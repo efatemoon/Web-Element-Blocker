@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.55test
+// @version      0.1.6
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -824,8 +824,12 @@
                 .selection-info .domain-item {
                     display: inline-block; background: rgba(255,111,0,0.7); color: white;
                     padding: 2px 9px; border-radius: 12px; margin: 3px 4px 0 0; font-size: 11px;
-                    word-break: break-all; font-weight: 500;
+                    word-break: break-all; font-weight: 500; cursor: pointer; transition: filter 0.15s;
                 }
+                .selection-info .domain-item:hover { filter: brightness(1.15); }
+                .domain-scroll { display: flex; gap: 6px; overflow-x: auto; max-width: 100%; padding-bottom: 4px; white-space: nowrap; }
+                .domain-scroll::-webkit-scrollbar { height: 4px; }
+                .domain-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 2px; }
                 .safe-flag {
                     display: inline-block; background: rgba(40,167,69,0.75); color: white;
                     padding: 2px 9px; border-radius: 12px; font-size: 10px; margin-left: 6px; font-weight: 600;
@@ -1300,6 +1304,121 @@
 
             this._applySelectionHighlight(element);
             this._refreshSelectionInfo(panel);
+        }
+
+        showGlobalDomainPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            const result = BlockEngine.extractResourceDomains(document.documentElement);
+            let selectedDomains = [...result.domains];
+
+            const renderDomains = () => {
+                const box = panel.querySelector('#global-domains');
+                if (!box) return;
+                if (selectedDomains.length === 0) {
+                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未发现或未选择第三方资源域</span>';
+                } else {
+                    box.innerHTML = '<span class="info-label">🔍 发现第三方资源域（点击可删除不屏蔽）：</span>' +
+                        '<div class="domain-scroll">' +
+                        selectedDomains.map((d, i) => `<span class="domain-item" data-index="${i}">${escapeHTML(d)} ✕</span>`).join('') +
+                        '</div>';
+                }
+                const btnBlock = panel.querySelector('#btn-block-global');
+                if (btnBlock) {
+                    btnBlock.disabled = selectedDomains.length === 0;
+                    btnBlock.textContent = selectedDomains.length > 0
+                        ? `🔥 彻底封杀 ${selectedDomains.length} 个广告域名（推荐）`
+                        : '🔥 未选择可封杀域名';
+                }
+            };
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">全局域名检索</h3>
+                <p>已扫描全页第三方资源域，点击域名标签可将其从封杀列表中移除。</p>
+                <div class="selection-info">
+                    <div class="info-row" id="global-domains"></div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn-danger" id="btn-block-global" style="flex:100%; font-weight:bold;">🔥 彻底封杀广告域名（推荐）</button>
+                </div>
+                <div class="section-divider"></div>
+                <div class="btn-group">
+                    <button class="btn-warning" id="btn-preview-global">🔍 预览效果</button>
+                    <button class="btn-outline" id="btn-cancel-global">取消配置</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+            renderDomains();
+
+            panel.querySelector('#global-domains').addEventListener('click', (e) => {
+                const item = e.target.closest('.domain-item');
+                if (!item) return;
+                const idx = parseInt(item.dataset.index, 10);
+                selectedDomains.splice(idx, 1);
+                renderDomains();
+            });
+
+            let previewActive = false;
+            let previewHiddenElements = [];
+            panel.querySelector('#btn-preview-global').addEventListener('click', (e) => {
+                if (previewActive) {
+                    previewHiddenElements.forEach(el => {
+                        el.style.removeProperty('display');
+                        el.style.removeProperty('opacity');
+                    });
+                    previewHiddenElements = [];
+                    previewActive = false;
+                    e.target.textContent = '🔍 预览效果';
+                    return;
+                }
+                if (selectedDomains.length === 0) return;
+                previewHiddenElements = [];
+                selectedDomains.forEach(d => {
+                    const esc = escapeCSSAttr(d);
+                    document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
+                        const t = BlockEngine.findSingleChildWrapper(el, 4);
+                        if (t.style.display !== 'none') {
+                            t.style.setProperty('display', 'none', 'important');
+                            t.style.setProperty('opacity', '0', 'important');
+                            previewHiddenElements.push(t);
+                        }
+                    });
+                });
+                previewActive = true;
+                e.target.textContent = '👁 恢复显示';
+            });
+
+            panel.querySelector('#btn-block-global').addEventListener('click', () => {
+                if (selectedDomains.length === 0) return;
+                if (!confirm(`将封杀以下 ${selectedDomains.length} 个域名（全局生效，所有页面都将拦截）：\n\n${selectedDomains.join('\n')}\n\n确认继续？`)) return;
+                selectedDomains.forEach(d => storage.addRule('domainBlock', { domain: d, type: 'domainBlock' }));
+                selectedDomains.forEach(d => {
+                    const esc = escapeCSSAttr(d);
+                    document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
+                        const t = BlockEngine.findSingleChildWrapper(el, 4);
+                        t.style.setProperty('display', 'none', 'important');
+                        t.style.setProperty('opacity', '0', 'important');
+                    });
+                });
+                this.clearPanel();
+                alert(`已封杀 ${selectedDomains.length} 个域名，后续刷新与所有页面都将自动拦截。`);
+            });
+
+            panel.querySelector('#btn-cancel-global').addEventListener('click', () => {
+                if (previewActive) {
+                    previewHiddenElements.forEach(el => {
+                        el.style.removeProperty('display');
+                        el.style.removeProperty('opacity');
+                    });
+                    previewHiddenElements = [];
+                    previewActive = false;
+                }
+                this.clearPanel();
+            });
         }
 
         showRegexPanel() {
@@ -1876,6 +1995,7 @@
         }
 
         GM_registerMenuCommand('🖱 手动选择屏蔽元素', () => getUI().startSelection());
+        GM_registerMenuCommand('🌐 全局检索域名', () => getUI().showGlobalDomainPanel());
         GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
