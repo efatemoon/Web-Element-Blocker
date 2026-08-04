@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.6
+// @version      0.1.61
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -827,8 +827,9 @@
                     word-break: break-all; font-weight: 500; cursor: pointer; transition: filter 0.15s;
                 }
                 .selection-info .domain-item:hover { filter: brightness(1.15); }
-                .domain-scroll { display: flex; gap: 6px; overflow-x: auto; max-width: 100%; padding-bottom: 4px; white-space: nowrap; }
-                .domain-scroll::-webkit-scrollbar { height: 4px; }
+                .domain-scroll { display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto; padding-right: 4px; }
+                .domain-scroll .domain-item { display: flex; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; margin: 0; padding: 6px 10px; border-radius: 8px; font-size: 12px; }
+                .domain-scroll::-webkit-scrollbar { width: 4px; }
                 .domain-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 2px; }
                 .safe-flag {
                     display: inline-block; background: rgba(40,167,69,0.75); color: white;
