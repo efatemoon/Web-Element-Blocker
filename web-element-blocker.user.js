@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.61
+// @version      0.1.62
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -38,6 +38,9 @@
     function escapeCSSAttr(s) {
         return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     }
+
+    // 广告域名/关键词通用匹配（在域名扫描与 AdGuard 导出中复用）
+    const AD_KEYWORDS = /ads|adnxs|advert|banner|doubleclick|googlesyndication|googleads|google-analytics|googletag|gstatic|googleapis|facebook|fbcdn|twitter|adsystem|amazon-adsystem|outbrain|taboola|mgid|popads|propeller|onclickads|revcontent|yandex|baidu|toutiao|pangolin|gdt|mob|umeng|umengcloud|sentry|analytics|tracking|tracker|stats|metrics|ping|beacon|pixel|logger/i;
 
     /**
      * 核心数据与配置管理模块
@@ -265,7 +268,11 @@
             const hideCSS = '{ display: none !important; opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; z-index: -2147483648 !important; height: 0 !important; width: 0 !important; position: absolute !important; }\n';
 
             data.static.forEach(r => r.selector && (cssText += `${r.selector} ${hideCSS}`));
-            data.dynamic.forEach(r => r.className && (cssText += `.${CSS.escape(r.className)} ${hideCSS}`));
+            data.dynamic.forEach(r => {
+                if (!r.className) return;
+                const token = r.className.split(/\s+/).filter(Boolean)[0];
+                if (token) cssText += `[class*="${escapeCSSAttr(token)}"] ${hideCSS}`;
+            });
             data.attribute.forEach(r => r.attrSelector && (cssText += `${r.attrSelector} ${hideCSS}`));
             data.structural.forEach(r => r.structSelector && (cssText += `${r.structSelector} ${hideCSS}`));
 
@@ -297,7 +304,12 @@
             if (!styleEl) {
                 styleEl = document.createElement('style');
                 styleEl.id = this.styleElementId;
-                (document.head || document.documentElement).appendChild(styleEl);
+                const parent = document.head || document.documentElement;
+                if (parent.firstChild) {
+                    parent.insertBefore(styleEl, parent.firstChild);
+                } else {
+                    parent.appendChild(styleEl);
+                }
             }
             if (styleEl.textContent !== cssText) {
                 styleEl.textContent = cssText;
@@ -442,13 +454,14 @@
             data.complex.forEach(rule => {
                 try {
                     let baseSelector = '*';
+                    const simpleParts = [];
                     if (rule.logic === 'AND') {
-                        let parts = [];
                         rule.conditions.forEach(c => {
-                            if (c.type === 'class' && c.operator === 'contains' && /^[a-zA-Z0-9\-_]+$/.test(c.value)) parts.push(`.${c.value}`);
-                            if (c.type === 'id' && c.operator === 'equals' && /^[a-zA-Z0-9\-_]+$/.test(c.value)) parts.push(`#${c.value}`);
+                            if (c.type === 'class' && (c.operator === 'contains' || c.operator === 'equals')) simpleParts.push(`[class*="${escapeCSSAttr(c.value)}"]`);
+                            if (c.type === 'id' && c.operator === 'equals') simpleParts.push(`[id="${escapeCSSAttr(c.value)}"]`);
+                            if (c.type === 'id' && c.operator === 'contains') simpleParts.push(`[id*="${escapeCSSAttr(c.value)}"]`);
                         });
-                        if (parts.length > 0) baseSelector = parts.join('');
+                        if (simpleParts.length > 0) baseSelector = `*${simpleParts.join('')}`;
                     }
 
                     const elements = baseSelector === '*'
@@ -536,16 +549,30 @@
                     if (this._cachedDomainList === null) this._cachedDomainList = domainList;
                     if (this._cachedPathPatterns === null) this._cachedPathPatterns = pathPatterns;
                     batchNodes.forEach(node => this.scanAndBlockDynamic(node, domainList, pathPatterns));
-
-                    // 确保 style 元素始终在 body 末尾以获得最高优先级
-                    const styleEl = document.getElementById(this.styleElementId);
-                    if (styleEl && document.body && styleEl.parentElement !== document.body) {
-                        document.body.appendChild(styleEl);
-                        storage.markAsFlashing();
-                    }
                     debouncedDynamicApply();
                 }
             });
+
+            // head 就绪时立即把 style 移入 head 并应用规则，比等 body 更早
+            const ensureStyleInHead = () => {
+                const styleEl = document.getElementById(this.styleElementId);
+                if (styleEl && document.head && styleEl.parentElement !== document.head) {
+                    document.head.insertBefore(styleEl, document.head.firstChild);
+                    this.applyCSSRules();
+                }
+            };
+
+            if (document.head) {
+                ensureStyleInHead();
+            } else {
+                const headObserver = new MutationObserver(() => {
+                    if (document.head) {
+                        headObserver.disconnect();
+                        ensureStyleInHead();
+                    }
+                });
+                headObserver.observe(document.documentElement, { childList: true });
+            }
 
             // body 就绪后立即启动全量扫描 + 观察器（不等 DOMContentLoaded，消除监控盲区）
             const startObserving = () => {
@@ -575,6 +602,39 @@
                 this.applyComplexRules();
                 this.scanAndBlockDynamic(document.body);
             });
+
+            // 页面完全加载后再做一次兜底扫描
+            window.addEventListener('load', () => {
+                this.applyCSSRules();
+                this.applyRegexRules();
+                this.applyComplexRules();
+                this.scanAndBlockDynamic(document.body);
+            });
+
+            // SPA 路由变化时重新应用规则（解决点击链接不刷新导致广告漏网）
+            let _lastUrl = location.href;
+            const reapplyOnNavigation = () => {
+                if (location.href === _lastUrl) return;
+                _lastUrl = location.href;
+                this.applyCSSRules();
+                this.applyRegexRules();
+                this.applyComplexRules();
+                if (document.body) this.scanAndBlockDynamic(document.body);
+            };
+            window.addEventListener('popstate', reapplyOnNavigation);
+            window.addEventListener('hashchange', reapplyOnNavigation);
+
+            // 额外兜底：某些 SPA 通过 history.pushState 导航，劫持它以触发重应用
+            const _pushState = history.pushState;
+            history.pushState = function (...args) {
+                _pushState.apply(this, args);
+                setTimeout(() => reapplyOnNavigation(), 0);
+            };
+            const _replaceState = history.replaceState;
+            history.replaceState = function (...args) {
+                _replaceState.apply(this, args);
+                setTimeout(() => reapplyOnNavigation(), 0);
+            };
         }
 
         static generateOptimalSelector(element) {
@@ -620,57 +680,144 @@
         }
 
         /**
-         * 增强版资源域识别：递归查找元素内所有第三方资源域名（含 srcset）
+         * 资源域识别：默认进行轻量扫描（src/href/srcset/内联样式）。
+         * 当 deep=true 且扫描对象为 document.documentElement 时，额外扫描样式表、
+         * 数据属性、script 文本/JSON 配置与全局变量中暴露的广告域。
+         * 返回带置信度与来源说明的结果，便于用户判断。
          */
-        static extractResourceDomains(element) {
+        static extractResourceDomains(element, options = {}) {
+            const { deep = false, includeScripts = true, includeStyles = true } = options;
+            const isFullPage = element === document.documentElement;
             const urls = new Set();
-            const domains = new Set();
-            if (!element) return { urls: [], domains: [] };
+            const domainMeta = new Map(); // domain -> {score, sources:Set, reasons:Set}
+            if (!element) return { urls: [], domains: [], scoredDomains: [] };
+
+            const KNOWN_SAFE_CDNS = new Set([
+                'ajax.googleapis.com', 'fonts.googleapis.com', 'fonts.gstatic.com',
+                'cdn.jsdelivr.net', 'unpkg.com', 'cdnjs.cloudflare.com', 'code.jquery.com',
+                'stackpath.bootstrapcdn.com', 'maxcdn.bootstrapcdn.com', 'cdn.bootcss.com',
+                'staticfile.org', 'cdn.staticfile.org', 'www.google.com', 'www.recaptcha.net',
+                'challenges.cloudflare.com', 'hcaptcha.com', 'static.cloudflareinsights.com'
+            ]);
+
+            const addUrl = (url, source = 'attr', reason = '') => {
+                if (!url || typeof url !== 'string') return;
+                if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('mailto:')) return;
+                let absUrl = url;
+                if (url.startsWith('//')) absUrl = location.protocol + url;
+                if (!absUrl.startsWith('http')) return;
+                try {
+                    const urlObj = new URL(absUrl);
+                    if (!urlObj.hostname) return;
+                    urls.add(url);
+                    const host = urlObj.hostname.toLowerCase();
+                    if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) return;
+                    if (!domainMeta.has(host)) domainMeta.set(host, { score: 0, sources: new Set(), reasons: new Set(), count: 0 });
+                    const meta = domainMeta.get(host);
+                    meta.count++;
+                    meta.sources.add(source);
+                    if (reason) meta.reasons.add(reason);
+                } catch (e) { }
+            };
+
+            const scanString = (str, source) => {
+                if (!str || typeof str !== 'string') return;
+                const urlLike = str.match(/https?:\/\/[^\s"'<>(){}]+/gi);
+                if (urlLike) urlLike.forEach(u => addUrl(u, source));
+            };
 
             const collect = (el) => {
                 if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
-                const attrs = ['src', 'href', 'data-src', 'data-original', 'poster'];
-                attrs.forEach(attr => {
+                const attrSources = ['src', 'href', 'data-src', 'data-original', 'poster', 'data-href', 'data-url', 'data-link', 'data-bg', 'data-image', 'data-thumb', 'data-poster', 'data-lazy', 'data-lazy-src', 'data-srcset', 'srcset'];
+                attrSources.forEach(attr => {
                     const val = el.getAttribute(attr);
-                    if (val) urls.add(val);
+                    if (val) {
+                        if (attr === 'srcset') {
+                            val.split(',').forEach(part => addUrl(part.trim().split(/\s+/)[0], 'srcset'));
+                        } else {
+                            addUrl(val, 'attr', attr);
+                        }
+                    }
                 });
-                const srcset = el.getAttribute('srcset');
-                if (srcset) {
-                    srcset.split(',').forEach(part => {
-                        const url = part.trim().split(/\s+/)[0];
-                        if (url) urls.add(url);
-                    });
+                if (includeStyles) {
+                    const inlineBg = el.style && el.style.backgroundImage;
+                    if (inlineBg && inlineBg.includes('url(')) {
+                        const matches = inlineBg.match(/url\(["']?([^"')]+)["']?\)/g);
+                        if (matches) matches.forEach(m => addUrl(m.replace(/url\(["']?|["']?\)/g, ''), 'inline-style'));
+                    }
                 }
-                const bg = el.style && el.style.backgroundImage;
-                if (bg && bg.includes('url(')) {
-                    const matches = bg.match(/url\(["']?([^"')]+)["']?\)/g);
-                    if (matches) matches.forEach(m => {
-                        const url = m.replace(/url\(["']?|["']?\)/g, '');
-                        if (url) urls.add(url);
+                if (deep) {
+                    Array.from(el.attributes).forEach(attr => {
+                        if (attr.name.startsWith('data-') && /^(https?:)?\/\//.test(attr.value)) {
+                            addUrl(attr.value, 'data-attr', attr.name);
+                        }
                     });
                 }
             };
 
             collect(element);
             try {
-                element.querySelectorAll && element.querySelectorAll('img, iframe, video, source, embed, a, script').forEach(collect);
+                const selectors = deep
+                    ? '*'
+                    : 'img, iframe, video, source, embed, a, script, link, div, section, article, aside, span';
+                element.querySelectorAll && element.querySelectorAll(selectors).forEach(collect);
             } catch (e) { }
 
-            const currentHost = window.location.hostname;
-            urls.forEach(url => {
+            if (deep && includeStyles && isFullPage) {
                 try {
-                    if (url.startsWith('data:')) return;
-                    let absUrl = url;
-                    if (url.startsWith('//')) absUrl = location.protocol + url;
-                    if (!absUrl.startsWith('http')) return;
-                    const urlObj = new URL(absUrl);
-                    if (urlObj.hostname && urlObj.hostname !== currentHost && !urlObj.hostname.endsWith('.' + currentHost)) {
-                        domains.add(urlObj.hostname);
-                    }
+                    Array.from(document.styleSheets).forEach(sheet => {
+                        let rules;
+                        try { rules = sheet.cssRules || sheet.rules; } catch (e) { return; }
+                        if (!rules) return;
+                        Array.from(rules).forEach(rule => {
+                            try {
+                                const cssText = rule.cssText || '';
+                                const matches = cssText.match(/url\(["']?([^"')]+)["']?\)/g);
+                                if (matches) matches.forEach(m => addUrl(m.replace(/url\(["']?|["']?\)/g, ''), 'stylesheet'));
+                            } catch (e) { }
+                        });
+                    });
                 } catch (e) { }
+            }
+
+            if (deep && includeScripts && isFullPage) {
+                try {
+                    document.querySelectorAll('script').forEach(script => {
+                        const text = script.textContent || '';
+                        scanString(text, 'script-text');
+                        if (text.includes('window.') || text.includes('var ') || text.includes('let ') || text.includes('const ')) {
+                            const domainMatches = text.match(/["']([a-z0-9-]+\.(?:com|cn|net|org|io|cc|tv|xyz|top|club|info|site|vip|icu|asia|app|dev|co|me|mobi|us|biz|ru|jp|tw|hk|uk|de|fr|br|au))["']/gi);
+                            if (domainMatches) domainMatches.forEach(d => addUrl('https://' + d.replace(/["']/g, ''), 'script-var'));
+                        }
+                    });
+                } catch (e) { }
+            }
+
+            domainMeta.forEach((meta, host) => {
+                let score = 0;
+                if (AD_KEYWORDS.test(host)) score += 40;
+                if (meta.sources.has('script-text') || meta.sources.has('script-var')) score += 20;
+                if (meta.sources.has('inline-style') || meta.sources.has('stylesheet')) score += 10;
+                if (meta.sources.has('srcset') || meta.sources.has('attr')) score += 10;
+                if (meta.sources.has('data-attr')) score += 15;
+                score += Math.min(meta.count * 2, 20);
+                if (KNOWN_SAFE_CDNS.has(host)) score -= 30;
+                if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) score -= 1000;
+                meta.score = Math.max(0, score);
             });
 
-            return { urls: Array.from(urls), domains: Array.from(domains) };
+            const scoredDomains = Array.from(domainMeta.entries())
+                .filter(([, meta]) => meta.score > 0)
+                .sort((a, b) => b[1].score - a[1].score)
+                .map(([host, meta]) => ({
+                    host,
+                    score: meta.score,
+                    sources: Array.from(meta.sources),
+                    reasons: Array.from(meta.reasons),
+                    count: meta.count
+                }));
+
+            return { urls: Array.from(urls), domains: scoredDomains.map(d => d.host), scoredDomains };
         }
 
         static isSafeOutermost(element) {
@@ -740,10 +887,13 @@
                 :host { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
                 .panel {
                     position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-                    background: rgba(25, 25, 30, 0.62); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-                    border: 1px solid rgba(255,255,255,0.14); padding: 20px; border-radius: 14px;
-                    box-shadow: 0 16px 56px rgba(0,0,0,0.35), inset 0 0 0 1px rgba(255,255,255,0.06); width: 480px; max-width: calc(100vw - 24px);
-                    max-height: 88vh; overflow-y: auto; color: #eee; text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+                    background: rgba(25, 25, 30, 0.72); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+                    border: 1px solid rgba(255,255,255,0.16); padding: 20px; border-radius: 16px;
+                    box-shadow: 0 20px 64px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(255,255,255,0.07);
+                    width: min(480px, calc(100vw - 48px));
+                    max-width: calc(100vw - 48px);
+                    max-height: min(720px, 76vh); overflow-y: auto; color: #eee; text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+                    box-sizing: border-box;
                 }
                 @media (max-width: 600px) {
                     .panel { background: rgba(25, 25, 30, 0.52); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); max-width: calc(100vw - 48px); max-height: 70vh; padding: 16px; }
@@ -840,6 +990,39 @@
 
                 .section-divider { height: 1px; background: rgba(255,255,255,0.1); margin: 14px 0 10px; }
                 .empty-tip { text-align: center; color: #aaa; margin: 24px 0; font-size: 13px; }
+
+                .gd-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+                .gd-toolbar input { flex: 1; min-width: 120px; margin-bottom: 0; }
+                .gd-toolbar label { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #ccc; margin-bottom: 0; cursor: pointer; }
+                .gd-toolbar label input[type="checkbox"] { width: auto; margin: 0; }
+                .gd-toolbar button { flex: none; padding: 7px 10px; font-size: 12px; }
+                .gd-stats { font-size: 11px; color: #aaa; margin-bottom: 8px; }
+                .gd-domain-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; border-radius: 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); cursor: pointer; transition: background 0.15s; }
+                .gd-domain-row:hover { background: rgba(255,255,255,0.12); }
+                .gd-domain-row.selected { border-color: rgba(255,111,0,0.7); background: rgba(255,111,0,0.18); }
+                .gd-domain-row .gd-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+                .gd-domain-row .gd-check { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.3); border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: #fff; flex: none; }
+                .gd-domain-row.selected .gd-check { background: #ff6f00; border-color: #ff6f00; }
+                .gd-domain-row .gd-host { font-size: 12px; word-break: break-all; color: #fff; }
+                .gd-domain-row .gd-meta { font-size: 10px; color: #aaa; margin-top: 2px; }
+                .gd-domain-row .gd-score { flex: none; font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: 600; }
+                .gd-score.high { background: rgba(255,59,48,0.65); color: #fff; }
+                .gd-score.mid { background: rgba(255,149,0,0.65); color: #fff; }
+                .gd-score.low { background: rgba(120,144,156,0.55); color: #fff; }
+                .gd-manual { display: flex; gap: 8px; margin-top: 10px; }
+                .gd-manual input { flex: 1; margin-bottom: 0; }
+                .gd-manual button { flex: none; }
+                .export-box { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 10px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; color: #eee; margin-bottom: 12px; }
+                .hint-text { font-size: 11px; color: #aaa; margin: -8px 0 10px; line-height: 1.5; }
+
+                @media (max-width: 480px) {
+                    .panel { padding: 16px; border-radius: 14px; max-height: 72vh; }
+                    .panel h3 { font-size: 15px; }
+                    .panel p, .panel .hint-text { font-size: 12px; }
+                    .btn-group button { padding: 8px 10px; font-size: 12px; }
+                    .gd-domain-row { padding: 8px; }
+                    .gd-domain-row .gd-host { font-size: 11px; }
+                }
             `;
             this.shadowRoot.appendChild(style);
         }
@@ -888,10 +1071,17 @@
                 e.preventDefault();
             };
 
+            const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
             const onMouseMove = (e) => {
                 if (!isDragging) return;
-                panel.style.left = `${initialLeft + (e.clientX - startX)}px`;
-                panel.style.top = `${initialTop + (e.clientY - startY)}px`;
+                const rect = panel.getBoundingClientRect();
+                const padding = 24;
+                let nextLeft = initialLeft + (e.clientX - startX);
+                let nextTop = initialTop + (e.clientY - startY);
+                nextLeft = clamp(nextLeft, padding, window.innerWidth - rect.width - padding);
+                nextTop = clamp(nextTop, padding, window.innerHeight - rect.height - padding);
+                panel.style.left = `${nextLeft}px`;
+                panel.style.top = `${nextTop}px`;
             };
 
             const onMouseUp = () => { isDragging = false; };
@@ -1014,8 +1204,9 @@
         }
 
         _handleClick(e) {
-            e.preventDefault(); e.stopPropagation();
             if (!e.target || !e.target.closest || e.target.closest('#pro-blocker-ui-host')) return;
+            e.preventDefault();
+            e.stopPropagation();
             this.stopSelection();
             this.showActionPanel(e.target);
         }
@@ -1055,7 +1246,7 @@
 
             const selector = BlockEngine.generateOptimalSelector(el);
             const structSelector = BlockEngine.generateStructuralSelector(el);
-            const resourceResult = BlockEngine.extractResourceDomains(el);
+            const resourceResult = BlockEngine.extractResourceDomains(el, { deep: true });
             const isSafeOuter = BlockEngine.isSafeOutermost(el);
             const canZoomOut = this.selectionStack.length > 0;
             const canZoomIn = !isSafeOuter && !!el.parentElement;
@@ -1077,7 +1268,7 @@
             if (domainBox) {
                 if (resourceResult.domains.length > 0) {
                     domainBox.innerHTML = '<span class="info-label">🔍 发现第三方资源域：</span>' +
-                        resourceResult.domains.map(d => `<span class="domain-item">${d}</span>`).join('');
+                        resourceResult.domains.map(d => `<span class="domain-item">${escapeHTML(d)}</span>`).join('');
                 } else {
                     domainBox.innerHTML = '<span class="info-label" style="color:#bbb;">🔍 当前框选范围内未发现第三方资源域</span>';
                 }
@@ -1233,7 +1424,7 @@
                     this.clearPanel();
                     return;
                 }
-                const result = BlockEngine.extractResourceDomains(this.currentSelectedEl);
+                const result = BlockEngine.extractResourceDomains(this.currentSelectedEl, { deep: true });
                 if (result.domains.length === 0) {
                     alert('当前框选范围内未发现第三方资源域，无法执行域名封杀。');
                     return;
@@ -1312,34 +1503,74 @@
             const panel = document.createElement('div');
             panel.className = 'panel';
 
-            const result = BlockEngine.extractResourceDomains(document.documentElement);
-            let selectedDomains = [...result.domains];
+            const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
+            let allDomains = scoredDomains;
+            let selectedHosts = new Set(scoredDomains.filter(d => d.score >= 35).map(d => d.host));
+            let filterText = '';
+            let onlyAds = true;
+
+            const isAdLike = (host) => AD_KEYWORDS.test(host);
+
+            const getScoreClass = (score) => score >= 50 ? 'high' : score >= 25 ? 'mid' : 'low';
+            const sourceLabel = (src) => ({ 'attr': '属性', 'srcset': '响应图', 'inline-style': '内联样式', 'stylesheet': '样式表', 'data-attr': '数据属性', 'script-text': '脚本文本', 'script-var': '脚本变量' }[src] || src);
 
             const renderDomains = () => {
                 const box = panel.querySelector('#global-domains');
+                const stats = panel.querySelector('#gd-stats');
                 if (!box) return;
-                if (selectedDomains.length === 0) {
-                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未发现或未选择第三方资源域</span>';
+
+                const filtered = allDomains.filter(d => {
+                    if (filterText && !d.host.includes(filterText)) return false;
+                    if (onlyAds && !isAdLike(d.host) && d.score < 40) return false;
+                    return true;
+                });
+
+                if (stats) stats.textContent = `共 ${allDomains.length} 个第三方域名 · 已选 ${selectedHosts.size} 个 · 当前显示 ${filtered.length} 个`;
+
+                if (filtered.length === 0) {
+                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未匹配到域名，请尝试取消“只看广告相关”或手动添加。</span>';
                 } else {
-                    box.innerHTML = '<span class="info-label">🔍 发现第三方资源域（点击可删除不屏蔽）：</span>' +
-                        '<div class="domain-scroll">' +
-                        selectedDomains.map((d, i) => `<span class="domain-item" data-index="${i}">${escapeHTML(d)} ✕</span>`).join('') +
-                        '</div>';
+                    box.innerHTML = filtered.map(d => {
+                        const checked = selectedHosts.has(d.host);
+                        const reasons = d.reasons.length ? ` · ${d.reasons.slice(0, 3).join(', ')}` : '';
+                        return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-host="${escapeHTML(d.host)}">
+                            <div class="gd-left">
+                                <div class="gd-check">${checked ? '✓' : ''}</div>
+                                <div>
+                                    <div class="gd-host">${escapeHTML(d.host)}</div>
+                                    <div class="gd-meta">来源：${d.sources.map(sourceLabel).join('、')}${reasons}</div>
+                                </div>
+                            </div>
+                            <div class="gd-score ${getScoreClass(d.score)}">${d.score} 分</div>
+                        </div>`;
+                    }).join('');
                 }
+
                 const btnBlock = panel.querySelector('#btn-block-global');
                 if (btnBlock) {
-                    btnBlock.disabled = selectedDomains.length === 0;
-                    btnBlock.textContent = selectedDomains.length > 0
-                        ? `🔥 彻底封杀 ${selectedDomains.length} 个广告域名（推荐）`
+                    btnBlock.disabled = selectedHosts.size === 0;
+                    btnBlock.textContent = selectedHosts.size > 0
+                        ? `🔥 彻底封杀 ${selectedHosts.size} 个域名（推荐）`
                         : '🔥 未选择可封杀域名';
                 }
             };
 
             panel.innerHTML = `
-                <h3 title="按住可拖动窗口">全局域名检索</h3>
-                <p>已扫描全页第三方资源域，点击域名标签可将其从封杀列表中移除。</p>
-                <div class="selection-info">
+                <h3 title="按住可拖动窗口">全局域名深度检索</h3>
+                <p>已深度扫描页面资源、样式、数据属性与脚本变量。分数越高越可能是广告域，橙色/红色建议优先封杀。</p>
+                <div class="gd-toolbar">
+                    <input type="text" id="gd-filter" placeholder="输入域名关键字过滤..." />
+                    <label><input type="checkbox" id="gd-only-ads" checked /> 只看广告相关</label>
+                    <button class="btn-outline" id="gd-select-all">全选</button>
+                    <button class="btn-outline" id="gd-select-none">清空</button>
+                </div>
+                <div class="gd-stats" id="gd-stats"></div>
+                <div class="selection-info" style="max-height: 260px; overflow-y: auto;">
                     <div class="info-row" id="global-domains"></div>
+                </div>
+                <div class="gd-manual">
+                    <input type="text" id="gd-manual-input" placeholder="手动输入域名，例如：ads.example.com" />
+                    <button class="btn-outline" id="gd-manual-add">+ 添加</button>
                 </div>
                 <div class="btn-group">
                     <button class="btn-danger" id="btn-block-global" style="flex:100%; font-weight:bold;">🔥 彻底封杀广告域名（推荐）</button>
@@ -1356,10 +1587,33 @@
             renderDomains();
 
             panel.querySelector('#global-domains').addEventListener('click', (e) => {
-                const item = e.target.closest('.domain-item');
-                if (!item) return;
-                const idx = parseInt(item.dataset.index, 10);
-                selectedDomains.splice(idx, 1);
+                const row = e.target.closest('.gd-domain-row');
+                if (!row) return;
+                const host = row.dataset.host.toLowerCase();
+                if (selectedHosts.has(host)) selectedHosts.delete(host);
+                else selectedHosts.add(host);
+                renderDomains();
+            });
+
+            panel.querySelector('#gd-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderDomains(); });
+            panel.querySelector('#gd-only-ads').addEventListener('change', (e) => { onlyAds = e.target.checked; renderDomains(); });
+            panel.querySelector('#gd-select-all').addEventListener('click', () => {
+                allDomains.forEach(d => selectedHosts.add(d.host));
+                renderDomains();
+            });
+            panel.querySelector('#gd-select-none').addEventListener('click', () => {
+                selectedHosts.clear();
+                renderDomains();
+            });
+            panel.querySelector('#gd-manual-add').addEventListener('click', () => {
+                const input = panel.querySelector('#gd-manual-input');
+                const host = input.value.trim().toLowerCase();
+                if (!host) return;
+                if (!allDomains.find(d => d.host === host)) {
+                    allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1 });
+                }
+                selectedHosts.add(host);
+                input.value = '';
                 renderDomains();
             });
 
@@ -1376,9 +1630,9 @@
                     e.target.textContent = '🔍 预览效果';
                     return;
                 }
-                if (selectedDomains.length === 0) return;
+                if (selectedHosts.size === 0) return;
                 previewHiddenElements = [];
-                selectedDomains.forEach(d => {
+                selectedHosts.forEach(d => {
                     const esc = escapeCSSAttr(d);
                     document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
                         const t = BlockEngine.findSingleChildWrapper(el, 4);
@@ -1394,10 +1648,11 @@
             });
 
             panel.querySelector('#btn-block-global').addEventListener('click', () => {
-                if (selectedDomains.length === 0) return;
-                if (!confirm(`将封杀以下 ${selectedDomains.length} 个域名（全局生效，所有页面都将拦截）：\n\n${selectedDomains.join('\n')}\n\n确认继续？`)) return;
-                selectedDomains.forEach(d => storage.addRule('domainBlock', { domain: d, type: 'domainBlock' }));
-                selectedDomains.forEach(d => {
+                if (selectedHosts.size === 0) return;
+                const list = Array.from(selectedHosts);
+                if (!confirm(`将封杀以下 ${list.length} 个域名（全局生效，所有页面都将拦截）：\n\n${list.join('\n')}\n\n确认继续？`)) return;
+                list.forEach(d => storage.addRule('domainBlock', { domain: d, type: 'domainBlock' }));
+                list.forEach(d => {
                     const esc = escapeCSSAttr(d);
                     document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
                         const t = BlockEngine.findSingleChildWrapper(el, 4);
@@ -1406,7 +1661,7 @@
                     });
                 });
                 this.clearPanel();
-                alert(`已封杀 ${selectedDomains.length} 个域名，后续刷新与所有页面都将自动拦截。`);
+                alert(`已封杀 ${list.length} 个域名，后续刷新与所有页面都将自动拦截。`);
             });
 
             panel.querySelector('#btn-cancel-global').addEventListener('click', () => {
@@ -1608,13 +1863,14 @@
                     }
 
                     let baseSelector = '*';
+                    const simpleParts = [];
                     if (logic === 'AND') {
-                        let parts = [];
                         conditions.forEach(c => {
-                            if (c.type === 'class' && c.operator === 'contains' && /^[a-zA-Z0-9\-_]+$/.test(c.value)) parts.push(`.${c.value}`);
-                            if (c.type === 'id' && c.operator === 'equals' && /^[a-zA-Z0-9\-_]+$/.test(c.value)) parts.push(`#${c.value}`);
+                            if (c.type === 'class' && (c.operator === 'contains' || c.operator === 'equals')) simpleParts.push(`[class*="${escapeCSSAttr(c.value)}"]`);
+                            if (c.type === 'id' && c.operator === 'equals') simpleParts.push(`[id="${escapeCSSAttr(c.value)}"]`);
+                            if (c.type === 'id' && c.operator === 'contains') simpleParts.push(`[id*="${escapeCSSAttr(c.value)}"]`);
                         });
-                        if (parts.length > 0) baseSelector = parts.join('');
+                        if (simpleParts.length > 0) baseSelector = `*${simpleParts.join('')}`;
                     }
 
                     const root = document.body;
@@ -1825,6 +2081,7 @@
                     <button class="btn-warning" id="btn-import">📥 导入规则</button>
                 </div>
                 <div class="btn-group" style="margin-top: 10px;">
+                    <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
                     <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
                     <button class="btn-primary" id="btn-close-manager">完成</button>
                 </div>
@@ -1856,6 +2113,7 @@
 
             panel.querySelector('#btn-export').addEventListener('click', () => this.showExportPanel());
             panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
+            panel.querySelector('#btn-ag-export').addEventListener('click', () => this.showAdGuardExportPanel());
 
             panel.querySelector('#btn-clear-all').addEventListener('click', () => {
                 if (confirm('警告：此操作将清空【当前域名】下的所有拦截规则和配置（不影响全局域名黑名单）。确认继续？')) {
@@ -1913,6 +2171,186 @@
             });
 
             panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
+        }
+
+        generateAdGuardRules() {
+            const raw = JSON.parse(storage.exportAll() || '{}');
+            const ruleBuckets = {
+                blocks: raw.blocks || {},
+                dynamicBlocks: raw.dynamicBlocks || {},
+                regexBlocks: raw.regexBlocks || {},
+                attrBlocks: raw.attrBlocks || {},
+                structBlocks: raw.structBlocks || {},
+                complexBlocks: raw.complexBlocks || {},
+                pathPatternBlocks: raw.pathPatternBlocks || {},
+                domainBlocks: raw.domainBlocks || []
+            };
+            const allDomains = new Set([
+                ...Object.keys(ruleBuckets.blocks),
+                ...Object.keys(ruleBuckets.dynamicBlocks),
+                ...Object.keys(ruleBuckets.regexBlocks),
+                ...Object.keys(ruleBuckets.attrBlocks),
+                ...Object.keys(ruleBuckets.structBlocks),
+                ...Object.keys(ruleBuckets.complexBlocks),
+                ...Object.keys(ruleBuckets.pathPatternBlocks)
+            ]);
+            const globalDomains = Array.isArray(ruleBuckets.domainBlocks) ? ruleBuckets.domainBlocks : [];
+            const lines = ['! 由 Web Element Blocker 转换的 AdGuard 规则', `! 生成时间：${new Date().toLocaleString()}`, ''];
+
+            const escapeCssValue = (v) => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            const firstClassToken = (cls) => (cls || '').split(/\s+/).filter(Boolean)[0] || cls;
+
+            const convertRule = (rule, domain) => {
+                if (!rule || !rule.type) return null;
+                switch (rule.type) {
+                    case 'static':
+                        return `${domain}##${rule.selector}`;
+                    case 'dynamic':
+                        return rule.className ? `${domain}##[class*="${escapeCssValue(firstClassToken(rule.className))}"]` : null;
+                    case 'attribute':
+                        return rule.attrSelector ? `${domain}##${rule.attrSelector}` : null;
+                    case 'structural':
+                        return rule.structSelector ? `${domain}##${rule.structSelector}` : null;
+                    case 'regex':
+                        if (!rule.regex) return null;
+                        try {
+                            new RegExp(rule.regex);
+                            return `${domain}##:has-text(/${rule.regex.replace(/\//g, '\\/')}/)`;
+                        } catch (e) { return null; }
+                    case 'contains':
+                        if (!rule.regex) return null;
+                        return `${domain}##:contains("${escapeCssValue(rule.regex)}")`;
+                    case 'domainBlock':
+                        return `||${rule.domain}^$third-party`;
+                    case 'pathPattern':
+                        if (!rule.pattern) return null;
+                        return `${domain}##a[href*="${escapeCssValue(rule.pattern)}"], ${domain}##[src*="${escapeCssValue(rule.pattern)}"]`;
+                    case 'complex': {
+                        if (!rule.conditions || rule.conditions.length === 0) return null;
+                        const andMode = rule.logic === 'AND';
+                        const simpleParts = [];
+                        const pseudoParts = [];
+                        rule.conditions.forEach(c => {
+                            if (c.type === 'class') {
+                                if (c.operator === 'contains' || c.operator === 'equals') simpleParts.push(`[class*="${escapeCssValue(c.value)}"]`);
+                                if (c.operator === 'not_contains') pseudoParts.push(`:not([class*="${escapeCssValue(c.value)}"])`);
+                            } else if (c.type === 'id') {
+                                if (c.operator === 'equals') simpleParts.push(`[id="${escapeCssValue(c.value)}"]`);
+                                else if (c.operator === 'contains') simpleParts.push(`[id*="${escapeCssValue(c.value)}"]`);
+                                else if (c.operator === 'not_contains') pseudoParts.push(`:not([id*="${escapeCssValue(c.value)}"])`);
+                            } else if (c.type === 'text') {
+                                if (c.operator === 'contains') pseudoParts.push(`:contains("${escapeCssValue(c.value)}")`);
+                                if (c.operator === 'equals') pseudoParts.push(`:has-text(/^${c.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$/)`);
+                                if (c.operator === 'not_contains') pseudoParts.push(`:not(:contains("${escapeCssValue(c.value)}"))`);
+                            }
+                        });
+                        const base = simpleParts.length ? `*${simpleParts.join('')}` : '*';
+                        const tail = pseudoParts.join('');
+                        if (!tail && !simpleParts.length) return null;
+                        if (andMode) {
+                            return `${domain}##${base}${tail}`;
+                        } else {
+                            const perCondition = rule.conditions.map(c => {
+                                if (c.type === 'class') {
+                                    if (c.operator === 'contains') return `${domain}##*[class*="${escapeCssValue(c.value)}"]`;
+                                    if (c.operator === 'equals') return `${domain}##[class*="${escapeCssValue(c.value)}"]`;
+                                    if (c.operator === 'not_contains') return `${domain}##*:not([class*="${escapeCssValue(c.value)}"])`;
+                                } else if (c.type === 'id') {
+                                    if (c.operator === 'equals') return `${domain}##[id="${escapeCssValue(c.value)}"]`;
+                                    if (c.operator === 'contains') return `${domain}##[id*="${escapeCssValue(c.value)}"]`;
+                                    if (c.operator === 'not_contains') return `${domain}##*:not([id*="${escapeCssValue(c.value)}"])`;
+                                } else if (c.type === 'text') {
+                                    if (c.operator === 'contains') return `${domain}##:contains("${escapeCssValue(c.value)}")`;
+                                    if (c.operator === 'equals') return `${domain}##:has-text(/^${c.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$/)`;
+                                    if (c.operator === 'not_contains') return `${domain}##*:not(:contains("${escapeCssValue(c.value)}"))`;
+                                }
+                                return null;
+                            }).filter(Boolean);
+                            return perCondition.join('\n');
+                        }
+                    }
+                    default:
+                        return null;
+                }
+            };
+
+            allDomains.forEach(domain => {
+                const rules = [
+                    ...(ruleBuckets.blocks[domain] || []),
+                    ...(ruleBuckets.dynamicBlocks[domain] || []),
+                    ...(ruleBuckets.regexBlocks[domain] || []),
+                    ...(ruleBuckets.attrBlocks[domain] || []),
+                    ...(ruleBuckets.structBlocks[domain] || []),
+                    ...(ruleBuckets.complexBlocks[domain] || []),
+                    ...(ruleBuckets.pathPatternBlocks[domain] || [])
+                ];
+                if (rules.length === 0) return;
+                lines.push(`! ${domain}`);
+                rules.forEach(rule => {
+                    const converted = convertRule(rule, domain);
+                    if (converted) lines.push(converted);
+                });
+                lines.push('');
+            });
+
+            if (globalDomains.length) {
+                lines.push('! 全局域名拦截');
+                globalDomains.forEach(host => lines.push(`||${host}^$third-party`));
+                lines.push('');
+            }
+
+            return lines.join('\n');
+        }
+
+        showAdGuardExportPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+            const rulesText = this.generateAdGuardRules();
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
+                <p class="hint-text">下方已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容的过滤语法。你可以直接导入到 AdGuard 浏览器扩展、AdGuard DNS 或 uBlock Origin 的「自定义规则」中。</p>
+                <div class="export-box" id="ag-export-box"></div>
+                <div class="btn-group">
+                    <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
+                    <button class="btn-success" id="btn-ag-download">💾 下载 txt</button>
+                    <button class="btn-outline" id="btn-ag-back">返回</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            const box = panel.querySelector('#ag-export-box');
+            box.textContent = rulesText || '! 当前没有可转换的规则';
+
+            panel.querySelector('#btn-ag-copy').addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(rulesText);
+                    alert('AdGuard 规则已复制到剪贴板！');
+                } catch (e) {
+                    const range = document.createRange();
+                    range.selectNode(box);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    try { document.execCommand('copy'); alert('已复制！'); }
+                    catch (e2) { alert('复制失败，请手动复制。'); }
+                }
+            });
+
+            panel.querySelector('#btn-ag-download').addEventListener('click', () => {
+                const blob = new Blob([rulesText], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `adguard-rules-${new Date().toISOString().slice(0, 10)}.txt`;
+                a.click();
+                URL.revokeObjectURL(url);
+            });
+
+            panel.querySelector('#btn-ag-back').addEventListener('click', () => this.showManager());
         }
 
         showImportPanel() {
@@ -2000,6 +2438,7 @@
         GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
+        GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => getUI().showAdGuardExportPanel());
         GM_registerMenuCommand('📥 导入规则', () => getUI().showImportPanel());
     }
 

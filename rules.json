@@ -1,0 +1,99 @@
+{
+  "blocks": {},
+  "dynamicBlocks": {
+    "www.mmzx6.com": [
+      {
+        "className": "xhjGT",
+        "type": "dynamic"
+      },
+      {
+        "className": "CHNBy",
+        "type": "dynamic"
+      }
+    ]
+  },
+  "regexBlocks": {},
+  "attrBlocks": {},
+  "structBlocks": {},
+  "complexBlocks": {},
+  "pathPatternBlocks": {
+    "koj.ddsp8.hair": [
+      {
+        "pattern": "/000/flink/url.php",
+        "type": "pathPattern"
+      }
+    ],
+    "www.mmzx6.com": [
+      {
+        "pattern": "/apijs/image/2t1y2q2p.png",
+        "type": "pathPattern"
+      },
+      {
+        "pattern": "/apijs/image/2k2y2q2p.jpg",
+        "type": "pathPattern"
+      }
+    ]
+  },
+  "config": {},
+  "pro_blocker_flash_domains": {
+    "lpno.lhcfy.top": true,
+    "koj.ddsp8.hair": true,
+    "ldau.lhcfy.top": true,
+    "www.mmzx6.com": true,
+    "akp.ddsp8.hair": true,
+    "wxts.wuxiants773.com": true,
+    "bfi.ylsp9.help": true,
+    "scriptcat.org": true
+  },
+  "domainBlocks": [
+    "www.k12v7b.cc",
+    "txdy.mczsok.com",
+    "img.alicdn.com",
+    "img1.ah7907.com",
+    "dsyh978sd.imghost9743fvd853.top",
+    "vhsd.92uhf73ad.com",
+    "2026tu.myxuanxuan.com",
+    "img.hrzs168.com",
+    "feifei.fmjmm.com",
+    "xm2026.myxuanxuan.com",
+    "alisnhy.hamra.xin",
+    "tuchuang111.cww3qrrq4llezz7ct1231.com",
+    "fdhdfgfghfdgdhfgdghfdgfg.zhuanshutupian458.com",
+    "spdf.zbczce.com",
+    "img1212.syhze.com",
+    "mnbvcxzasdfghjklm.jhgfdsaqpwoeiru.cc",
+    "file.icve.com.cn",
+    "dsyh978sd.imghost971x43456.top",
+    "kfpicture.xyz",
+    "d3ccefxs96519j.cloudfront.net",
+    "ksihoauys.achxr.cn",
+    "imgimg.yhrlf.com",
+    "xy724-1.anvnjmc.com",
+    "dq38rjje7qjm3.cloudfront.net",
+    "shu1.mczsok.com",
+    "14.1.31.21",
+    "qazwsxedcrfvtgbnhy.asdfghjklpoiuyt.net",
+    "xtc.ftihzjg.com",
+    "sytpngyek.52ypc.net",
+    "www.mdynieu.com",
+    "www.feiseky3.com",
+    "img37788.szpro360.com",
+    "psuu.syxyzj.cc",
+    "www.6yu3e5fxve.com",
+    "www.bw28qk3jd.cc",
+    "www.ag7rz87m6g.com",
+    "www.d5p7yn9yj9.com",
+    "www.hz9p8m2bby.com",
+    "www.by782gg8.cc",
+    "www.gxg3rjt15z.com",
+    "www.8nbv7u2sds.com",
+    "plus.fngbcayncx.cc",
+    "www.c3ks9sh7cm.com",
+    "www.55dwv2cr19.com"
+  ],
+  "__meta__": {
+    "version": "0.9",
+    "exportTime": "2026-08-05T01:09:20.648Z",
+    "exporter": "网页元素屏蔽器"
+  }
+}
