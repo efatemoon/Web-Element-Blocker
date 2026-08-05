@@ -10,7 +10,7 @@
 // @grant        GM_getValue
 // @run-at       document-start
 // @license      MIT
-// @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/web-element-blocker.user.js%E2%80%8B
+// @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/web-element-blocker.user.js
 // @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/web-element-blocker.meta.js
 // ==/UserScript==
 
