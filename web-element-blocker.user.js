@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.66
+// @version      0.1.68
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -203,6 +203,12 @@
                 delete this.flashList[this.domain];
                 GM_setValue('pro_blocker_flash_domains', this.flashList);
             }
+            // 同步清除自愈计数残留，避免迁移/重置后遗留无效状态
+            const cleanLoads = GM_getValue('pro_blocker_clean_loads', {});
+            if (cleanLoads[this.domain]) {
+                delete cleanLoads[this.domain];
+                GM_setValue('pro_blocker_clean_loads', cleanLoads);
+            }
             BlockEngine.invalidateCache();
         }
 
@@ -280,6 +286,52 @@
                 this.flashList[this.domain] = true;
                 GM_setValue('pro_blocker_flash_domains', this.flashList);
             }
+            // 闪现复发 → 复位干净加载计数（打断自愈进程）
+            const cleanLoads = GM_getValue('pro_blocker_clean_loads', {});
+            if (cleanLoads[this.domain]) {
+                cleanLoads[this.domain] = 0;
+                GM_setValue('pro_blocker_clean_loads', cleanLoads);
+            }
+        }
+
+        // 自愈机制：本次加载未发生闪现时调用。连续 CLEAN_LOAD_THRESHOLD 次干净加载 → 自动清除闪现标记
+        // 避免 flashList 永久锁定 preemptive，让"系统评估"真正反映当前规则有效性
+        recordCleanLoad() {
+            if (!this.flashList[this.domain]) return false;
+            const CLEAN_LOAD_THRESHOLD = 3;
+            const cleanLoads = GM_getValue('pro_blocker_clean_loads', {});
+            cleanLoads[this.domain] = (cleanLoads[this.domain] || 0) + 1;
+            if (cleanLoads[this.domain] >= CLEAN_LOAD_THRESHOLD) {
+                delete this.flashList[this.domain];
+                delete cleanLoads[this.domain];
+                GM_setValue('pro_blocker_flash_domains', this.flashList);
+                GM_setValue('pro_blocker_clean_loads', cleanLoads);
+                this.invalidateDataCache();
+                return true; // 自愈完成
+            }
+            GM_setValue('pro_blocker_clean_loads', cleanLoads);
+            return false;
+        }
+
+        // 手动重置闪现标记（用户确认规则已生效后清除 preemptive 强制启用）
+        resetFlash() {
+            let changed = false;
+            if (this.flashList[this.domain]) {
+                delete this.flashList[this.domain];
+                GM_setValue('pro_blocker_flash_domains', this.flashList);
+                changed = true;
+            }
+            const cleanLoads = GM_getValue('pro_blocker_clean_loads', {});
+            if (cleanLoads[this.domain]) {
+                delete cleanLoads[this.domain];
+                GM_setValue('pro_blocker_clean_loads', cleanLoads);
+            }
+            if (changed) this.invalidateDataCache();
+            return changed;
+        }
+
+        getCleanLoadCount() {
+            return (GM_getValue('pro_blocker_clean_loads', {})[this.domain]) || 0;
         }
 
         toggleMode() {
@@ -301,35 +353,61 @@
     class BlockEngine {
         static styleElementId = 'pro-blocker-core-css';
         static _cachedDomainList = null;
+        static _cachedDomainSet = null;
         static _cachedPathPatterns = null;
         static _loggedDomains = new Set();
         static _loggedPatterns = new Set();
+        static _loggedOverlays = new Set();
         static _addedNodesBuffer = [];
+        // 本次页面加载是否检测到广告闪现（fastInject 重置，detectFlashAndMark 置位）
+        // load 事件据此判断是否为"干净加载"，驱动 flashList 自愈
+        static _flashDetectedThisLoad = false;
 
         static invalidateCache() {
             this._cachedDomainList = null;
+            this._cachedDomainSet = null;
             this._cachedPathPatterns = null;
+        }
+
+        /**
+         * 域名匹配（最优算法）：用 Set 做精确匹配 O(1)，再逐级上探父域 O(depth)
+         * 替代原 domainList.some(hostname === d || hostname.endsWith('.' + d)) 的 O(n) 线性扫描
+         * 例如 ads.example.com → 先查精确，再查 example.com，再查 com（TLD 单独不计）
+         * 当黑名单 40+ 域名时，单次匹配从 O(40) 降为 O(2~3)
+         */
+        static hostnameBlocked(host, domainSet) {
+            if (!host || !domainSet || domainSet.size === 0) return false;
+            if (domainSet.has(host)) return true;
+            const parts = host.split('.');
+            // 保留至少 TLD：从第二段起逐级上探，避免误匹配单 TLD（如 "com"）
+            for (let i = 1; i < parts.length - 1; i++) {
+                if (domainSet.has(parts.slice(i).join('.'))) return true;
+            }
+            return false;
         }
 
         // 始终在 document-start 注入 CSS，确保广告在首次渲染前即被隐藏
         static fastInject() {
+            this._flashDetectedThisLoad = false;
             this.applyCSSRules();
             // preemptive 判定：用户手动开启该模式，或该域名曾被检测到广告闪现（flashList 标记）
-            // flashList 由 detectFlashAndMark 自动写入，使"下次进入自动启用极速注入"真正生效
+            // flashList 由 detectFlashAndMark 自动写入，recordCleanLoad/resetFlash 自动清除（自愈）
             const data = storage.getData();
             const mode = data.config.mode || 'auto';
             const isPreemptive = mode === 'preemptive' || !!storage.flashList[storage.domain];
             if (isPreemptive) {
-                let frames = 0;
-                const tick = () => {
-                    this.applyCSSRules();
-                    if (document.body) {
-                        this.scanAndBlockDynamic(document.body);
-                        this.scanInvisibleOverlays({ autoBlock: true });
-                    }
-                    if (++frames < 5) requestAnimationFrame(tick);
-                };
-                requestAnimationFrame(tick);
+                // 扫描时序：0/100/300/700/1500ms 递增覆盖，比 5 连续帧（~80ms）更能捕获延迟加载的广告
+                // 早期扫描（0/100ms）拦截 document-start 阶段注入的广告；后期扫描兜底异步注入
+                const delays = [0, 100, 300, 700, 1500];
+                delays.forEach(d => {
+                    setTimeout(() => {
+                        this.applyCSSRules();
+                        if (document.body) {
+                            this.scanAndBlockDynamic(document.body);
+                            this.scanInvisibleOverlays({ autoBlock: true });
+                        }
+                    }, d);
+                });
             } else if (!document.documentElement) {
                 // auto 模式：documentElement 未就绪时下一帧重试一次
                 requestAnimationFrame(() => this.applyCSSRules());
@@ -338,15 +416,17 @@
 
         /**
          * 检测广告闪现：若元素在被拦截前已渲染（有非零尺寸 + 含广告特征），标记域名为闪现域
-         * 一旦标记，下次进入该域会自动启用 preemptive 模式
+         * 一旦标记，下次进入该域会自动启用 preemptive 模式；连续 3 次干净加载后自愈清除
          */
         static detectFlashAndMark(element, triggerUrl) {
             if (!element) return;
             try {
                 const rect = element.getBoundingClientRect();
+                // 阈值 50px：过滤 1x1 追踪像素等非可视闪现，只对真正可见的广告标记
                 if (rect.width < 50 || rect.height < 50) return;
                 const host = triggerUrl ? new URL(triggerUrl, location.href).hostname : '';
                 if (host && AD_KEYWORDS.test(host)) {
+                    this._flashDetectedThisLoad = true;
                     storage.markAsFlashing();
                 }
             } catch (e) { }
@@ -382,10 +462,10 @@
 
                 // 不可见性判定：透明/隐藏但仍可点击
                 const opacity = parseFloat(style.opacity);
-                const isTransparent = opacity < 0.1 ||
-                    style.visibility === 'hidden' ||
-                    (style.backgroundColor === 'rgba(0, 0, 0, 0)' &&
-                        (!style.backgroundImage || style.backgroundImage === 'none'));
+                // 浏览器对透明背景的序列化可能为 'rgba(0, 0, 0, 0)' 或 'transparent'，两者均需识别
+                const bgTransparent = (style.backgroundColor === 'rgba(0, 0, 0, 0)' || style.backgroundColor === 'transparent') &&
+                    (!style.backgroundImage || style.backgroundImage === 'none');
+                const isTransparent = opacity < 0.1 || style.visibility === 'hidden' || bgTransparent;
                 if (!isTransparent) return;
 
                 // 覆盖范围判定：面积需达到阈值
@@ -393,23 +473,29 @@
                 if (rect.width < minSize || rect.height < minSize) return;
                 const area = rect.width * rect.height;
                 if (area < minSize * minSize) return;
+                // 视口相交判定：离屏定位（如 left:-9999px）的元素无法捕获点击，排除以减少误报
+                const vw = window.innerWidth, vh = window.innerHeight;
+                if (rect.right < 0 || rect.bottom < 0 || rect.left > vw || rect.top > vh) return;
 
                 // 跳转能力判定：自身或子元素可触发跳转
                 // 注意：<a href="#"> 的 el.href 会被浏览器解析为"当前URL#"（非 '#'），需排除 hash-only / 空锚点
                 const rawHref = el.tagName === 'A' ? el.getAttribute('href') : null;
                 const selfHref = rawHref !== null && rawHref !== '' && !rawHref.startsWith('#') &&
                     !rawHref.startsWith('javascript:') && !rawHref.startsWith('mailto:');
-                const hasOnClick = el.hasAttribute('onclick') || el.hasAttribute('ontouchstart');
+                const hasOnClick = el.hasAttribute('onclick') || el.hasAttribute('ontouchstart') || el.hasAttribute('onmousedown');
+                // 广告 SDK 常把跳转地址藏在 data-* 属性，由 JS 读取后跳转，纳入触发源
+                const dataTrigger = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('data-link');
                 const childLink = el.querySelector && el.querySelector('a[href]:not([href="#"]):not([href^="javascript:"]):not([href^="#"]):not([href=""])');
                 // 排除 about:blank / 空 src 的 iframe，避免误判为跨域高风险
-                const childIframe = el.querySelector && el.querySelector('iframe[src]:not([src="about:blank"])');
+                const childIframe = el.querySelector && el.querySelector('iframe[src]:not([src="about:blank"]):not([src=""])');
 
                 let triggerUrl = '';
                 if (selfHref) triggerUrl = el.href;
+                else if (dataTrigger) triggerUrl = dataTrigger;
                 else if (childLink) triggerUrl = childLink.href;
                 else if (childIframe) triggerUrl = childIframe.src;
 
-                if (!selfHref && !hasOnClick && !childLink && !childIframe) return;
+                if (!selfHref && !hasOnClick && !dataTrigger && !childLink && !childIframe) return;
 
                 const record = {
                     el,
@@ -441,7 +527,6 @@
                     el.style.setProperty('pointer-events', 'none', 'important');
                     el.style.setProperty('visibility', 'hidden', 'important');
                     record.blocked = true;
-                    if (!this._loggedOverlays) this._loggedOverlays = new Set();
                     const key = record.tagName + '|' + record.id + '|' + record.className;
                     if (!this._loggedOverlays.has(key)) {
                         this._loggedOverlays.add(key);
@@ -474,8 +559,9 @@
                 const esc = escapeCSSAttr(domain);
                 const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [poster*="${esc}"], [srcset*="${esc}"]`;
                 cssText += `${sel} ${hideCSS}`;
-                // :has() 已被主流浏览器支持（Chrome 105+/Firefox 121+/Safari 15.4+），隐藏直接父容器解决横幅空白
-                cssText += `*:has(> ${sel}) ${hideCSS}`;
+                // 注意：:has(> a, b) 中 > 仅作用于 a，其余为后代选择器会过度隐藏。
+                // 用 :is() 包裹整组，使 > 对每个选择器均生效，只隐藏"直接子节点命中"的父容器。
+                cssText += `*:has(> :is(${sel})) ${hideCSS}`;
             });
 
             // 路径模式拦截：典型广告跳转路径，如 /000/flink/url.php
@@ -485,7 +571,7 @@
                     const esc = escapeCSSAttr(r.pattern);
                     const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
                     cssText += `${sel} ${hideCSS}`;
-                    cssText += `*:has(> ${sel}) ${hideCSS}`;
+                    cssText += `*:has(> :is(${sel})) ${hideCSS}`;
                 }
             });
 
@@ -519,6 +605,9 @@
             const pathPatterns = cachedPathPatterns !== undefined ? cachedPathPatterns : (this._cachedPathPatterns !== null ? this._cachedPathPatterns : storage.getData().pathPattern);
             if (this._cachedDomainList === null) this._cachedDomainList = domainList;
             if (this._cachedPathPatterns === null) this._cachedPathPatterns = pathPatterns;
+            // 域名集合与列表同生命周期：列表重建时集合一并重建，避免每次匹配都 new Set
+            if (this._cachedDomainSet === null) this._cachedDomainSet = new Set(this._cachedDomainList);
+            const domainSet = this._cachedDomainSet;
             if (domainList.length === 0 && pathPatterns.length === 0) return;
             if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
 
@@ -572,7 +661,8 @@
                         if (absUrl.startsWith('http')) {
                             const urlObj = new URL(absUrl);
                             if (urlObj.hostname && urlObj.hostname !== currentHost && !urlObj.hostname.endsWith('.' + currentHost)) {
-                                if (domainList.some(d => urlObj.hostname === d || urlObj.hostname.endsWith('.' + d))) {
+                                // Set O(1) 精确匹配 + O(depth) 父域上探，替代 O(n) 线性扫描
+                                if (this.hostnameBlocked(urlObj.hostname, domainSet)) {
                                     blocked = true;
                                     matchedDomain = urlObj.hostname;
                                     break;
@@ -853,6 +943,11 @@
                     this.scanAndBlockDynamic(document.body);
                     this.scanInvisibleOverlays({ autoBlock: true });
                 }
+                // 自愈检查：本次加载（含 preemptive 各时序扫描）未检测到闪现 → 记录一次干净加载
+                // 连续 3 次干净加载后 flashList 自动清除，preemptive 强制启用随之解除
+                if (!this._flashDetectedThisLoad) {
+                    storage.recordCleanLoad();
+                }
             });
 
             // SPA 路由变化时重新应用规则（解决点击链接不刷新导致广告漏网）
@@ -1033,7 +1128,9 @@
                         const text = script.textContent || '';
                         scanString(text, 'script-text');
                         if (text.includes('window.') || text.includes('var ') || text.includes('let ') || text.includes('const ')) {
-                            const domainMatches = text.match(/["']([a-z0-9-]+\.(?:com|cn|net|org|io|cc|tv|xyz|top|club|info|site|vip|icu|asia|app|dev|co|me|mobi|us|biz|ru|jp|tw|hk|uk|de|fr|br|au))["']/gi);
+                            // 允许子域：首尾须为字母数字，中间可含 ./-，覆盖 "ads.example.com" 这类多级广告域
+                            // 原正则 [a-z0-9-]+ 不含点号，无法匹配子域，遗漏了大量广告配置中的域名引用
+                            const domainMatches = text.match(/["']([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.(?:com|cn|net|org|io|cc|tv|xyz|top|club|info|site|vip|icu|asia|app|dev|co|me|mobi|us|biz|ru|jp|tw|hk|uk|de|fr|br|au))["']/gi);
                             if (domainMatches) domainMatches.forEach(d => addUrl('https://' + d.replace(/["']/g, ''), 'script-var'));
                         }
                     });
@@ -1123,9 +1220,15 @@
             this.selectionStack = [];
             this._previewAffectedElements = [];
             this._actionPreview = { active: false, el: null };
+            // 全局域名面板预览状态：必须为实例属性，clearPanel 才能跨面板切换时清理，避免预览隐藏的元素永久残留
+            this._globalPreview = { active: false, elements: [] };
             this._contextmenuHandler = null;
             this._handleMouseOver = this._handleMouseOver.bind(this);
             this._handleClick = this._handleClick.bind(this);
+            // 触屏处理函数同样在构造期绑定一次，保持引用稳定，避免 startSelection 重复 bind 已绑定函数
+            this._handleTouchStart = this._handleTouchStart.bind(this);
+            this._handleTouchMove = this._handleTouchMove.bind(this);
+            this._handleTouchEnd = this._handleTouchEnd.bind(this);
         }
 
         injectStyles() {
@@ -1372,10 +1475,6 @@
             this._keydownHandler = (e) => {
                 if (e.key === 'Escape') this.stopSelection();
             };
-            // 移动端 touch 事件处理函数绑定（必须在 body 就绪前完成绑定以保持引用一致）
-            this._handleTouchStart = this._handleTouchStart.bind(this);
-            this._handleTouchMove = this._handleTouchMove.bind(this);
-            this._handleTouchEnd = this._handleTouchEnd.bind(this);
             document.addEventListener('keydown', this._keydownHandler);
             this._whenBodyReady(() => {
                 document.body.addEventListener('mouseover', this._handleMouseOver, true);
@@ -1874,21 +1973,27 @@
                 renderDomains();
             });
 
-            let previewActive = false;
-            let previewHiddenElements = [];
-            panel.querySelector('#btn-preview-global').addEventListener('click', (e) => {
-                if (previewActive) {
-                    previewHiddenElements.forEach(el => {
+            // 预览状态使用实例属性 this._globalPreview，clearPanel 可跨面板清理，避免预览元素残留
+            const resetGlobalPreview = (btn) => {
+                if (!this._globalPreview.active) return;
+                this._globalPreview.elements.forEach(el => {
+                    if (el) {
                         el.style.removeProperty('display');
                         el.style.removeProperty('opacity');
-                    });
-                    previewHiddenElements = [];
-                    previewActive = false;
-                    e.target.textContent = '🔍 预览效果';
+                    }
+                });
+                this._globalPreview = { active: false, elements: [] };
+                if (btn) btn.textContent = '🔍 预览效果';
+            };
+            // 面板关闭/切换时由 clearPanel 兜底清理；按钮文案需在面板存活期内同步
+            const previewBtn = panel.querySelector('#btn-preview-global');
+            previewBtn.addEventListener('click', (e) => {
+                if (this._globalPreview.active) {
+                    resetGlobalPreview(e.target);
                     return;
                 }
                 if (selectedHosts.size === 0) return;
-                previewHiddenElements = [];
+                this._globalPreview = { active: true, elements: [] };
                 selectedHosts.forEach(d => {
                     const esc = escapeCSSAttr(d);
                     document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
@@ -1896,11 +2001,10 @@
                         if (t.style.display !== 'none') {
                             t.style.setProperty('display', 'none', 'important');
                             t.style.setProperty('opacity', '0', 'important');
-                            previewHiddenElements.push(t);
+                            this._globalPreview.elements.push(t);
                         }
                     });
                 });
-                previewActive = true;
                 e.target.textContent = '👁 恢复显示';
             });
 
@@ -1917,19 +2021,14 @@
                         t.style.setProperty('opacity', '0', 'important');
                     });
                 });
+                // 封杀后这些元素本就应隐藏，直接清空预览状态（不恢复 display），交由 clearPanel 收尾
+                this._globalPreview = { active: false, elements: [] };
                 this.clearPanel();
                 alert(`已封杀 ${list.length} 个域名，后续刷新与所有页面都将自动拦截。`);
             });
 
             panel.querySelector('#btn-cancel-global').addEventListener('click', () => {
-                if (previewActive) {
-                    previewHiddenElements.forEach(el => {
-                        el.style.removeProperty('display');
-                        el.style.removeProperty('opacity');
-                    });
-                    previewHiddenElements = [];
-                    previewActive = false;
-                }
+                resetGlobalPreview(previewBtn);
                 this.clearPanel();
             });
         }
@@ -2315,8 +2414,24 @@
                 rulesHTML = '<p class="empty-tip">当前暂无屏蔽规则</p>';
             } else { rulesHTML += '</ul>'; }
 
-            const modeText = data.config.mode === 'preemptive' ? '强制极速预判 (防闪现)' : '智能自动';
-            const flashStatus = storage.flashList[storage.domain] ? '<span style="color:red; font-weight:bold;">已记录闪现特征，系统采用极速注入</span>' : '运行良好';
+            // 防御策略状态：区分"手动开启"与"闪现自动启用"，并展示自愈进度
+            const isManualPreemptive = data.config.mode === 'preemptive';
+            const isFlashMarked = !!storage.flashList[storage.domain];
+            const cleanCount = storage.getCleanLoadCount();
+            let modeText, modeHint;
+            if (isManualPreemptive) {
+                modeText = '<span style="color:#ffb74d; font-weight:bold;">极速预判（手动开启）</span>';
+                modeHint = '在 0/100/300/700/1500ms 多时序重扫，专治首屏闪现；观察无闪现后可切回智能自动。';
+            } else if (isFlashMarked) {
+                modeText = `<span style="color:#ff6f00; font-weight:bold;">极速预判（闪现自动启用）</span> · 自愈进度 ${cleanCount}/3`;
+                modeHint = '检测到广告闪现已自动升级。连续 3 次干净加载后自动恢复智能自动，或手动重置。';
+            } else {
+                modeText = '<span style="color:#34c759; font-weight:bold;">智能自动</span>';
+                modeHint = '由 MutationObserver 实时拦截动态广告，常规站点推荐。遇首屏闪现可手动切到极速预判。';
+            }
+            const flashStatus = isFlashMarked
+                ? `<span style="color:red; font-weight:bold;">已记录闪现特征</span>（本次加载如无闪现，将计入自愈 ${cleanCount}/3）`
+                : '<span style="color:#34c759; font-weight:bold;">运行良好</span>';
             const domainCount = data.domainBlock.length;
 
             panel.innerHTML = `
@@ -2324,6 +2439,7 @@
 
                 <div class="status-bar">
                     <div><strong>防御策略：</strong> ${modeText}</div>
+                    <div style="font-size:11px; color:#999; margin:2px 0 6px;">${modeHint}</div>
                     <div><strong>系统评估：</strong> ${flashStatus}</div>
                     <div><strong>全局域名黑名单：</strong> 共 ${domainCount} 个域名（跨站点生效）</div>
                 </div>
@@ -2334,6 +2450,7 @@
 
                 <div class="btn-group">
                     <button class="btn-info" id="btn-toggle-mode">🚀 切换防御策略</button>
+                    <button class="btn-warning" id="btn-reset-flash" style="${isFlashMarked ? '' : 'display:none;'}">♻️ 重置闪现标记</button>
                     <button class="btn-success" id="btn-export">📤 导出规则</button>
                     <button class="btn-warning" id="btn-import">📥 导入规则</button>
                 </div>
@@ -2365,9 +2482,21 @@
 
             panel.querySelector('#btn-toggle-mode').addEventListener('click', () => {
                 const newMode = storage.toggleMode();
-                alert(`策略已调整为：${newMode === 'preemptive' ? '极速预判模式' : '智能自动模式'}\n页面即将刷新以应用变更配置。`);
+                alert(`策略已调整为：${newMode === 'preemptive' ? '极速预判模式（多时序重扫，防首屏闪现）' : '智能自动模式（观察器实时拦截）'}\n页面即将刷新以应用变更配置。`);
                 window.location.reload();
             });
+
+            // 手动重置闪现标记：确认规则已生效后清除，解除 preemptive 强制启用
+            const resetBtn = panel.querySelector('#btn-reset-flash');
+            if (resetBtn) {
+                resetBtn.addEventListener('click', () => {
+                    if (confirm('确认清除本站的闪现标记？清除后将恢复"智能自动"模式（除非你手动开启极速预判）。')) {
+                        storage.resetFlash();
+                        alert('闪现标记已清除，页面即将刷新。');
+                        window.location.reload();
+                    }
+                });
+            }
 
             panel.querySelector('#btn-export').addEventListener('click', () => this.showExportPanel());
             panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
@@ -2505,8 +2634,9 @@
                         const esc = escapeCssValue(rule.pattern);
                         // 与脚本内 CSS 注入保持一致：同时隐藏资源元素及其直接父容器（解决横幅空白）
                         // :has() 属于 AdGuard 扩展 CSS，需用 #?# 标记
+                        // 用 :is() 包裹逗号选择器组，确保 > 对每项生效，避免后代匹配过度隐藏
                         const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
-                        return `${domain}##${sel}\n${domain}#?#*:has(> ${sel})`;
+                        return `${domain}##${sel}\n${domain}#?#*:has(> :is(${sel}))`;
                     }
                     case 'complex': {
                         if (!rule.conditions || rule.conditions.length === 0) return null;
@@ -2940,6 +3070,16 @@
                     }
                 });
                 this._previewAffectedElements = [];
+            }
+            // 全局域名面板预览：跨面板切换时恢复被预览隐藏的元素，修复局部变量无法清理的泄漏
+            if (this._globalPreview && this._globalPreview.active) {
+                this._globalPreview.elements.forEach(el => {
+                    if (el) {
+                        el.style.removeProperty('display');
+                        el.style.removeProperty('opacity');
+                    }
+                });
+                this._globalPreview = { active: false, elements: [] };
             }
             this._clearSelectionHighlight();
 

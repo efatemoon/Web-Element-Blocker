@@ -1,5 +1,115 @@
 # 更新日志
 
+## v0.1.68 — 2026-08-05
+
+### 逐菜单功能复核与检测算法深度优化
+
+逐一检测 9 个菜单功能（手动选择 / 全局检索域名 / 扫描不可见覆盖层 / 添加规则 / 管理规则与防御 / 按网站查看 / 导出 / AdGuard 导出 / 导入），核对代码与功能对应关系，并升级核心检测算法。
+
+#### 算法优化 1：域名匹配 O(n) → O(depth)（scanAndBlockDynamic）
+
+- **原算法**：`domainList.some(d => host === d || host.endsWith('.' + d))`，每个 URL 对黑名单做 O(n) 线性扫描。黑名单 40+ 域名时，单次匹配 O(40)。
+- **新算法**：新增 [hostnameBlocked()](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L378) —— 缓存 `Set` 做精确匹配 O(1)，未命中再逐级上探父域 O(depth)（`ads.example.com` → `example.com` → 跳过 TLD）。单次匹配降至 O(2~3)。集合与列表同生命周期，`invalidateCache` 一并失效，无重建开销。
+
+#### 算法优化 2：不可见覆盖层检测更全更准（scanInvisibleOverlays）
+
+- **触发源补全**：新增 `data-href`/`data-url`/`data-link` 与 `onmousedown` 作为跳转触发源，覆盖广告 SDK 把跳转地址藏在 data-\* 属性、由 JS 读取后跳转的形态。
+- **透明背景识别**：`backgroundColor` 序列化兼容 `'rgba(0,0,0,0)'` 与 `'transparent'` 两种形式，避免漏判。
+- **视口相交校验**：离屏定位（如 `left:-9999px`）的覆盖层无法捕获点击，新增视口相交判定，减少误报。
+- **iframe 空源过滤**：子 iframe 选择器排除空 `src=""`，避免误判为跨域高风险。
+
+#### 算法优化 3：脚本域名抽取支持子域（extractResourceDomains）
+
+- **原正则**：`[a-z0-9-]+\.(?:TLD)` 不含点号，`"ads.example.com"` 无法匹配，遗漏广告配置中的多级域名引用。
+- **新正则**：`[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.(?:TLD)`，首尾为字母数字、中间允许 `./-`，正确捕获子域广告域。
+
+### 代码优雅性改进
+
+#### 触屏处理函数绑定统一到构造期
+
+- **原状**：`_handleMouseOver`/`_handleClick` 在构造期 `.bind(this)`，而 `_handleTouchStart/Move/End` 在 `startSelection` 内每次调用重新 `.bind`（对已绑定函数再次 bind，产生冗余链）。
+- **改进**：三个触屏处理函数统一在构造期绑定一次，引用稳定。`startSelection` 重复调用时不再产生新引用，`stopSelection` 移除的始终是同一引用，逻辑更清晰。
+
+#### clearDomain 同步清理自愈计数
+
+- `clearDomain` 现同步清除 `pro_blocker_clean_loads` 中本域的残留计数，避免清除规则后遗留无效状态。
+
+### 9 菜单功能复核结论
+
+| 菜单                    | 复核结论                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------ |
+| 🖱 手动选择屏蔽元素     | 正确。`startSelection` 先 `stopSelection` 防重复绑定泄漏；触屏拦截防广告跳转；清理链完整。 |
+| 🌐 全局检索域名         | 正确（v0.1.67 已修预览泄漏）。域名评分、选择、封杀逻辑闭合。                               |
+| 👁 扫描不可见覆盖层广告 | 正确，本轮增强检测算法。选中索引与 records 同步，重扫后重建。                              |
+| 📝 添加规则             | 正确。5 模式（包含/正则/积木/属性/路径）校验、预览、保存闭合。                             |
+| ⚙️ 管理规则与防御策略   | 正确（v0.1.67 已增强防御策略）。删除/切换/重置/导出入口齐全。                              |
+| 🗂 按网站查看所有规则   | 正确（v0.1.66 新增）。坍缩视图 + 筛选 + 跨站删除。                                         |
+| 📤 导出规则             | 正确。clipboard + execCommand 双通道，下载 blob。                                          |
+| 🛡️ 导出 AdGuard 规则    | 正确（v0.1.67 已修 `:has()` 过度隐藏）。7 类规则 + 域名分段，AND/OR 全覆盖。               |
+| 📥 导入规则             | 正确。合并/覆盖双模式，导入后刷新生效。                                                    |
+
+### 验证
+
+- `node --check` 语法检查通过
+- `hostnameBlocked` 与原 `some` 语义等价性核对（精确 + 父域后缀，TLD 单独不计）
+- 触屏绑定迁移后 `startSelection`/`stopSelection` 引用一致性核对通过
+- 9 菜单调用链与功能逐一对应，无无效代码
+
+---
+
+## v0.1.67 — 2026-08-05
+
+### 深度优化：防御策略（切换防御策略）功能重构
+
+**用户反馈**：不清楚"切换防御策略"到底有什么用。深度审查后发现原实现存在两个核心问题，已一并解决。
+
+#### 问题 1：flashList 永久锁定，"系统评估"名不副实
+
+- **原状**：`detectFlashAndMark` 一旦检测到广告闪现就把域名写入 `flashList`，且**永远不会自动清除**。导致：
+  - 域名被永久强制为 preemptive 模式，即使用户后续加规则已消除闪现；
+  - 管理面板"系统评估"永远显示"已记录闪现特征"，无法反映规则真实效果；
+  - 用户无法手动解除，只能盲操作。
+- **修复（自愈机制）**：新增 `pro_blocker_clean_loads` 计数。`load` 事件时若本次加载未检测到闪现（`_flashDetectedThisLoad=false`）则调用 `recordCleanLoad()` 递增；连续 3 次干净加载后自动清除 `flashList` 标记，preemptive 强制启用随之解除。闪现复发时 `markAsFlashing` 立即复位计数，打断自愈进程。
+- **手动重置**：管理面板新增 `♻️ 重置闪现标记` 按钮（仅闪现标记存在时显示），确认规则已生效后可手动清除。
+
+#### 问题 2：preemptive 扫描时序覆盖不足
+
+- **原状**：preemptive 模式用 `requestAnimationFrame` 连续 5 帧（约 80ms）重扫，仅能覆盖首屏极早期注入的广告，对 200ms 后异步加载的广告无效。
+- **修复**：改为 `0/100/300/700/1500ms` 递增多时序扫描，既保留早期拦截能力，又兜底延迟注入的广告。
+
+#### 状态文案清晰化
+
+- 防御策略状态区分三种：`极速预判（手动开启）` / `极速预判（闪现自动启用）· 自愈进度 N/3` / `智能自动`，每项附带说明文案，用户一眼可知当前模式来源与切换意义。
+
+### 修复的关键 Bug
+
+#### Bug 7：CSS `:has(> a, b, c)` 过度隐藏（选择器作用域错误）
+
+- **位置**：`BlockEngine.applyCSSRules`（domainBlock + pathPattern）、`generateAdGuardRules`（pathPattern）
+- **问题**：`:has(> a, b, c)` 中 `>` 组合器**仅作用于第一个选择器** `a`，其余 `b`、`c` 被解析为后代选择器（任意深度匹配）。本意是"直接子节点命中任一资源选择器即隐藏父容器"，实际变成"后代命中也隐藏"，导致非广告的祖先容器被误隐藏。
+- **修复**：用 `:is()` 包裹整组选择器 → `*:has(> :is(a, b, c))`，使 `>` 对组内每个选择器均生效，只隐藏直接父容器。`:is()` 兼容性（Chrome 88+）高于 `:has()`（Chrome 105+），不降低既有兼容性。
+
+#### Bug 8：showGlobalDomainPanel 预览泄漏（跨面板切换元素永久隐藏）
+
+- **位置**：`UIManager.showGlobalDomainPanel`
+- **问题**：预览状态 `previewActive`/`previewHiddenElements` 为函数内局部变量，`clearPanel` 无法访问。当用户点"预览效果"隐藏若干元素后，不点"取消配置"而是直接打开其他菜单（触发 `clearPanel`），局部闭包丢失，被预览隐藏的元素永久 `display:none` 直到刷新。
+- **修复**：预览状态迁移为实例属性 `this._globalPreview = { active, elements }`，`clearPanel` 统一清理（恢复 display/opacity）。封杀按钮点击后直接清空预览状态（这些元素本就应隐藏，不恢复）。
+
+#### Bug 9：`_loggedOverlays` 未声明为静态字段
+
+- **位置**：`BlockEngine`
+- **问题**：`_loggedOverlays` 在 `scanInvisibleOverlays` 内懒初始化（`if (!this._loggedOverlays) this._loggedOverlays = new Set()`），与同类 `_loggedDomains`/`_loggedPatterns` 的静态字段声明风格不一致。
+- **修复**：补齐 `static _loggedOverlays = new Set();` 声明，移除懒初始化。
+
+### 验证
+
+- `node --check` 语法检查通过
+- `:has(> :is(...))` 选择器语义与 JS 侧 `findSingleChildWrapper` 直接父容器逻辑一致
+- 自愈/重置/手动切换三条路径互不冲突，`_flashDetectedThisLoad` 生命周期（fastInject 重置 → detectFlashAndMark 置位 → load 读取）闭合
+- 预览清理链：`_actionPreview` / `_previewAffectedElements` / `_globalPreview` 三处均在 `clearPanel` 统一收口，无残留分支
+
+---
+
 ## v0.1.66 — 2026-08-05
 
 ### 新功能
