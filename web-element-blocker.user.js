@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.12
+// @version      0.2.13
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -707,7 +707,6 @@
         static _cachedPathRegex = null; // 合并路径正则缓存：false 表示无路径规则
         static _cachedPathIndex = null; // 倒排索引构建标记：null=未构建，true=已构建
         // 泛化规则匹配缓存：域名通配后缀集合 + 路径通配正则
-        static _cachedGenDomainList = null;
         static _cachedGenDomainSet = null;
         static _cachedGenPathRegex = null; // false 表示无泛化路径规则
         static _loggedDomains = new Set();
@@ -737,7 +736,6 @@
             this._cachedPathPatterns = null;
             this._cachedPathRegex = null;
             this._cachedPathIndex = null; // 倒排索引标记重置，下次 isUrlBlocked 重建
-            this._cachedGenDomainList = null;
             this._cachedGenDomainSet = null;
             this._cachedGenPathRegex = null;
             this._lastCSSFingerprint = ''; // 规则变更后强制下次 applyCSSRules 重建样式表
@@ -780,7 +778,6 @@
             if (this._cachedGenDomainSet === null) {
                 const gen = storage.getGeneralized().domain || [];
                 const list = gen.map(r => r && r.rule ? String(r.rule).replace(/^\*\./, '') : '').filter(Boolean);
-                this._cachedGenDomainList = list;
                 this._cachedGenDomainSet = new Set(list);
             }
             return this._cachedGenDomainSet;
@@ -810,8 +807,9 @@
             if (!url || typeof url !== 'string') return false;
             try {
                 const absUrl = new URL(url, location.href);
-                if (absUrl.hostname && absUrl.hostname !== location.hostname &&
-                    !absUrl.hostname.endsWith('.' + location.hostname)) {
+                // 仅排除与当前页完全同域的请求（避免拦截页面自身导航/根资源致页面白屏），
+                // 子域不在豁免范围：用户显式拉黑的 ads.example.com 在 example.com 下必须生效
+                if (absUrl.hostname && absUrl.hostname !== location.hostname) {
                     // 1. 精确域名黑名单
                     if (this.hostnameBlocked(absUrl.hostname, this.getDomainSet())) return true;
                     // 2. 泛化域名通配（*.base 收敛规则）
@@ -1004,6 +1002,15 @@
                         this._loggedOverlays.add(key);
                         console.info(`[Pro Blocker] 拦截不可见覆盖层 ${record.tagName} ${record.rect.w}x${record.rect.h} -> ${triggerUrl || 'onclick'}`);
                     }
+                }
+            });
+
+            // 穿透 Shadow DOM 边界：querySelectorAll 不进入 shadow root，需递归扫描 shadow 内的覆盖层
+            // 广告 SDK 常在 shadow 内注入透明跳转层以规避常规选择器，不递归则完全漏拦
+            candidates.forEach(el => {
+                if (el.shadowRoot) {
+                    const shadowResults = this.scanInvisibleOverlays({ autoBlock, root: el.shadowRoot, minSize });
+                    for (let i = 0; i < shadowResults.length; i++) results.push(shadowResults[i]);
                 }
             });
 
@@ -1212,7 +1219,8 @@
                         if (url.startsWith('//')) absUrl = location.protocol + url;
                         if (absUrl.startsWith('http')) {
                             const urlObj = new URL(absUrl);
-                            if (urlObj.hostname && urlObj.hostname !== currentHost && !urlObj.hostname.endsWith('.' + currentHost)) {
+                            // 仅排除与当前页完全同域的资源；子域不豁免（与 isUrlBlocked 保持一致）
+                            if (urlObj.hostname && urlObj.hostname !== currentHost) {
                                 // Set O(1) 精确匹配 + O(depth) 父域上探，替代 O(n) 线性扫描
                                 if (this.hostnameBlocked(urlObj.hostname, domainSet)) {
                                     blocked = true;
@@ -1457,8 +1465,11 @@
                     }
                 }
                 if (batchNodes.length > 0) {
-                    if (domainList.length > 0 || pathPatterns.length > 0) {
-                        batchNodes.forEach(node => this.scanAndBlockDynamic(node, domainList, pathPatterns, { force: true }));
+                    // 重新获取列表：invalidateCache 会将缓存置 null，闭包捕获的旧数组引用不会更新，
+                    // shadow 内动态节点会因过期规则漏拦截
+                    const cur = this._getLists();
+                    if (cur.domainList.length > 0 || cur.pathPatterns.length > 0) {
+                        batchNodes.forEach(node => this.scanAndBlockDynamic(node, cur.domainList, cur.pathPatterns, { force: true }));
                     }
                     // 去抖执行正则/积木/拓扑规则：shadow 边界外的主观察器无法覆盖 shadow 内动态内容
                     // 不补充此调用则这些规则类型对 shadow 内动态广告完全失效
@@ -1468,7 +1479,7 @@
             obs.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'data-src', 'data-original', 'data-href', 'data-url', 'data-link', 'data-lazy-src', 'data-srcset', 'poster', 'srcset'] });
         }
 
-        // 去抖对 shadow root 应用正则/积木/拓扑规则，避免高频 mutation 重复全量扫描
+        // 去抖对 shadow root 应用正则/积木/拓扑规则 + 覆盖层扫描，避免高频 mutation 重复全量扫描
         static _scheduleShadowApply(root) {
             const existing = this._shadowApplyTimers.get(root);
             if (existing) clearTimeout(existing);
@@ -1477,6 +1488,8 @@
                 this.applyRegexRules(root);
                 this.applyComplexRules(root);
                 this.applyTopologyRules(root);
+                // shadow 内动态注入的透明跳转层同样需拦截，与主观察器行为一致
+                this.scanInvisibleOverlays({ autoBlock: true, root: root });
             }, 150);
             this._shadowApplyTimers.set(root, timer);
         }

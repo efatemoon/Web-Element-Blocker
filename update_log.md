@@ -1,5 +1,40 @@
 # 更新日志
 
+## v0.2.13 — 2026-08-05
+
+### 核心过滤功能深度审计 + 5 处 Bug 修复
+
+对 `GM_registerMenuCommand` 注册的 10 个菜单及底层拦截链路（网络层 / DOM 层 / Shadow DOM / 覆盖层）深度审计，修复 3 处影响广告过滤正确性的关键 Bug + 1 处死代码清理 + 1 处覆盖层扫描盲区。
+
+#### Bug 修复
+
+1. **同源守卫过度跳过子域名黑名单**（[isUrlBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L809) + [scanAndBlockDynamic](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1217)）：
+   - **根因**：`absUrl.hostname.endsWith('.' + location.hostname)` 将当前页面的所有子域划入豁免区，导致用户显式拉黑的 `ads.example.com` 在浏览 `example.com` 时**域名黑名单完全不生效**——网络层不拦截、DOM 层不隐藏，广告照常加载。
+   - **影响**：同源子域广告（站点自托管广告 / CDN 子域广告）成为拦截盲区，这是最常见的广告投放形态之一。
+   - **修复**：两处守卫均移除子域豁免，仅保留精确同域豁免（`hostname !== location.hostname`）。用户显式拉黑的子域现在在父域页面上正确拦截；页面自身根域仍受精确豁免保护不会白屏。
+
+2. **Shadow DOM 观察器闭包捕获过期规则**（[\_observeShadowRoot](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1435) MutationObserver 回调）：
+   - **根因**：`_observeShadowRoot` 在创建 MutationObserver 时通过 `const { domainList, pathPatterns } = this._getLists()` 捕获了当时的规则数组引用。后续用户增删规则触发 `invalidateCache()` 将 `_cachedDomainList` / `_cachedPathPatterns` 置 null，但闭包变量仍指向旧数组。Shadow DOM 内动态注入的节点永远用**过期规则**匹配，新增的域名/路径规则对 shadow 内广告完全失效。
+   - **修复**：MutationObserver 回调内改为调用 `this._getLists()` 重新获取缓存（缓存被 invalidate 后会从 storage 重读），确保 shadow 内动态节点始终用最新规则匹配。
+
+3. **不可见覆盖层扫描不穿透 Shadow DOM**（[scanInvisibleOverlays](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L910)）：
+   - **根因**：`root.querySelectorAll(...)` 不跨越 shadow 边界，广告 SDK 在 shadow root 内注入的透明跳转覆盖层完全逃逸检测。这是 v0.1.68 覆盖层检测增强后遗留的盲区。
+   - **修复**：主候选扫描完成后，遍历所有带 `shadowRoot` 的元素递归调用 `scanInvisibleOverlays`，覆盖层检测现在能穿透 shadow 边界；同时 `[_scheduleShadowApply](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1483)` 新增 `scanInvisibleOverlays` 调用，shadow 内动态注入的覆盖层也会被去抖拦截。
+
+#### 死代码清理
+
+4. **移除 `_cachedGenDomainList` 死字段**：该字段在 `getGeneralizedDomainSet` 中赋值、在 `invalidateCache` 中清除，但**全代码库无任何读取点**（实际使用的是 `_cachedGenDomainSet` 即 Set 结构）。移除声明、赋值、清除三处无效代码。
+
+### 验证
+
+- `node --check` 语法检查通过（user.js + meta.js）
+- 同源守卫修复验证：`ads.example.com` 在 `example.com` 页面下 → `hostname !== location.hostname` 为 true → 进入域名检查 → 命中黑名单拦截 ✓；`example.com` 自身 → 精确豁免 → 页面不白屏 ✓
+- Shadow DOM 闭包修复验证：`invalidateCache` 后 MutationObserver 回调调用 `_getLists()` 重读 storage → 新规则生效 ✓
+- 覆盖层穿透验证：递归扫描 `el.shadowRoot` → shadow 内透明跳转层被检测并 autoBlock ✓
+- 10 菜单 + 核心过滤链路审计无其他 Bug
+
+---
+
 ## v0.2.12 — 2026-08-05
 
 ### 优化方案 v2 全量落地：自动化泛化引擎 + 模糊拓扑指纹 + 构造样式表
