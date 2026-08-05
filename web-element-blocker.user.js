@@ -143,7 +143,7 @@
                 (type === 'dynamic' && item.className === rule.className) ||
                 (type === 'attribute' && item.attrSelector === rule.attrSelector) ||
                 (type === 'structural' && item.structSelector === rule.structSelector) ||
-                (type === 'complex' && JSON.stringify(item.conditions) === JSON.stringify(rule.conditions) && item.level === rule.level) ||
+                (type === 'complex' && JSON.stringify(item.conditions) === JSON.stringify(rule.conditions) && item.level === rule.level && item.logic === rule.logic) ||
                 (type === 'pathPattern' && item.pattern === rule.pattern)
             );
             if (!isDuplicate) {
@@ -313,26 +313,28 @@
 
             const dictKeys = ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config', 'pro_blocker_flash_domains'];
             dictKeys.forEach(key => {
-                if (!importData[key] || typeof importData[key] !== 'object') return;
+                const incoming = importData[key];
                 if (merge) {
+                    if (!incoming || typeof incoming !== 'object') return;
                     const existing = this._readKey(key, {});
-                    for (let d in importData[key]) {
-                        if (!Object.prototype.hasOwnProperty.call(importData[key], d)) continue;
+                    for (let d in incoming) {
+                        if (!Object.prototype.hasOwnProperty.call(incoming, d)) continue;
                         if (!existing[d]) {
-                            existing[d] = importData[key][d];
-                        } else if (Array.isArray(existing[d]) && Array.isArray(importData[key][d])) {
-                            importData[key][d].forEach(item => {
+                            existing[d] = incoming[d];
+                        } else if (Array.isArray(existing[d]) && Array.isArray(incoming[d])) {
+                            incoming[d].forEach(item => {
                                 if (item && typeof item === 'object' && !existing[d].some(x => JSON.stringify(x) === JSON.stringify(item))) {
                                     existing[d].push(item);
                                 }
                             });
                         } else {
-                            existing[d] = importData[key][d];
+                            existing[d] = incoming[d];
                         }
                     }
                     this._markDirty(key, existing);
                 } else {
-                    this._markDirty(key, importData[key]);
+                    // 覆盖模式：导入数据成为新状态；缺失键显式清空，确保"覆盖"语义完整
+                    this._markDirty(key, (incoming && typeof incoming === 'object') ? incoming : {});
                 }
             });
             if (Array.isArray(importData['domainBlocks'])) {
@@ -346,6 +348,8 @@
                 } else {
                     this._markDirty('domainBlocks', validDomains);
                 }
+            } else if (!merge) {
+                this._markDirty('domainBlocks', []); // 覆盖模式缺失则清空全局域名黑名单
             }
             // 泛化规则：合并模式去重追加，覆盖模式直接替换
             if (importData['generalizedRules'] && typeof importData['generalizedRules'] === 'object') {
@@ -368,6 +372,9 @@
                         fused: Array.isArray(incoming.fused) ? incoming.fused : []
                     });
                 }
+            } else if (!merge) {
+                // 覆盖模式缺失则清空泛化规则，确保"覆盖"语义完整
+                this._markDirty('generalizedRules', { domain: [], path: [], fused: [] });
             }
             BlockEngine.invalidateCache();
             this.invalidateDataCache();
@@ -375,7 +382,9 @@
             BlockEngine.applyRegexRules();
             BlockEngine.applyComplexRules();
             // 导入后触发重新泛化，合并新规则并刷新匹配缓存
-            AutoGeneralizer.schedule();
+            // 用同步 run() 而非防抖 schedule()：showImportPanel 紧随 alert+reload，
+            // 防抖定时器会被导航取消导致重新泛化永不执行；同步执行后由 beforeunload 落盘
+            AutoGeneralizer.run();
         }
 
         markAsFlashing() {
@@ -3080,6 +3089,9 @@
                 if (selectedHosts.size === 0) return;
                 const list = Array.from(selectedHosts);
                 if (!confirm(`将封杀以下 ${list.length} 个域名（全局生效，所有页面都将拦截）：\n\n${list.join('\n')}\n\n确认继续？`)) return;
+                // 先恢复预览隐藏的所有元素：若用户预览后改了选择，未选中域名的元素需还原 display，
+                // 否则会话内永久隐藏却无对应规则（刷新后才恢复）。封杀逻辑随后会重新隐藏选中域名的元素。
+                resetGlobalPreview(previewBtn);
                 list.forEach(d => storage.addRule('domainBlock', { domain: d, type: 'domainBlock' }));
                 list.forEach(d => {
                     const esc = escapeCSSAttr(d);
@@ -3089,7 +3101,7 @@
                         t.style.setProperty('opacity', '0', 'important');
                     });
                 });
-                // 封杀后这些元素本就应隐藏，直接清空预览状态（不恢复 display），交由 clearPanel 收尾
+                // 封杀的元素已由上方逻辑重新隐藏，预览状态已清空，交由 clearPanel 收尾
                 this._globalPreview = { active: false, elements: [] };
                 this.clearPanel();
                 alert(`已封杀 ${list.length} 个域名，后续刷新与所有页面都将自动拦截。`);
@@ -3435,6 +3447,11 @@
                         const escapedText = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
                         regexRule = `.*${escapedText}.*`;
                     }
+                    // 正则模式保存前校验语法，与预览路径一致；非法正则会被 applyRegexRules 静默丢弃
+                    if (mode === 'regex') {
+                        try { new RegExp(regexRule); }
+                        catch (e) { alert('校验失败：正则表达式语法错误。\n' + e.message); return; }
+                    }
 
                     storage.addRule('regex', { regex: regexRule, level: level, type: 'regex' });
                     BlockEngine.applyRegexRules();
@@ -3572,8 +3589,11 @@
                     const type = typeMap[e.target.getAttribute('data-type')];
                     const index = parseInt(e.target.getAttribute('data-index'), 10);
                     storage.removeRule(type, index);
-                    // regex/complex 通过 inline style 隐藏，删除后需刷新才能恢复
-                    if (type === 'regex' || type === 'complex') {
+                    // regex/complex 经 applyRegexRules/applyComplexRules 设 inline display:none；
+                    // pathPattern/domainBlock 经 scanAndBlockDynamic 对动态加载资源也设 inline display:none。
+                    // 删除规则只重建样式表（移除 CSS 层），inline 样式残留 → 需刷新才能恢复显示。
+                    // static/dynamic/attribute/structural 仅靠 CSS 样式表隐藏，删除即可恢复，无需刷新。
+                    if (type === 'regex' || type === 'complex' || type === 'pathPattern' || type === 'domainBlock') {
                         window.location.reload();
                     } else {
                         this.showManager();
@@ -3755,7 +3775,7 @@
                                 else if (c.operator === 'not_contains') pseudoParts.push(`:not([id*="${escapeCssValue(c.value)}"])`);
                             } else if (c.type === 'text') {
                                 if (c.operator === 'contains') pseudoParts.push(`:has-text("${escapeCssValue(c.value)}")`);
-                                if (c.operator === 'equals') pseudoParts.push(`:has-text(/^${escapeRegexLiteral(c.value)}$/)`);
+                                if (c.operator === 'equals') pseudoParts.push(`:has-text(/^\\s*${escapeRegexLiteral(c.value)}\\s*$/)`);
                                 if (c.operator === 'not_contains') pseudoParts.push(`:not(:has-text("${escapeCssValue(c.value)}"))`);
                             }
                         });
@@ -3777,7 +3797,7 @@
                                     if (c.operator === 'not_contains') return `${domain}#?#*:not([id*="${escapeCssValue(c.value)}"])`;
                                 } else if (c.type === 'text') {
                                     if (c.operator === 'contains') return `${domain}#?#*:has-text("${escapeCssValue(c.value)}")`;
-                                    if (c.operator === 'equals') return `${domain}#?#*:has-text(/^${escapeRegexLiteral(c.value)}$/)`;
+                                    if (c.operator === 'equals') return `${domain}#?#*:has-text(/^\\s*${escapeRegexLiteral(c.value)}\\s*$/)`;
                                     if (c.operator === 'not_contains') return `${domain}#?#*:not(:has-text("${escapeCssValue(c.value)}"))`;
                                 }
                                 return null;
@@ -3831,7 +3851,7 @@
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
                 <p class="hint-text">已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
-                <div class="export-box" id="ag-export-box"></div>
+                <textarea class="export-box" id="ag-export-box" readonly></textarea>
                 <div class="btn-group">
                     <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
                     <button class="btn-success" id="btn-ag-download">💾 下载 txt</button>
@@ -3843,20 +3863,18 @@
             this.shadowRoot.appendChild(panel);
 
             const box = panel.querySelector('#ag-export-box');
-            box.textContent = rulesText || '! 当前没有可转换的规则';
+            box.value = rulesText;
 
             panel.querySelector('#btn-ag-copy').addEventListener('click', async () => {
                 try {
                     await navigator.clipboard.writeText(rulesText);
                     alert('AdGuard 规则已复制到剪贴板！');
                 } catch (e) {
-                    const range = document.createRange();
-                    range.selectNode(box);
-                    const sel = window.getSelection();
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    try { document.execCommand('copy'); alert('已复制！'); }
-                    catch (e2) { alert('复制失败，请手动复制。'); }
+                    // textarea.select() + execCommand 在 Shadow DOM 中可靠（浏览器原生处理选区），
+                    // 优于 createRange+selectNode 对 Shadow DOM 节点的程序化选区（跨浏览器不一致）
+                    box.select();
+                    try { document.execCommand('copy'); alert('AdGuard 规则已复制到剪贴板！'); }
+                    catch (e2) { alert('复制失败，请手动选中文本复制。'); }
                 }
             });
 
@@ -3964,7 +3982,8 @@
 
             panel.querySelector('#btn-block-overlay').addEventListener('click', () => {
                 if (selectedSet.size === 0) return;
-                Array.from(selectedSet).sort((a, b) => b - a).forEach(idx => {
+                // 仅修改 record 属性不删除数组元素，无需降序遍历；直接 forEach
+                Array.from(selectedSet).forEach(idx => {
                     const r = records[idx];
                     if (!r || !r.el || !document.contains(r.el)) return;
                     r.el.style.setProperty('display', 'none', 'important');

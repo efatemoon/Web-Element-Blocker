@@ -48,6 +48,21 @@
 2. **`PathInvertedIndex` 声明未接入**：`_cachedPathIndex` 字段已声明但 `invalidateCache` 未重置、`isUrlBlocked` 未调用 → 补 `_ensurePathIndex` 懒构建并在 `invalidateCache` 重置标记。
 3. **`DomainGeneralizer` sources 元数据错位**：`childDomains` 过滤比较时 reverse 切片（`com.ads`）与正向拼接（`ads.com`）顺序不一致，导致 sources 恒为空 → 统一为 `[...currentPath, key].join('.')` 倒序键。
 
+#### 10 菜单功能逐项审计 + 修复
+
+对 `GM_registerMenuCommand` 注册的全部 10 个菜单（手动选择 / 全局检索域名 / 扫描覆盖层 / 添加规则 / 管理规则 / 按网站查看 / 自动化泛化 / 导出 / AdGuard 导出 / 导入）深度审计，修复 8 处 Bug：
+
+1. **导入后重新泛化永不执行**（[showImportPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L4252) → importAll）：`importAll` 调防抖 `AutoGeneralizer.schedule()`（500ms），但 `showImportPanel` 紧随 `alert` + `reload()`，导航取消定时器，注释承诺的"导入后重新泛化"落空 → 改为同步 `AutoGeneralizer.run()`，由 `beforeunload` 落盘。
+2. **预览后改选再封杀，未选中域名元素会话内永久隐藏**（[showGlobalDomainPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3081)）：封杀 handler 直接清空预览状态不恢复 display，假设预览元素==封杀元素；用户预览后取消勾选某域名再封杀，该域名元素无规则却保持 `display:none` → 封杀前先 `resetGlobalPreview` 恢复全部预览元素，封杀逻辑随后重新隐藏选中域名。
+3. **正则模式保存未校验非法正则**（[showRegexPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3444)）：regex 模式直接存入用户输入，`applyRegexRules` 编译失败时静默丢弃，规则永不生效无提示 → 保存前 `new RegExp` 校验，与预览路径一致。
+4. **删除 pathPattern/domainBlock 规则未刷新，inline 隐藏残留**（[showManager](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3589)）：`scanAndBlockDynamic` 对路径/域名匹配的动态资源设 inline `display:none`，删除规则只重建样式表（移除 CSS 层），inline 样式残留致已隐藏元素不恢复 → 将 pathPattern/domainBlock 纳入 reload 分支（与 regex/complex 一致）。
+5. **complex 规则去重漏比 `logic`**（[addRule](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L146)）：同 conditions+level 但不同 logic（AND vs OR）的规则被误判重复丢弃 → 补 `item.logic === rule.logic`。
+6. **AdGuard 导出 text equals 正则不 trim**（[generateAdGuardRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3771)）：导出 `/^value$/` 锚定整段 textContent 不容空白，而脚本自身匹配用 `val.trim()===c.value.trim()`，跨平台迁移后规则失效 → 改为 `/^\s*value\s*$/`（AND 与 OR 两处）。
+7. **AdGuard 复制 fallback 在 Shadow DOM 不可靠**（[showAdGuardExportPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3854)）：`createRange+selectNode` 对 Shadow DOM 内 div 的程序化选区跨浏览器不一致 → 改为 `<textarea readonly>` + `select()` + `execCommand`，与 showExportPanel 一致。
+8. **覆盖导入缺失键不清空**（[importAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L315)）：覆盖模式下导入 JSON 缺某键时跳过处理，现有数据保留，与"覆盖"语义矛盾 → 缺失键显式清空（dictKeys→{}、domainBlocks→[]、generalizedRules→空）。
+
+清理 1 处死代码：`showOverlayScanPanel` 封杀 handler 的降序 `sort`（不删除数组元素，sort 无意义）。
+
 ### 验证
 
 - `node --check` 语法检查通过（user.js + meta.js）
@@ -55,7 +70,9 @@
 - DomainGeneralizer 边界用例：3 子域 → `*.ads.com`（sources 正确填充）；google/facebook/amazon → `[]`（`*.com` 守卫生效）；< threshold → `[]`
 - PathGeneralizer 边界用例：`/ads/banner/1.js` 等 3 路径 → `/ads/banner/*`（vc=9≥8 通过）；`/a/b` vs `/a/c` → null（vc=1<8 熔断）
 - Constructable Stylesheets 降级链：支持时 `replaceSync` 快路径 → 整体失败时 `insertRule` 隔离 → 不支持时 `<style>` 降级
+- AdGuard text equals 导出串验证：`:has-text(/^\s*广告\s*$/)` 正确生成
 - 六大维度全部落地：倒排索引 ✅ / MurmurHash3 模糊拓扑 ✅ / Constructable Stylesheets ✅ / 域名泛化 ✅ / 路径泛化 ✅ / 泛化面板 ✅
+- 10 菜单逐项审计：startSelection / showOverlayScanPanel / showAllSitesPanel / showGeneralizationPanel / showExportPanel 审计无 Bug；其余 5 项共修复 8 处
 
 ---
 
