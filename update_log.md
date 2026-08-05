@@ -1,5 +1,37 @@
 # 更新日志
 
+## v0.2.11 — 2026-08-05
+
+### 优化方案六大维度终检 + 隐藏 Bug 修复
+
+对照 `优化方案.md` 逐维度复核，补齐缺失项并修复代码审查发现的 4 个隐藏 Bug。
+
+#### 维度二.3 补齐：广告域置信度评分引擎（Logistic Regression）
+
+- 新增 [AdScorerLR](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1566) 类：用 Sigmoid 将线性累加压缩到 (0,1) 概率区间，从数学根源解决"分数无上限"与基础设施域名误杀；结合香农熵识别 DGA 随机子域。
+- 接入 [NetworkInterceptor.isUrlBlocked()](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1663)：LR 得分 ≥ 85 且非同源/非安全 CDN 时自动加入拦截队列，减少人工指认成本（软阻断 200 空响应，单关键词域名不触发）。
+- [extractResourceDomains](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1437) 评分矩阵加 `Math.min(100, …)` 上界，与 LR 引擎 0-100 刻度对齐。
+
+#### 维度六.1 补齐：匹配引擎耗时看板
+
+- `BlockEngine.stats` 新增 `matchTimeMs`，[scanAndBlockDynamic](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L753) 累计 `performance.now()` 耗时。
+- 管理面板状态栏由 2 列扩为 3 列，新增 `⚡ 匹配耗时 N ms`，衡量 Long Task 风险。
+
+#### Bug 修复（代码审查发现）
+
+1. **requestIdleCallback 丢失文本节点**（[applyRegexRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L876)）：原逻辑 `timeRemaining` 耗尽时 `break`，但 `walker.nextNode()` 已推进指针，该节点永久漏匹配 → 改为先执行 `_executeRegexMatch` 再判时让出，确保每个节点都被处理。
+2. **Shadow DOM 规则失效**（[\_observeShadowRoot](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1008)）：① 初始扫描传 `ShadowRoot`（nodeType 11）被 `scanAndBlockDynamic` 的 ELEMENT_NODE 守卫直接 return，成空操作 → 改为遍历 `root.children` 逐个扫描；② 观察器回调只跑域名/路径规则，正则/积木/拓扑规则对 shadow 内动态内容完全失效 → 新增 [\_scheduleShadowApply](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1045) 去抖补跑三类规则；③ `applyComplexRules`/`applyTopologyRules` 用 `targetNode.parentElement` 回退，而 `ShadowRoot.parentElement` 为 null → 增加 `DOCUMENT_FRAGMENT_NODE` 分支直接以 shadow root 为查询根。
+3. **高亮颜色配置失效**（[showManager](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3062)）：`#ui-highlight-color` 输入框无任何事件监听器，`config_highlight_color` 只读不写，颜色永远保持默认 → 补 `input` 监听器，校验 Hex 后实时更新 CSS 变量、预览色块并 `GM_setValue` 持久化。
+4. **IntersectionObserver 内存泄漏**（[childListObserver](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1126)）：节点从 DOM 移除后未 `unobserve`，IntersectionObserver 持强引用阻止 GC，SPA 虚拟列表/无限滚动场景内存持续增长 → `removedNodes` 回调中主动 `unobserve`。
+
+### 验证
+
+- `node --check` 语法检查通过
+- AdScorerLR 边界用例：空 URL / 2 段 hostname / 畸形 URL 均 try/catch 放行；单关键词域名（ad=50/ads=57）低于阈值 85 不误杀，双关键词（ads+track=91）触发自动拦截
+- 6 维度优化全部落地：网络层 ✅ / ReDoS ✅ / LR 评分 ✅ / CSSOM 增量 ✅ / MutationObserver 拆分 ✅ / IntersectionObserver ✅ / TreeWalker 分片 ✅ / WeakSet+Shadow 穿透 ✅ / StorageManager 防抖 ✅ / 拓扑哈希 ✅ / 状态看板+Hex 配置 ✅
+
+---
+
 ## v0.2.00 — 2026-08-05
 
 ### Bug 修复：预览→恢复后红框消失
