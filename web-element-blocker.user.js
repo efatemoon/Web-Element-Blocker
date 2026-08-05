@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.62
+// @version      0.1.63
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -260,6 +260,10 @@
         // 始终在 document-start 注入 CSS，确保广告在首次渲染前即被隐藏
         static fastInject() {
             this.applyCSSRules();
+            // documentElement 此刻可能尚未就绪，下一帧重试一次确保 CSS 落地
+            if (!document.documentElement) {
+                requestAnimationFrame(() => this.applyCSSRules());
+            }
         }
 
         static applyCSSRules() {
@@ -300,11 +304,14 @@
 
             if (!cssText) return;
 
+            // document-start 阶段 documentElement 可能尚未就绪，做安全检查避免抛错
+            const parent = document.head || document.documentElement;
+            if (!parent) return;
+
             let styleEl = document.getElementById(this.styleElementId);
             if (!styleEl) {
                 styleEl = document.createElement('style');
                 styleEl.id = this.styleElementId;
-                const parent = document.head || document.documentElement;
                 if (parent.firstChild) {
                     parent.insertBefore(styleEl, parent.firstChild);
                 } else {
@@ -505,6 +512,10 @@
         }
 
         static startObserver() {
+            // 监听这些资源属性的变化，捕获懒加载广告（src 在元素插入后才被 JS 设置）
+            const RESOURCE_ATTRS = ['src', 'href', 'data-src', 'data-original', 'poster', 'srcset'];
+
+            // 正则/积木规则较重，去抖执行；缩短到 120ms/600ms 让广告闪现时间最短
             const debouncedDynamicApply = debounce(() => {
                 const rawNodes = this._addedNodesBuffer;
                 this._addedNodesBuffer = [];
@@ -526,13 +537,21 @@
                         this.applyComplexRules(node);
                     });
                 }
-            }, 300, 2000);
+            }, 120, 600);
+
+            // 批量获取缓存的域名/路径列表，避免每个 mutation 重复读取存储
+            const getLists = () => {
+                if (this._cachedDomainList === null) this._cachedDomainList = GM_getValue('domainBlocks', []);
+                if (this._cachedPathPatterns === null) this._cachedPathPatterns = storage.getData().pathPattern;
+                return { domainList: this._cachedDomainList, pathPatterns: this._cachedPathPatterns };
+            };
 
             const observer = new MutationObserver((mutations) => {
                 let hasAddedNodes = false;
                 const batchNodes = [];
+                const attrNodes = new Set();
                 for (let mutation of mutations) {
-                    if (mutation.addedNodes.length > 0) {
+                    if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
                         hasAddedNodes = true;
                         mutation.addedNodes.forEach(node => {
                             if (node.nodeType === Node.ELEMENT_NODE) {
@@ -540,16 +559,20 @@
                                 this._addedNodesBuffer.push(node);
                             }
                         });
+                    } else if (mutation.type === 'attributes' && mutation.target && mutation.target.nodeType === Node.ELEMENT_NODE) {
+                        // 属性变化：懒加载广告在元素插入后才设置 src/data-src，需立即扫描容器
+                        attrNodes.add(mutation.target);
                     }
                 }
-                if (hasAddedNodes) {
-                    // 批量扫描：缓存只读一次，所有节点共用
-                    const domainList = this._cachedDomainList !== null ? this._cachedDomainList : GM_getValue('domainBlocks', []);
-                    const pathPatterns = this._cachedPathPatterns !== null ? this._cachedPathPatterns : storage.getData().pathPattern;
-                    if (this._cachedDomainList === null) this._cachedDomainList = domainList;
-                    if (this._cachedPathPatterns === null) this._cachedPathPatterns = pathPatterns;
-                    batchNodes.forEach(node => this.scanAndBlockDynamic(node, domainList, pathPatterns));
-                    debouncedDynamicApply();
+                if (hasAddedNodes || attrNodes.size > 0) {
+                    const { domainList, pathPatterns } = getLists();
+                    // 新增节点 + 属性变更节点立即扫描域名/路径（不等去抖，避免广告闪现）
+                    if (domainList.length > 0 || pathPatterns.length > 0) {
+                        batchNodes.forEach(node => this.scanAndBlockDynamic(node, domainList, pathPatterns));
+                        attrNodes.forEach(node => this.scanAndBlockDynamic(node, domainList, pathPatterns));
+                    }
+                    // 正则/积木规则仅在新增节点时去抖执行（属性变化不改文本内容，无需重跑）
+                    if (hasAddedNodes) debouncedDynamicApply();
                 }
             });
 
@@ -574,22 +597,32 @@
                 headObserver.observe(document.documentElement, { childList: true });
             }
 
-            // body 就绪后立即启动全量扫描 + 观察器（不等 DOMContentLoaded，消除监控盲区）
-            const startObserving = () => {
+            // 立即在 documentElement 上启动观察器（不等 body，覆盖 head 阶段注入的早期广告）
+            // 这是解决"首次进入广告未过滤、需刷新"的关键：原来等 body 才观察，会漏掉 body 之前注入的节点
+            observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: RESOURCE_ATTRS
+            });
+
+            // body 就绪后立即做全量扫描（不等 DOMContentLoaded，消除监控盲区）
+            const doInitialScan = () => {
                 this.applyCSSRules();
-                this.applyRegexRules();
-                this.applyComplexRules();
-                this.scanAndBlockDynamic(document.body);
-                observer.observe(document.body, { childList: true, subtree: true });
+                if (document.body) {
+                    this.applyRegexRules();
+                    this.applyComplexRules();
+                    this.scanAndBlockDynamic(document.body);
+                }
             };
 
             if (document.body) {
-                startObserving();
+                doInitialScan();
             } else {
                 const bodyObserver = new MutationObserver(() => {
                     if (document.body) {
                         bodyObserver.disconnect();
-                        startObserving();
+                        doInitialScan();
                     }
                 });
                 bodyObserver.observe(document.documentElement, { childList: true });
@@ -600,7 +633,7 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                this.scanAndBlockDynamic(document.body);
+                if (document.body) this.scanAndBlockDynamic(document.body);
             });
 
             // 页面完全加载后再做一次兜底扫描
@@ -608,7 +641,7 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                this.scanAndBlockDynamic(document.body);
+                if (document.body) this.scanAndBlockDynamic(document.body);
             });
 
             // SPA 路由变化时重新应用规则（解决点击链接不刷新导致广告漏网）
@@ -2194,37 +2227,59 @@
                 ...Object.keys(ruleBuckets.complexBlocks),
                 ...Object.keys(ruleBuckets.pathPatternBlocks)
             ]);
-            const globalDomains = Array.isArray(ruleBuckets.domainBlocks) ? ruleBuckets.domainBlocks : [];
-            const lines = ['! 由 Web Element Blocker 转换的 AdGuard 规则', `! 生成时间：${new Date().toLocaleString()}`, ''];
+            // 校验域名：非空、无空白、长度合理
+            const isValidDomain = (d) => typeof d === 'string' && d.length > 0 && d.length < 200 && !/\s/.test(d);
+            const globalDomains = (Array.isArray(ruleBuckets.domainBlocks) ? ruleBuckets.domainBlocks : [])
+                .filter(isValidDomain);
+
+            const lines = [
+                '! 由 Web Element Blocker 转换的 AdGuard 规则',
+                `! 生成时间：${new Date().toLocaleString()}`,
+                '! 兼容 AdGuard 浏览器扩展 / uBlock Origin。',
+                '! 注意：元素隐藏类规则 (## / #?#) 仅适用于浏览器扩展，不适用于 AdGuard DNS。',
+                '! AdGuard DNS 仅支持下方"全局域名拦截（DNS 兼容）"段落中的 ||domain^ 规则。',
+                ''
+            ];
 
             const escapeCssValue = (v) => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
             const firstClassToken = (cls) => (cls || '').split(/\s+/).filter(Boolean)[0] || cls;
+            // 用户已写好的正则 → 仅转义定界符 / 并剔除换行（保留反斜杠的 regex 语义）
+            const escapeAdGuardRegex = (r) => String(r).replace(/[\r\n]+/g, '').replace(/\//g, '\\/');
+            // 纯文本 → 转义全部 regex 元字符与定界符，用于嵌入 /.../ 字面量
+            const escapeRegexLiteral = (v) => String(v).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&').replace(/[\r\n]+/g, '');
 
+            /**
+             * 把单条规则转换为 AdGuard 兼容文本（OR 模式可能返回多行，用 \n 分隔）
+             * 标记说明：
+             *   ##  = 普通元素隐藏（标准 CSS 选择器）
+             *   #?# = 扩展 CSS（含 :has-text / :not(:has-text) 等扩展伪类，AdGuard 强制要求此标记）
+             * 文本匹配统一用 :has-text()，它是 uBlock Origin 主用名、AdGuard 的 :contains() 同义词，兼容性最佳。
+             */
             const convertRule = (rule, domain) => {
-                if (!rule || !rule.type) return null;
+                if (!rule || !rule.type || !isValidDomain(domain)) return null;
                 switch (rule.type) {
                     case 'static':
-                        return `${domain}##${rule.selector}`;
+                        return rule.selector ? `${domain}##${rule.selector}` : null;
                     case 'dynamic':
                         return rule.className ? `${domain}##[class*="${escapeCssValue(firstClassToken(rule.className))}"]` : null;
                     case 'attribute':
                         return rule.attrSelector ? `${domain}##${rule.attrSelector}` : null;
                     case 'structural':
                         return rule.structSelector ? `${domain}##${rule.structSelector}` : null;
-                    case 'regex':
+                    case 'regex': {
                         if (!rule.regex) return null;
-                        try {
-                            new RegExp(rule.regex);
-                            return `${domain}##:has-text(/${rule.regex.replace(/\//g, '\\/')}/)`;
-                        } catch (e) { return null; }
-                    case 'contains':
-                        if (!rule.regex) return null;
-                        return `${domain}##:contains("${escapeCssValue(rule.regex)}")`;
-                    case 'domainBlock':
-                        return `||${rule.domain}^$third-party`;
-                    case 'pathPattern':
+                        try { new RegExp(rule.regex); } catch (e) { return null; }
+                        const body = escapeAdGuardRegex(rule.regex);
+                        if (!body) return null;
+                        // 扩展 CSS 必须用 #?# 标记
+                        return `${domain}#?#*:has-text(/${body}/)`;
+                    }
+                    case 'pathPattern': {
                         if (!rule.pattern) return null;
-                        return `${domain}##a[href*="${escapeCssValue(rule.pattern)}"], ${domain}##[src*="${escapeCssValue(rule.pattern)}"]`;
+                        const esc = escapeCssValue(rule.pattern);
+                        // AdGuard 一行一条规则，多选择器用逗号合并（与脚本内 CSS 注入的属性范围保持一致）
+                        return `${domain}##[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+                    }
                     case 'complex': {
                         if (!rule.conditions || rule.conditions.length === 0) return null;
                         const andMode = rule.logic === 'AND';
@@ -2239,34 +2294,34 @@
                                 else if (c.operator === 'contains') simpleParts.push(`[id*="${escapeCssValue(c.value)}"]`);
                                 else if (c.operator === 'not_contains') pseudoParts.push(`:not([id*="${escapeCssValue(c.value)}"])`);
                             } else if (c.type === 'text') {
-                                if (c.operator === 'contains') pseudoParts.push(`:contains("${escapeCssValue(c.value)}")`);
-                                if (c.operator === 'equals') pseudoParts.push(`:has-text(/^${c.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$/)`);
-                                if (c.operator === 'not_contains') pseudoParts.push(`:not(:contains("${escapeCssValue(c.value)}"))`);
+                                if (c.operator === 'contains') pseudoParts.push(`:has-text("${escapeCssValue(c.value)}")`);
+                                if (c.operator === 'equals') pseudoParts.push(`:has-text(/^${escapeRegexLiteral(c.value)}$/)`);
+                                if (c.operator === 'not_contains') pseudoParts.push(`:not(:has-text("${escapeCssValue(c.value)}"))`);
                             }
                         });
-                        const base = simpleParts.length ? `*${simpleParts.join('')}` : '*';
-                        const tail = pseudoParts.join('');
-                        if (!tail && !simpleParts.length) return null;
                         if (andMode) {
-                            return `${domain}##${base}${tail}`;
+                            if (!pseudoParts.length && !simpleParts.length) return null;
+                            const base = simpleParts.length ? `*${simpleParts.join('')}` : '*';
+                            const marker = pseudoParts.length > 0 ? '#?#' : '##';
+                            return `${domain}${marker}${base}${pseudoParts.join('')}`;
                         } else {
-                            const perCondition = rule.conditions.map(c => {
+                            // OR：每条件单独成行，含扩展伪类时用 #?#
+                            return rule.conditions.map(c => {
                                 if (c.type === 'class') {
                                     if (c.operator === 'contains') return `${domain}##*[class*="${escapeCssValue(c.value)}"]`;
                                     if (c.operator === 'equals') return `${domain}##[class*="${escapeCssValue(c.value)}"]`;
-                                    if (c.operator === 'not_contains') return `${domain}##*:not([class*="${escapeCssValue(c.value)}"])`;
+                                    if (c.operator === 'not_contains') return `${domain}#?#*:not([class*="${escapeCssValue(c.value)}"])`;
                                 } else if (c.type === 'id') {
                                     if (c.operator === 'equals') return `${domain}##[id="${escapeCssValue(c.value)}"]`;
                                     if (c.operator === 'contains') return `${domain}##[id*="${escapeCssValue(c.value)}"]`;
-                                    if (c.operator === 'not_contains') return `${domain}##*:not([id*="${escapeCssValue(c.value)}"])`;
+                                    if (c.operator === 'not_contains') return `${domain}#?#*:not([id*="${escapeCssValue(c.value)}"])`;
                                 } else if (c.type === 'text') {
-                                    if (c.operator === 'contains') return `${domain}##:contains("${escapeCssValue(c.value)}")`;
-                                    if (c.operator === 'equals') return `${domain}##:has-text(/^${c.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$/)`;
-                                    if (c.operator === 'not_contains') return `${domain}##*:not(:contains("${escapeCssValue(c.value)}"))`;
+                                    if (c.operator === 'contains') return `${domain}#?#*:has-text("${escapeCssValue(c.value)}")`;
+                                    if (c.operator === 'equals') return `${domain}#?#*:has-text(/^${escapeRegexLiteral(c.value)}$/)`;
+                                    if (c.operator === 'not_contains') return `${domain}#?#*:not(:has-text("${escapeCssValue(c.value)}"))`;
                                 }
                                 return null;
-                            }).filter(Boolean);
-                            return perCondition.join('\n');
+                            }).filter(Boolean).join('\n');
                         }
                     }
                     default:
@@ -2294,8 +2349,13 @@
             });
 
             if (globalDomains.length) {
-                lines.push('! 全局域名拦截');
+                // 浏览器扩展版：$third-party 限定第三方请求，避免误杀同域资源
+                lines.push('! 全局域名拦截（AdGuard 浏览器扩展 / uBlock Origin）');
                 globalDomains.forEach(host => lines.push(`||${host}^$third-party`));
+                lines.push('');
+                // DNS 兼容版：AdGuard DNS 会忽略含未知修饰符的整条规则，故去掉 $third-party
+                lines.push('! 全局域名拦截（AdGuard DNS 兼容，无修饰符）');
+                globalDomains.forEach(host => lines.push(`||${host}^`));
                 lines.push('');
             }
 
@@ -2310,7 +2370,7 @@
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
-                <p class="hint-text">下方已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容的过滤语法。你可以直接导入到 AdGuard 浏览器扩展、AdGuard DNS 或 uBlock Origin 的「自定义规则」中。</p>
+                <p class="hint-text">已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
                 <div class="export-box" id="ag-export-box"></div>
                 <div class="btn-group">
                     <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
