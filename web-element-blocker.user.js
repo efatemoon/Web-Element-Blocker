@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.63
+// @version      0.1.65
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -260,10 +260,143 @@
         // 始终在 document-start 注入 CSS，确保广告在首次渲染前即被隐藏
         static fastInject() {
             this.applyCSSRules();
-            // documentElement 此刻可能尚未就绪，下一帧重试一次确保 CSS 落地
-            if (!document.documentElement) {
+            // preemptive 判定：用户手动开启该模式，或该域名曾被检测到广告闪现（flashList 标记）
+            // flashList 由 detectFlashAndMark 自动写入，使"下次进入自动启用极速注入"真正生效
+            const data = storage.getData();
+            const mode = data.config.mode || 'auto';
+            const isPreemptive = mode === 'preemptive' || !!storage.flashList[storage.domain];
+            if (isPreemptive) {
+                let frames = 0;
+                const tick = () => {
+                    this.applyCSSRules();
+                    if (document.body) {
+                        this.scanAndBlockDynamic(document.body);
+                        this.scanInvisibleOverlays({ autoBlock: true });
+                    }
+                    if (++frames < 5) requestAnimationFrame(tick);
+                };
+                requestAnimationFrame(tick);
+            } else if (!document.documentElement) {
+                // auto 模式：documentElement 未就绪时下一帧重试一次
                 requestAnimationFrame(() => this.applyCSSRules());
             }
+        }
+
+        /**
+         * 检测广告闪现：若元素在被拦截前已渲染（有非零尺寸 + 含广告特征），标记域名为闪现域
+         * 一旦标记，下次进入该域会自动启用 preemptive 模式
+         */
+        static detectFlashAndMark(element, triggerUrl) {
+            if (!element) return;
+            try {
+                const rect = element.getBoundingClientRect();
+                if (rect.width < 50 || rect.height < 50) return;
+                const host = triggerUrl ? new URL(triggerUrl, location.href).hostname : '';
+                if (host && AD_KEYWORDS.test(host)) {
+                    storage.markAsFlashing();
+                }
+            } catch (e) { }
+        }
+
+        /**
+         * 不可见覆盖层广告扫描：检测"看不见但触屏/点击就跳转"的透明 overlay
+         * 典型特征：position:fixed/absolute + opacity:0/visibility:hidden + pointer-events:auto + 大面积
+         * autoBlock=true 时直接屏蔽高风险项；返回全部候选供 UI 审阅
+         */
+        static scanInvisibleOverlays(options = {}) {
+            const { autoBlock = true, root = document.documentElement, minSize = 100 } = options;
+            const results = [];
+            if (!root || !document.body) return results;
+
+            const selfHost = window.location.hostname;
+
+            let candidates;
+            try {
+                candidates = root.querySelectorAll('a, iframe, div, button, span, img, object, embed');
+            } catch (e) { return results; }
+
+            candidates.forEach(el => {
+                if (el.id === 'pro-blocker-ui-host') return;
+                if (el.closest && el.closest('#pro-blocker-ui-host')) return;
+                if (el.style.display === 'none') return;
+
+                let style;
+                try { style = window.getComputedStyle(el); } catch (e) { return; }
+                if (style.position !== 'fixed' && style.position !== 'absolute') return;
+                if (style.pointerEvents === 'none') return;
+                if (style.display === 'none') return;
+
+                // 不可见性判定：透明/隐藏但仍可点击
+                const opacity = parseFloat(style.opacity);
+                const isTransparent = opacity < 0.1 ||
+                    style.visibility === 'hidden' ||
+                    (style.backgroundColor === 'rgba(0, 0, 0, 0)' &&
+                        (!style.backgroundImage || style.backgroundImage === 'none'));
+                if (!isTransparent) return;
+
+                // 覆盖范围判定：面积需达到阈值
+                const rect = el.getBoundingClientRect();
+                if (rect.width < minSize || rect.height < minSize) return;
+                const area = rect.width * rect.height;
+                if (area < minSize * minSize) return;
+
+                // 跳转能力判定：自身或子元素可触发跳转
+                // 注意：<a href="#"> 的 el.href 会被浏览器解析为"当前URL#"（非 '#'），需排除 hash-only / 空锚点
+                const rawHref = el.tagName === 'A' ? el.getAttribute('href') : null;
+                const selfHref = rawHref !== null && rawHref !== '' && !rawHref.startsWith('#') &&
+                    !rawHref.startsWith('javascript:') && !rawHref.startsWith('mailto:');
+                const hasOnClick = el.hasAttribute('onclick') || el.hasAttribute('ontouchstart');
+                const childLink = el.querySelector && el.querySelector('a[href]:not([href="#"]):not([href^="javascript:"]):not([href^="#"]):not([href=""])');
+                // 排除 about:blank / 空 src 的 iframe，避免误判为跨域高风险
+                const childIframe = el.querySelector && el.querySelector('iframe[src]:not([src="about:blank"])');
+
+                let triggerUrl = '';
+                if (selfHref) triggerUrl = el.href;
+                else if (childLink) triggerUrl = childLink.href;
+                else if (childIframe) triggerUrl = childIframe.src;
+
+                if (!selfHref && !hasOnClick && !childLink && !childIframe) return;
+
+                const record = {
+                    el,
+                    tagName: el.tagName,
+                    id: el.id || '',
+                    className: typeof el.className === 'string' ? el.className.slice(0, 80) : '',
+                    opacity,
+                    visibility: style.visibility,
+                    position: style.position,
+                    rect: { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top), left: Math.round(rect.left) },
+                    triggerUrl,
+                    hasOnClick,
+                    hasIframeChild: !!childIframe,
+                    highRisk: false
+                };
+
+                try {
+                    if (triggerUrl) {
+                        const u = new URL(triggerUrl, location.href);
+                        record.crossDomain = u.hostname !== selfHost;
+                        record.highRisk = record.crossDomain && area > (minSize * minSize * 4);
+                    }
+                } catch (e) { record.crossDomain = false; }
+
+                results.push(record);
+
+                if (autoBlock && (record.highRisk || (record.triggerUrl && record.crossDomain))) {
+                    el.style.setProperty('display', 'none', 'important');
+                    el.style.setProperty('pointer-events', 'none', 'important');
+                    el.style.setProperty('visibility', 'hidden', 'important');
+                    record.blocked = true;
+                    if (!this._loggedOverlays) this._loggedOverlays = new Set();
+                    const key = record.tagName + '|' + record.id + '|' + record.className;
+                    if (!this._loggedOverlays.has(key)) {
+                        this._loggedOverlays.add(key);
+                        console.info(`[Pro Blocker] 拦截不可见覆盖层 ${record.tagName} ${record.rect.w}x${record.rect.h} -> ${triggerUrl || 'onclick'}`);
+                    }
+                }
+            });
+
+            return results;
         }
 
         static applyCSSRules() {
@@ -281,24 +414,24 @@
             data.structural.forEach(r => r.structSelector && (cssText += `${r.structSelector} ${hideCSS}`));
 
             // 全局域名黑名单：覆盖所有可能携带资源 URL 的属性（含 srcset）
+            // 同时生成 :has() 规则隐藏父级容器，避免横幅广告仅隐藏 iframe 后留下空白占位
             data.domainBlock.forEach(domain => {
                 if (!domain) return;
                 const esc = escapeCSSAttr(domain);
-                cssText += `[src*="${esc}"] ${hideCSS}`;
-                cssText += `[href*="${esc}"] ${hideCSS}`;
-                cssText += `[data-src*="${esc}"] ${hideCSS}`;
-                cssText += `[data-original*="${esc}"] ${hideCSS}`;
-                cssText += `[poster*="${esc}"] ${hideCSS}`;
-                cssText += `[srcset*="${esc}"] ${hideCSS}`;
+                const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [poster*="${esc}"], [srcset*="${esc}"]`;
+                cssText += `${sel} ${hideCSS}`;
+                // :has() 已被主流浏览器支持（Chrome 105+/Firefox 121+/Safari 15.4+），隐藏直接父容器解决横幅空白
+                cssText += `*:has(> ${sel}) ${hideCSS}`;
             });
 
             // 路径模式拦截：典型广告跳转路径，如 /000/flink/url.php
+            // 同样追加 :has() 规则隐藏父级，覆盖横幅广告场景
             data.pathPattern.forEach(r => {
                 if (r.pattern) {
                     const esc = escapeCSSAttr(r.pattern);
-                    cssText += `[href*="${esc}"] ${hideCSS}`;
-                    cssText += `[src*="${esc}"] ${hideCSS}`;
-                    cssText += `[data-src*="${esc}"] ${hideCSS}`;
+                    const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+                    cssText += `${sel} ${hideCSS}`;
+                    cssText += `*:has(> ${sel}) ${hideCSS}`;
                 }
             });
 
@@ -348,11 +481,16 @@
                 let matchedPattern = '';
 
                 // 收集所有可能的资源 URL（含 srcset 多 URL 拆分）
+                // data-href/data-url/data-lazy-src 等是广告 SDK 常见懒加载属性
                 const urls = [
                     el.src,
                     el.href,
                     el.getAttribute && el.getAttribute('data-src'),
                     el.getAttribute && el.getAttribute('data-original'),
+                    el.getAttribute && el.getAttribute('data-href'),
+                    el.getAttribute && el.getAttribute('data-url'),
+                    el.getAttribute && el.getAttribute('data-link'),
+                    el.getAttribute && el.getAttribute('data-lazy-src'),
                     el.getAttribute && el.getAttribute('poster')
                 ].filter(Boolean);
 
@@ -392,6 +530,9 @@
 
                 if (blocked) {
                     const target = this.findSingleChildWrapper(el, 4);
+                    // 闪现检测必须在隐藏之前：display:none 会使 getBoundingClientRect 返回 0×0
+                    // 元素已渲染出非零尺寸才说明它"闪现"过 → 标记域名，下次进入自动启用 preemptive
+                    this.detectFlashAndMark(el, matchedDomain ? `https://${matchedDomain}/` : '');
                     target.style.setProperty('display', 'none', 'important');
                     target.style.setProperty('opacity', '0', 'important');
                     target.style.setProperty('visibility', 'hidden', 'important');
@@ -435,6 +576,8 @@
                     while ((node = walker.nextNode())) {
                         if (regex.test(node.textContent)) {
                             let element = node.parentElement;
+                            // 文本节点可能已脱离 DOM（如被框架缓存），parentElement 可能为 null
+                            if (!element) continue;
                             for (let i = 0; i < rule.level; i++) {
                                 if (element.parentElement && element.parentElement !== document.body) {
                                     element = element.parentElement;
@@ -513,7 +656,8 @@
 
         static startObserver() {
             // 监听这些资源属性的变化，捕获懒加载广告（src 在元素插入后才被 JS 设置）
-            const RESOURCE_ATTRS = ['src', 'href', 'data-src', 'data-original', 'poster', 'srcset'];
+            // data-href/data-url/data-lazy-src 等是常见广告 SDK 的懒加载属性，需一并监听
+            const RESOURCE_ATTRS = ['src', 'href', 'data-src', 'data-original', 'data-href', 'data-url', 'data-link', 'data-lazy', 'data-lazy-src', 'data-srcset', 'poster', 'srcset'];
 
             // 正则/积木规则较重，去抖执行；缩短到 120ms/600ms 让广告闪现时间最短
             const debouncedDynamicApply = debounce(() => {
@@ -522,6 +666,8 @@
                 if (rawNodes.length === 0) {
                     this.applyRegexRules();
                     this.applyComplexRules();
+                    // 不可见覆盖层扫描：动态注入的透明 overlay 也需在去抖窗口内拦截
+                    this.scanInvisibleOverlays({ autoBlock: true });
                     return;
                 }
                 // 过滤游离节点 + 去除嵌套（子节点会被父节点的子树扫描覆盖）
@@ -531,10 +677,13 @@
                 if (nodes.length === 0) {
                     this.applyRegexRules();
                     this.applyComplexRules();
+                    this.scanInvisibleOverlays({ autoBlock: true });
                 } else {
                     nodes.forEach(node => {
                         this.applyRegexRules(node);
                         this.applyComplexRules(node);
+                        // 对新增子树单独扫描，避免每次都全页扫描
+                        this.scanInvisibleOverlays({ autoBlock: true, root: node });
                     });
                 }
             }, 120, 600);
@@ -613,6 +762,8 @@
                     this.applyRegexRules();
                     this.applyComplexRules();
                     this.scanAndBlockDynamic(document.body);
+                    // 不可见覆盖层在 body 就绪后立即扫描，防止首次进入就被透明 overlay 截获点击
+                    this.scanInvisibleOverlays({ autoBlock: true });
                 }
             };
 
@@ -633,7 +784,10 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                if (document.body) this.scanAndBlockDynamic(document.body);
+                if (document.body) {
+                    this.scanAndBlockDynamic(document.body);
+                    this.scanInvisibleOverlays({ autoBlock: true });
+                }
             });
 
             // 页面完全加载后再做一次兜底扫描
@@ -641,7 +795,10 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                if (document.body) this.scanAndBlockDynamic(document.body);
+                if (document.body) {
+                    this.scanAndBlockDynamic(document.body);
+                    this.scanInvisibleOverlays({ autoBlock: true });
+                }
             });
 
             // SPA 路由变化时重新应用规则（解决点击链接不刷新导致广告漏网）
@@ -652,7 +809,10 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                if (document.body) this.scanAndBlockDynamic(document.body);
+                if (document.body) {
+                    this.scanAndBlockDynamic(document.body);
+                    this.scanInvisibleOverlays({ autoBlock: true });
+                }
             };
             window.addEventListener('popstate', reapplyOnNavigation);
             window.addEventListener('hashchange', reapplyOnNavigation);
@@ -1133,13 +1293,17 @@
 
         _whenBodyReady(cb) {
             if (document.body) { cb(); return; }
-            const observer = new MutationObserver(() => {
+            // 持有 observer 引用，stopSelection 时可取消，避免在停止后仍触发绑定监听器导致泄漏
+            this._bodyReadyObserver = new MutationObserver(() => {
                 if (document.body) {
-                    observer.disconnect();
+                    if (this._bodyReadyObserver) {
+                        this._bodyReadyObserver.disconnect();
+                        this._bodyReadyObserver = null;
+                    }
                     cb();
                 }
             });
-            observer.observe(document.documentElement, { childList: true });
+            this._bodyReadyObserver.observe(document.documentElement, { childList: true });
         }
 
         startSelection() {
@@ -1170,6 +1334,11 @@
         }
 
         stopSelection() {
+            // 取消尚在等待 body 就绪的 observer，防止 stopSelection 后才触发绑定导致监听器泄漏
+            if (this._bodyReadyObserver) {
+                this._bodyReadyObserver.disconnect();
+                this._bodyReadyObserver = null;
+            }
             if (this._keydownHandler) {
                 document.removeEventListener('keydown', this._keydownHandler);
                 this._keydownHandler = null;
@@ -2277,8 +2446,10 @@
                     case 'pathPattern': {
                         if (!rule.pattern) return null;
                         const esc = escapeCssValue(rule.pattern);
-                        // AdGuard 一行一条规则，多选择器用逗号合并（与脚本内 CSS 注入的属性范围保持一致）
-                        return `${domain}##[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+                        // 与脚本内 CSS 注入保持一致：同时隐藏资源元素及其直接父容器（解决横幅空白）
+                        // :has() 属于 AdGuard 扩展 CSS，需用 #?# 标记
+                        const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+                        return `${domain}##${sel}\n${domain}#?#*:has(> ${sel})`;
                     }
                     case 'complex': {
                         if (!rule.conditions || rule.conditions.length === 0) return null;
@@ -2413,6 +2584,128 @@
             panel.querySelector('#btn-ag-back').addEventListener('click', () => this.showManager());
         }
 
+        /**
+         * 不可见覆盖层广告扫描面板：列出所有透明/隐藏的可跳转 overlay，支持逐项拦截与批量拦截
+         * 解决"触碰到就跳转但看不见"的广告问题
+         */
+        showOverlayScanPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            // 首次扫描（autoBlock=false，仅收集供 UI 展示）
+            let records = BlockEngine.scanInvisibleOverlays({ autoBlock: false });
+            let selectedSet = new Set(records.filter(r => r.highRisk).map((r, i) => i));
+
+            const render = () => {
+                const box = panel.querySelector('#overlay-list');
+                const stats = panel.querySelector('#overlay-stats');
+                if (!box) return;
+
+                if (stats) {
+                    const blockedCount = records.filter(r => r.blocked).length;
+                    stats.textContent = `发现 ${records.length} 个可疑覆盖层 · 已拦截 ${blockedCount} 个 · 当前选中 ${selectedSet.size} 个`;
+                }
+
+                if (records.length === 0) {
+                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未发现不可见覆盖层广告。若仍有跳转问题，可尝试"重新扫描"或使用全局域名检索。</span>';
+                    const btnBlock = panel.querySelector('#btn-block-overlay');
+                    if (btnBlock) btnBlock.disabled = true;
+                    return;
+                }
+
+                box.innerHTML = records.map((r, i) => {
+                    const checked = selectedSet.has(i);
+                    const riskTag = r.highRisk
+                        ? '<span class="tag" style="background:rgba(255,59,48,0.5);">高风险</span>'
+                        : '<span class="tag" style="background:rgba(255,149,0,0.5);">可疑</span>';
+                    const blockedTag = r.blocked ? '<span class="tag" style="background:rgba(52,199,89,0.5);">已拦截</span>' : '';
+                    const trigger = r.triggerUrl ? escapeHTML(r.triggerUrl) : (r.hasOnClick ? 'onclick 事件' : '未知');
+                    const cls = r.className ? `<div class="gd-meta">class: ${escapeHTML(r.className)}</div>` : '';
+                    return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-idx="${i}">
+                        <div class="gd-left">
+                            <div class="gd-check">${checked ? '✓' : ''}</div>
+                            <div>
+                                <div class="gd-host">${riskTag} ${blockedTag} ${escapeHTML(r.tagName)} ${r.id ? '#' + escapeHTML(r.id) : ''} · ${r.rect.w}×${r.rect.h}px</div>
+                                <div class="gd-meta">触发：${trigger} ${r.crossDomain ? '· 跨域' : ''}</div>
+                                ${cls}
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('');
+
+                const btnBlock = panel.querySelector('#btn-block-overlay');
+                if (btnBlock) {
+                    btnBlock.disabled = selectedSet.size === 0;
+                    btnBlock.textContent = selectedSet.size > 0
+                        ? `🛡️ 拦截选中的 ${selectedSet.size} 个覆盖层`
+                        : '🛡️ 未选择覆盖层';
+                }
+            };
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">👁 不可见覆盖层扫描</h3>
+                <p>检测透明/隐藏但可点击跳转的覆盖层广告（"触碰到就跳转但看不见"的元凶）。高风险项会被自动拦截，可疑项可手动选择拦截。</p>
+                <div class="gd-stats" id="overlay-stats"></div>
+                <div class="selection-info" style="max-height: 280px; overflow-y: auto;">
+                    <div class="info-row" id="overlay-list"></div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn-danger" id="btn-block-overlay" style="flex:100%; font-weight:bold;">🛡️ 拦截选中的覆盖层</button>
+                </div>
+                <div class="section-divider"></div>
+                <div class="btn-group">
+                    <button class="btn-warning" id="btn-rescan">🔄 重新扫描</button>
+                    <button class="btn-outline" id="btn-close-overlay">关闭</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+            render();
+
+            panel.querySelector('#overlay-list').addEventListener('click', (e) => {
+                const row = e.target.closest('.gd-domain-row');
+                if (!row) return;
+                const idx = parseInt(row.dataset.idx, 10);
+                if (selectedSet.has(idx)) selectedSet.delete(idx);
+                else selectedSet.add(idx);
+                render();
+            });
+
+            panel.querySelector('#btn-block-overlay').addEventListener('click', () => {
+                if (selectedSet.size === 0) return;
+                Array.from(selectedSet).sort((a, b) => b - a).forEach(idx => {
+                    const r = records[idx];
+                    if (!r || !r.el || !document.contains(r.el)) return;
+                    r.el.style.setProperty('display', 'none', 'important');
+                    r.el.style.setProperty('pointer-events', 'none', 'important');
+                    r.el.style.setProperty('visibility', 'hidden', 'important');
+                    r.blocked = true;
+                    // 若有跨域跳转 URL，同时加入域名黑名单，杜绝后续复活
+                    if (r.triggerUrl) {
+                        try {
+                            const u = new URL(r.triggerUrl, location.href);
+                            if (u.hostname !== window.location.hostname) {
+                                storage.addRule('domainBlock', { domain: u.hostname, type: 'domainBlock' });
+                            }
+                        } catch (e) { }
+                    }
+                });
+                selectedSet.clear();
+                render();
+                alert('已拦截选中的覆盖层。跨域跳转域名已加入全局黑名单。');
+            });
+
+            panel.querySelector('#btn-rescan').addEventListener('click', () => {
+                records = BlockEngine.scanInvisibleOverlays({ autoBlock: false });
+                selectedSet = new Set(records.filter(r => r.highRisk).map((r, i) => i));
+                render();
+            });
+
+            panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
+        }
+
         showImportPanel() {
             this.clearPanel();
             const panel = document.createElement('div');
@@ -2495,6 +2788,7 @@
 
         GM_registerMenuCommand('🖱 手动选择屏蔽元素', () => getUI().startSelection());
         GM_registerMenuCommand('🌐 全局检索域名', () => getUI().showGlobalDomainPanel());
+        GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => getUI().showOverlayScanPanel());
         GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
