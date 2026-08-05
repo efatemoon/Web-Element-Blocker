@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.11
+// @version      0.2.12
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -120,6 +120,7 @@
             this.invalidateDataCache();
             BlockEngine.invalidateCache();
             if (type !== 'regex' && type !== 'complex') BlockEngine.applyCSSRules();
+            if (type === 'pathPattern') AutoGeneralizer.schedule(); // 路径模式变更 → 触发路径轨重新泛化
         }
 
         addRule(type, rule) {
@@ -131,6 +132,7 @@
                     this.invalidateDataCache();
                     BlockEngine.invalidateCache();
                     BlockEngine.applyCSSRules();
+                    AutoGeneralizer.schedule(); // 域名黑名单变更 → 触发双轨重新泛化
                 }
                 return;
             }
@@ -159,6 +161,7 @@
                     this.invalidateDataCache();
                     BlockEngine.invalidateCache();
                     BlockEngine.applyCSSRules();
+                    AutoGeneralizer.schedule(); // 域名黑名单变更 → 触发双轨重新泛化
                 }
                 return;
             }
@@ -189,6 +192,7 @@
             BlockEngine.applyCSSRules();
             if (type === 'regex') BlockEngine.applyRegexRules();
             if (type === 'complex') BlockEngine.applyComplexRules();
+            if (type === 'pathPattern') AutoGeneralizer.schedule(); // 跨站删除路径规则 → 重新泛化
             return true;
         }
 
@@ -224,6 +228,41 @@
             return records;
         }
 
+        // ================= 自动化泛化规则 CRUD =================
+        // 泛化规则不区分网站（由全局域名黑名单与全站路径模式推导而来），
+        // 独立存储于 generalizedRules 键：{ domain:[], path:[], fused:[] }
+
+        getGeneralized() {
+            const data = this._readKey('generalizedRules', null);
+            if (!data || typeof data !== 'object') return { domain: [], path: [], fused: [] };
+            return {
+                domain: Array.isArray(data.domain) ? data.domain : [],
+                path: Array.isArray(data.path) ? data.path : [],
+                fused: Array.isArray(data.fused) ? data.fused : []
+            };
+        }
+
+        setGeneralized(data) {
+            const normalized = {
+                domain: Array.isArray(data?.domain) ? data.domain : [],
+                path: Array.isArray(data?.path) ? data.path : [],
+                fused: Array.isArray(data?.fused) ? data.fused : []
+            };
+            this._markDirty('generalizedRules', normalized);
+            BlockEngine.invalidateCache(); // 泛化规则变更后重建匹配缓存
+        }
+
+        // 删除单条泛化规则：type ∈ {'domain','path','fused'}，index 为数组下标
+        removeGeneralizedRule(type, index) {
+            if (!['domain', 'path', 'fused'].includes(type)) return;
+            const data = this.getGeneralized();
+            if (index >= 0 && index < data[type].length) {
+                data[type].splice(index, 1);
+                this._markDirty('generalizedRules', data);
+                BlockEngine.invalidateCache();
+            }
+        }
+
         clearDomain() {
             ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config'].forEach(key => {
                 const data = this._readKey(key, {});
@@ -241,6 +280,7 @@
                 this._markDirty('pro_blocker_clean_loads', cleanLoads);
             }
             BlockEngine.invalidateCache();
+            AutoGeneralizer.schedule(); // 清除本域路径规则 → 重新泛化
         }
 
         exportAll() {
@@ -250,6 +290,7 @@
                 exportData[key] = GM_getValue(key, {});
             });
             exportData['domainBlocks'] = storage._readKey('domainBlocks', []);
+            exportData['generalizedRules'] = storage._readKey('generalizedRules', { domain: [], path: [], fused: [] });
             exportData['__meta__'] = {
                 version: '0.9',
                 exportTime: new Date().toISOString(),
@@ -306,11 +347,35 @@
                     this._markDirty('domainBlocks', validDomains);
                 }
             }
+            // 泛化规则：合并模式去重追加，覆盖模式直接替换
+            if (importData['generalizedRules'] && typeof importData['generalizedRules'] === 'object') {
+                const incoming = importData['generalizedRules'];
+                if (merge) {
+                    const existing = this.getGeneralized();
+                    ['domain', 'path', 'fused'].forEach(t => {
+                        const arr = Array.isArray(incoming[t]) ? incoming[t] : [];
+                        arr.forEach(item => {
+                            if (item && typeof item === 'object' && !existing[t].some(x => JSON.stringify(x) === JSON.stringify(item))) {
+                                existing[t].push(item);
+                            }
+                        });
+                    });
+                    this._markDirty('generalizedRules', existing);
+                } else {
+                    this._markDirty('generalizedRules', {
+                        domain: Array.isArray(incoming.domain) ? incoming.domain : [],
+                        path: Array.isArray(incoming.path) ? incoming.path : [],
+                        fused: Array.isArray(incoming.fused) ? incoming.fused : []
+                    });
+                }
+            }
             BlockEngine.invalidateCache();
             this.invalidateDataCache();
             BlockEngine.applyCSSRules();
             BlockEngine.applyRegexRules();
             BlockEngine.applyComplexRules();
+            // 导入后触发重新泛化，合并新规则并刷新匹配缓存
+            AutoGeneralizer.schedule();
         }
 
         markAsFlashing() {
@@ -380,6 +445,249 @@
     const storage = new StorageManager();
 
     /**
+     * 路径规则倒排索引：提取每条 pattern 最长 ≥4 字符 token 建 Map<token, Set<pattern>>，
+     * 匹配时仅对 URL 中出现的 token 对应候选 pattern 做字面子串校验，将 O(N) 线性遍历降为 O(tokens) 查找。
+     * 无 ≥4 token 的 pattern 进入 fallback 线性表。供网络层 isUrlBlocked 使用；
+     * DOM 扫描仍用合并正则（getPathMatcher）以支持 .exec() 提取匹配串日志。
+     */
+    class PathInvertedIndex {
+        static _tokenIndex = new Map();   // token -> Set<rawPattern>
+        static _fallback = [];            // 无 ≥4 token 的 pattern，线性扫描
+        static _patternCount = 0;
+
+        static build(rawPatterns) {
+            this._tokenIndex = new Map();
+            this._fallback = [];
+            this._patternCount = 0;
+            rawPatterns.forEach(pattern => {
+                if (!pattern) return;
+                this._patternCount++;
+                const token = this._extractToken(pattern);
+                if (token) {
+                    if (!this._tokenIndex.has(token)) this._tokenIndex.set(token, new Set());
+                    this._tokenIndex.get(token).add(pattern);
+                } else {
+                    this._fallback.push(pattern);
+                }
+            });
+        }
+
+        // 提取最长 ≥4 字符的字母数字 token 作为该 pattern 的倒排键
+        static _extractToken(str) {
+            const tokens = str.toLowerCase().split(/[^a-z0-9]/);
+            let maxToken = '';
+            for (let i = 0; i < tokens.length; i++) {
+                if (tokens[i].length > maxToken.length) maxToken = tokens[i];
+            }
+            return maxToken.length >= 4 ? maxToken : null;
+        }
+
+        // 字面子串匹配：URL pathStr 含任一 pattern 即命中
+        static test(pathStr) {
+            if (this._patternCount === 0) return false;
+            const lower = pathStr.toLowerCase();
+            const tokens = lower.split(/[^a-z0-9]/);
+            // 仅校验 token 命中的候选 pattern，跳过绝大多数无关规则
+            const candidates = new Set();
+            for (let i = 0; i < tokens.length; i++) {
+                if (tokens[i].length >= 4) {
+                    const set = this._tokenIndex.get(tokens[i]);
+                    if (set) set.forEach(p => candidates.add(p));
+                }
+            }
+            for (const pattern of candidates) {
+                if (lower.includes(pattern.toLowerCase())) return true;
+            }
+            // fallback：无 token 的 pattern 逐一字面子串校验
+            for (let i = 0; i < this._fallback.length; i++) {
+                if (lower.includes(this._fallback[i].toLowerCase())) return true;
+            }
+            return false;
+        }
+
+        static get size() { return this._patternCount; }
+    }
+
+    /**
+     * 域名泛化器：反向基数树 (Reverse Radix Trie)。
+     * 利用域名层级倒置特性（com.adnetwork.srv1）构建反向字典树，
+     * 当某基准域名下子域密度 ≥ threshold 时自动收敛为 *.base 规则，抑制 DGA/CDN 泛洪。
+     * 安全约束：仅在 currentPath ≥ 2 层（com.xxx）时输出通配，永不输出 *.com 这类灾难性规则。
+     */
+    class DomainGeneralizer {
+        static buildReverseTrie(domains) {
+            const root = {};
+            domains.forEach(domain => {
+                if (!domain || typeof domain !== 'string') return;
+                const parts = domain.toLowerCase().split('.').reverse();
+                let curr = root;
+                parts.forEach(part => {
+                    if (!part) return;
+                    if (!curr[part]) curr[part] = { _count: 0, _children: {} };
+                    curr[part]._count++;
+                    curr = curr[part]._children;
+                });
+            });
+            return root;
+        }
+
+        // 返回 [{rule, meta, sources}] —— threshold 个以上子域收敛为 *.base
+        static extractOptimalDomains(domains, threshold = 3) {
+            if (!domains || domains.length < threshold) return [];
+            const trie = this.buildReverseTrie(domains);
+            const results = [];
+            const seen = new Set();
+
+            const traverse = (node, currentPath, childDomains) => {
+                const childrenKeys = Object.keys(node._children);
+                // 仅在 ≥2 层（com.xxx）且子域密度达标时收敛，杜绝 *.com 灾难性通配
+                if (currentPath.length >= 2 && childrenKeys.length >= threshold) {
+                    const base = [...currentPath].reverse().join('.');
+                    if (seen.has(base)) return;
+                    seen.add(base);
+                    results.push({
+                        rule: '*.' + base,
+                        meta: `${childrenKeys.length} 子域`,
+                        sources: childDomains.slice(0, 5)
+                    });
+                    return; // 已收敛，不再下钻
+                }
+                childrenKeys.forEach(key => {
+                    // currentPath 为 TLD 在前的倒序（如 ['com','ads']），与域名 reverse 切片同序
+                    const pathKey = [...currentPath, key].join('.');
+                    const nextChildDomains = childDomains.filter(d =>
+                        d.split('.').reverse().slice(0, currentPath.length + 1).join('.') === pathKey
+                    );
+                    traverse(node._children[key], [...currentPath, key], nextChildDomains);
+                });
+            };
+
+            Object.keys(trie).forEach(tld => traverse(trie[tld], [tld], domains.filter(d => d.toLowerCase().endsWith('.' + tld) || d.toLowerCase() === tld)));
+            return results;
+        }
+    }
+
+    /**
+     * 路径泛化器：基于多序列对齐 (MSA) 的 Token 级通配推导。
+     * 仅将变异维度替换为 *，严格保留尾部特征与定界符。
+     * 熔断条件：有效字符 < 8 / 通配符 > 2 / 规则退化为 /* → 判定误杀风险过高，废弃。
+     */
+    class PathGeneralizer {
+        // 输入一组路径，返回单条泛化模式 {rule, meta, sources} 或 null
+        static extractOptimalPattern(paths) {
+            if (!paths || paths.length < 2) return null;
+            const matrix = paths.map(p => String(p).split('/').filter(Boolean));
+            const minLen = Math.min(...matrix.map(t => t.length));
+            if (minLen < 2) return null;
+
+            const patternParts = [];
+            let wildcardCount = 0;
+            let validCharCount = 0;
+
+            for (let i = 0; i < minLen; i++) {
+                const baseToken = matrix[0][i];
+                const isIdentical = matrix.every(tokens => tokens[i] === baseToken);
+                if (isIdentical) {
+                    patternParts.push(baseToken);
+                    validCharCount += baseToken.length;
+                } else {
+                    patternParts.push('*');
+                    wildcardCount++;
+                }
+            }
+
+            const rule = '/' + patternParts.join('/');
+            // 熔断：有效特征过少 / 通配过多 / 退化为 /* → 误杀风险高，丢弃
+            if (validCharCount < 8 || wildcardCount > 2 || rule === '/*') return null;
+            return {
+                rule,
+                meta: `${paths.length} 路径对齐`,
+                sources: paths.slice(0, 5)
+            };
+        }
+
+        // 按首段聚类后逐组对齐，返回 [{rule, meta, sources}]
+        static extractOptimalPatterns(paths) {
+            if (!paths || paths.length < 2) return [];
+            // 按首段聚类：/ads/a 与 /ads/b 同组，/track/x 单独成组
+            const groups = new Map();
+            paths.forEach(p => {
+                const seg = String(p).split('/').filter(Boolean)[0] || '_root_';
+                if (!groups.has(seg)) groups.set(seg, []);
+                groups.get(seg).push(String(p));
+            });
+            const results = [];
+            const seen = new Set();
+            groups.forEach(groupPaths => {
+                if (groupPaths.length < 2) return;
+                const pattern = this.extractOptimalPattern(groupPaths);
+                if (pattern && !seen.has(pattern.rule)) {
+                    seen.add(pattern.rule);
+                    results.push(pattern);
+                }
+            });
+            return results;
+        }
+    }
+
+    /**
+     * 自动化泛化编排器：读取当前域名黑名单与路径模式规则，
+     * 驱动双轨泛化（DomainGeneralizer + PathGeneralizer），
+     * 将结果写入 StorageManager.generalizedRules 并刷新匹配缓存。
+     * 触发时机：域名/路径规则增删后防抖调用，或管理面板手动"重新泛化"。
+     */
+    class AutoGeneralizer {
+        static _runTimer = null;
+
+        // 防抖触发：合并 500ms 内的多次规则变更
+        static schedule() {
+            if (this._runTimer) clearTimeout(this._runTimer);
+            this._runTimer = setTimeout(() => {
+                this._runTimer = null;
+                this.run();
+            }, 500);
+        }
+
+        static run() {
+            try {
+                const data = storage.getData();
+                // 域名轨：全局域名黑名单
+                const domains = (data.domainBlock || []).filter(d => d && typeof d === 'string');
+                const genDomains = DomainGeneralizer.extractOptimalDomains(domains, 3);
+
+                // 路径轨：聚合所有站点的 pathPattern 规则
+                const allPaths = [];
+                const pathDict = storage._readKey('pathPatternBlocks', {});
+                Object.keys(pathDict).forEach(d => {
+                    (pathDict[d] || []).forEach(r => { if (r && r.pattern) allPaths.push(r.pattern); });
+                });
+                const genPaths = PathGeneralizer.extractOptimalPatterns(allPaths);
+
+                // 熔断日志：被泛化器拒绝的候选（路径过短/特征不足），供面板透明展示
+                const fused = [];
+                if (allPaths.length >= 2) {
+                    const segGroups = new Map();
+                    allPaths.forEach(p => {
+                        const seg = String(p).split('/').filter(Boolean)[0] || '_root_';
+                        if (!segGroups.has(seg)) segGroups.set(seg, []);
+                        segGroups.get(seg).push(String(p));
+                    });
+                    segGroups.forEach(gp => {
+                        if (gp.length >= 2) {
+                            const candidate = PathGeneralizer.extractOptimalPattern(gp);
+                            if (!candidate) fused.push({ rule: gp[0], meta: '特征不足/误杀风险', sources: gp.slice(0, 3) });
+                        }
+                    });
+                }
+
+                storage.setGeneralized({ domain: genDomains, path: genPaths, fused });
+            } catch (e) {
+                console.warn('[Pro Blocker] 自动化泛化失败：', e);
+            }
+        }
+    }
+
+    /**
      * 拦截引擎：DOM/CSS 控制 + 动态扫描
      */
     class BlockEngine {
@@ -388,6 +696,11 @@
         static _cachedDomainSet = null;
         static _cachedPathPatterns = null;
         static _cachedPathRegex = null; // 合并路径正则缓存：false 表示无路径规则
+        static _cachedPathIndex = null; // 倒排索引构建标记：null=未构建，true=已构建
+        // 泛化规则匹配缓存：域名通配后缀集合 + 路径通配正则
+        static _cachedGenDomainList = null;
+        static _cachedGenDomainSet = null;
+        static _cachedGenPathRegex = null; // false 表示无泛化路径规则
         static _loggedDomains = new Set();
         static _loggedPatterns = new Set();
         static _loggedOverlays = new Set();
@@ -397,6 +710,12 @@
         static _scannedNodes = new WeakSet();
         // CSSOM 增量注入指纹：记录上次注入的选择器集合，内容未变时跳过重建
         static _lastCSSFingerprint = '';
+        // Constructable Stylesheets 支持：Chrome 99+/Edge/Firefox 101+ 支持，
+        // WebKit 支持不完整，需 Feature Detection 后降级到 <style> + insertRule
+        static _supportsConstructable = (typeof CSSStyleSheet !== 'undefined') && ('adoptedStyleSheets' in document);
+        // 当前生效的 CSSStyleSheet（构造样式表 或 <style>.sheet），首次 applyCSSRules 时确定
+        static _styleSheet = null;
+        static _useConstructable = false;
         // 拦截统计：供管理面板看板展示，衡量网络层与 DOM 层拦截成效
         static stats = { networkBlocks: 0, domBlocks: 0, matchTimeMs: 0 };
         // 本次页面加载是否检测到广告闪现（fastInject 重置，detectFlashAndMark 置位）
@@ -408,7 +727,22 @@
             this._cachedDomainSet = null;
             this._cachedPathPatterns = null;
             this._cachedPathRegex = null;
+            this._cachedPathIndex = null; // 倒排索引标记重置，下次 isUrlBlocked 重建
+            this._cachedGenDomainList = null;
+            this._cachedGenDomainSet = null;
+            this._cachedGenPathRegex = null;
             this._lastCSSFingerprint = ''; // 规则变更后强制下次 applyCSSRules 重建样式表
+        }
+
+        // 构建路径倒排索引（网络层专用）：仅当 _cachedPathIndex !== true 时重建。
+        // DOM 扫描仍用 getPathMatcher() 以支持 .exec() 提取匹配串日志。
+        static _ensurePathIndex() {
+            if (this._cachedPathIndex === true) return;
+            const patterns = (this._cachedPathPatterns !== null ? this._cachedPathPatterns : storage.getData().pathPattern)
+                .map(r => r && r.pattern).filter(Boolean);
+            if (this._cachedPathPatterns === null) this._cachedPathPatterns = patterns;
+            PathInvertedIndex.build(patterns);
+            this._cachedPathIndex = true;
         }
 
         // 获取域名集合（与 _cachedDomainList 同生命周期），供网络拦截器与动态扫描复用
@@ -432,20 +766,56 @@
             return this._cachedPathRegex;
         }
 
-        // URL 拦截判定：域名黑名单 + 路径模式，供 NetworkInterceptor 与动态扫描复用
+        // 泛化域名集合：将 *.base 规则剥离 '*.' 前缀得 base 后缀，复用 hostnameBlocked 父域上探匹配
+        static getGeneralizedDomainSet() {
+            if (this._cachedGenDomainSet === null) {
+                const gen = storage.getGeneralized().domain || [];
+                const list = gen.map(r => r && r.rule ? String(r.rule).replace(/^\*\./, '') : '').filter(Boolean);
+                this._cachedGenDomainList = list;
+                this._cachedGenDomainSet = new Set(list);
+            }
+            return this._cachedGenDomainSet;
+        }
+
+        // 泛化路径正则：将 /a/*/b 通配转为正则（* → [^/]*，其余转义），合并为单 RegExp
+        // 返回 RegExp 或 false（无泛化路径规则时）
+        static getGeneralizedPathRegex() {
+            if (this._cachedGenPathRegex !== null) return this._cachedGenPathRegex;
+            const gen = storage.getGeneralized().path || [];
+            const regexParts = [];
+            gen.forEach(r => {
+                if (!r || !r.rule) return;
+                // * → [^/]*（仅匹配单段，避免跨 / 误杀）；其余特殊字符转义
+                const part = String(r.rule)
+                    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+                    .replace(/\*/g, '[^/]*');
+                if (part.length > 4) regexParts.push(part);
+            });
+            this._cachedGenPathRegex = regexParts.length > 0 ? new RegExp(regexParts.join('|')) : false;
+            return this._cachedGenPathRegex;
+        }
+
+        // URL 拦截判定：域名黑名单 + 路径模式 + 泛化规则，供 NetworkInterceptor 与动态扫描复用
+        // 路径匹配走倒排索引（O(tokens) 候选过滤）+ 泛化路径正则，网络层高频调用受益最大
         static isUrlBlocked(url) {
             if (!url || typeof url !== 'string') return false;
             try {
                 const absUrl = new URL(url, location.href);
                 if (absUrl.hostname && absUrl.hostname !== location.hostname &&
-                    !absUrl.hostname.endsWith('.' + location.hostname) &&
-                    this.hostnameBlocked(absUrl.hostname, this.getDomainSet())) {
-                    return true;
+                    !absUrl.hostname.endsWith('.' + location.hostname)) {
+                    // 1. 精确域名黑名单
+                    if (this.hostnameBlocked(absUrl.hostname, this.getDomainSet())) return true;
+                    // 2. 泛化域名通配（*.base 收敛规则）
+                    const genDomainSet = this.getGeneralizedDomainSet();
+                    if (genDomainSet.size > 0 && this.hostnameBlocked(absUrl.hostname, genDomainSet)) return true;
                 }
-                const matcher = this.getPathMatcher();
-                if (matcher && matcher.test(absUrl.pathname + absUrl.search)) {
-                    return true;
-                }
+                const pathStr = absUrl.pathname + absUrl.search;
+                // 3. 精确路径模式（倒排索引 O(tokens) 候选过滤）
+                this._ensurePathIndex();
+                if (PathInvertedIndex.size > 0 && PathInvertedIndex.test(pathStr)) return true;
+                // 4. 泛化路径通配（MSA 对齐生成的 /a/*/b 正则）
+                const genPathRegex = this.getGeneralizedPathRegex();
+                if (genPathRegex && genPathRegex.test(pathStr)) return true;
             } catch (e) { }
             return false;
         }
@@ -669,23 +1039,13 @@
             });
 
             // document-start 阶段 documentElement 可能尚未就绪，做安全检查避免抛错
-            const parent = document.head || document.documentElement;
-            if (!parent) return;
-
-            let styleEl = document.getElementById(this.styleElementId);
-            if (!styleEl) {
-                styleEl = document.createElement('style');
-                styleEl.id = this.styleElementId;
-                if (parent.firstChild) {
-                    parent.insertBefore(styleEl, parent.firstChild);
-                } else {
-                    parent.appendChild(styleEl);
-                }
-            }
+            // 注：Constructable Stylesheets 不依赖 head，可更早注入；<style> 降级路径需 head/documentElement
+            const sheet = this._getSheet();
+            if (!sheet) return;
 
             // 无规则时清空旧样式表，避免残留拦截
             if (selectors.length === 0) {
-                this._clearSheet(styleEl);
+                this._clearSheetRules(sheet);
                 this._lastCSSFingerprint = '';
                 return;
             }
@@ -694,34 +1054,74 @@
             const fingerprint = selectors.join('\n');
             if (fingerprint === this._lastCSSFingerprint) return;
 
-            // CSSOM 增量注入：逐条 insertRule，单条选择器非法（如 :has 在旧浏览器）不影响其余
-            // 相比 textContent 全量覆写，避免整棵 CSSOM 树销毁重建
-            const sheet = styleEl.sheet;
-            if (sheet) {
-                this._clearSheet(styleEl);
-                for (const sel of selectors) {
-                    try {
-                        sheet.insertRule(`${sel} ${hideCSS}`, sheet.cssRules.length);
-                    } catch (e) {
-                        // 非标准伪类静默跳过，不影响其他规则注入
-                    }
+            const cssText = selectors.map(s => `${s} ${hideCSS}`).join('\n');
+
+            // Constructable Stylesheets 快路径：replaceSync 一次性 C++ 注入，
+            // 不触发 HTML 解析器，且无法被 document.querySelector('style') 探查（防反屏蔽）
+            if (this._useConstructable) {
+                try {
+                    sheet.replaceSync(cssText);
+                    this._lastCSSFingerprint = fingerprint;
+                    return;
+                } catch (e) {
+                    // 整体替换失败（某条选择器非法，如 :has 在旧引擎）：
+                    // 清空后降级到逐条 insertRule 隔离，单条非法不影响其余
+                    this._clearSheetRules(sheet);
                 }
             } else {
-                // 兜底：sheet 不可用时回退到 textContent 全量注入
-                const cssText = selectors.map(s => `${s} ${hideCSS}`).join('\n');
-                if (styleEl.textContent !== cssText) {
-                    styleEl.textContent = cssText;
+                this._clearSheetRules(sheet);
+            }
+
+            // 逐条 insertRule：降级路径 + 构造样式表整体失败后的隔离路径
+            // 单条选择器非法（如 :has 在旧浏览器）静默跳过，不影响其他规则注入
+            for (const sel of selectors) {
+                try {
+                    sheet.insertRule(`${sel} ${hideCSS}`, sheet.cssRules.length);
+                } catch (e) {
+                    // 非标准伪类静默跳过
                 }
             }
             this._lastCSSFingerprint = fingerprint;
         }
 
-        // 清空样式表所有规则（insertRule 增量注入前的预处理）
-        static _clearSheet(styleEl) {
-            const sheet = styleEl && styleEl.sheet;
+        // 获取（惰性创建）当前生效的 CSSStyleSheet：
+        // 优先 Constructable Stylesheets（C++ 对象，零解析、防探查），不支持时降级到 <style>.sheet
+        static _getSheet() {
+            if (this._styleSheet) return this._styleSheet;
+            // 路径 A：Constructable Stylesheets
+            if (this._supportsConstructable) {
+                try {
+                    const csSheet = new CSSStyleSheet();
+                    document.adoptedStyleSheets = [...document.adoptedStyleSheets, csSheet];
+                    this._styleSheet = csSheet;
+                    this._useConstructable = true;
+                    return csSheet;
+                } catch (e) {
+                    // adoptedStyleSheets 赋值失败（被覆盖/只读），降级
+                }
+            }
+            // 路径 B：<style> + insertRule 降级
+            const parent = document.head || document.documentElement;
+            if (!parent) return null;
+            let styleEl = document.getElementById(this.styleElementId);
+            if (!styleEl) {
+                styleEl = document.createElement('style');
+                styleEl.id = this.styleElementId;
+                if (parent.firstChild) parent.insertBefore(styleEl, parent.firstChild);
+                else parent.appendChild(styleEl);
+            }
+            this._styleSheet = styleEl.sheet;
+            this._useConstructable = false;
+            return this._styleSheet;
+        }
+
+        // 清空任意 CSSStyleSheet（构造样式表 或 <style>.sheet）的所有规则
+        static _clearSheetRules(sheet) {
             if (!sheet) return;
-            while (sheet.cssRules.length > 0) {
-                try { sheet.deleteRule(0); } catch (e) { break; }
+            if (sheet.cssRules) {
+                while (sheet.cssRules.length > 0) {
+                    try { sheet.deleteRule(0); } catch (e) { break; }
+                }
             }
         }
 
@@ -789,6 +1189,14 @@
                                 matchedPattern = m[0];
                             }
                         }
+                        // 泛化路径通配（MSA 对齐生成的 /a/*/b 正则）
+                        if (!blocked) {
+                            const genPathRegex = this.getGeneralizedPathRegex();
+                            if (genPathRegex) {
+                                const m = genPathRegex.exec(url);
+                                if (m) { blocked = true; matchedPattern = m[0]; }
+                            }
+                        }
                         if (blocked) break;
 
                         let absUrl = url;
@@ -798,6 +1206,13 @@
                             if (urlObj.hostname && urlObj.hostname !== currentHost && !urlObj.hostname.endsWith('.' + currentHost)) {
                                 // Set O(1) 精确匹配 + O(depth) 父域上探，替代 O(n) 线性扫描
                                 if (this.hostnameBlocked(urlObj.hostname, domainSet)) {
+                                    blocked = true;
+                                    matchedDomain = urlObj.hostname;
+                                    break;
+                                }
+                                // 泛化域名通配（*.base 收敛规则）
+                                const genDomainSet = this.getGeneralizedDomainSet();
+                                if (genDomainSet.size > 0 && this.hostnameBlocked(urlObj.hostname, genDomainSet)) {
                                     blocked = true;
                                     matchedDomain = urlObj.hostname;
                                     break;
@@ -1357,32 +1772,84 @@
         }
 
         /**
-         * DOM 拓扑指纹：基于局部拓扑特征（标签 + 兄弟类型序列 + 子节点类型序列 + 子树深度 + 子节点数）
-         * 生成抗干扰指纹。当精准 Selector 因 Tailwind/随机插入层失效时，用指纹兜底定位广告容器。
+         * MurmurHash3 (x86 32-bit) —— 位操作优化的非加密哈希。
+         * 用于模糊拓扑指纹：将 DOM 骨架字符串压缩为定长 hex，避免存储与比对原始结构串。
+         * 仅用 Math.imul（32-bit 整数乘法）与位运算，无浮点开销。
+         */
+        static murmur32(str) {
+            let k, h = 0x811c9dc5;
+            for (let i = 0, len = str.length; i < len; i++) {
+                k = str.charCodeAt(i);
+                k = Math.imul(k, 0xcc9e2d51);
+                k = (k << 15) | (k >>> 17);
+                k = Math.imul(k, 0x1b873593);
+                h ^= k;
+                h = (h << 13) | (h >>> 19);
+                h = Math.imul(h, 5) + 0xe6546b64;
+            }
+            h ^= str.length;
+            h ^= h >>> 16;
+            h = Math.imul(h, 0x85ebca6b);
+            h ^= h >>> 13;
+            h = Math.imul(h, 0xc2b2ae35);
+            h ^= h >>> 16;
+            return (h >>> 0).toString(16);
+        }
+
+        /**
+         * 模糊拓扑指纹（Fuzzy Topology Signature）：
+         * 抛弃脆弱的兄弟节点索引（广告脚本插入空 div 即可破坏），
+         * 仅采集"元素自身及父容器的固定骨架信息"（Tag + className 长度分布 + 结构层级），
+         * 经 MurmurHash3 压缩为 hex。前缀 'mh:' 标记新算法，便于旧规则迁移识别。
+         * 当精准 Selector 因 Tailwind/随机插入层失效时，用指纹兜底定位广告容器。
          */
         static generateTopologyFingerprint(element) {
             if (!element || element.nodeType !== Node.ELEMENT_NODE) return '';
-            const tag = element.tagName.toLowerCase();
+            let topology = '';
+            let current = element;
+            let depth = 0;
+            // 沿父链上溯至 body（不含），最多 5 层；采集 tag + className 长度（不采 class 名，抗随机化）
+            while (current && current !== document.body && current.nodeType === Node.ELEMENT_NODE && depth < 5) {
+                const tag = current.tagName;
+                const classDist = typeof current.className === 'string' ? current.className.length : 0;
+                topology += `${tag}(${classDist})_`;
+                current = current.parentElement;
+                depth++;
+            }
+            return 'mh:' + this.murmur32(topology);
+        }
 
-            // 兄弟节点类型特征（前 3 个前驱 + 前 3 个后继）
-            const sibs = [];
-            let sib = element.previousElementSibling, n = 0;
-            while (sib && n < 3) { sibs.push(sib.tagName.toLowerCase()); sib = sib.previousElementSibling; n++; }
-            const prevSibs = sibs.join(',');
-            const nextSibs = [];
-            sib = element.nextElementSibling; n = 0;
-            while (sib && n < 3) { nextSibs.push(sib.tagName.toLowerCase()); sib = sib.nextElementSibling; n++; }
-
-            // 直接子节点类型序列（前 5 个）
-            const childTags = [];
-            let child = element.firstElementChild; n = 0;
-            while (child && n < 5) { childTags.push(child.tagName.toLowerCase()); child = child.nextElementSibling; n++; }
-
-            // 子树最大深度（限 10 层防死循环）
-            let depth = 0, deepest = element;
-            while (deepest.firstElementChild && depth < 10) { deepest = deepest.firstElementChild; depth++; }
-
-            return `${tag}|p[${prevSibs}]|n[${nextSibs.join(',')}]|c[${childTags.join(',')}]|d${depth}|k${element.children.length}`;
+        /**
+         * 旧版拓扑规则迁移：v0.2.11 之前的 topoHash 为明文结构串（无 'mh:' 前缀），
+         * 与新算法不兼容。无法离线重算（缺原元素），故剥离 topoHash 让规则退化为
+         * 纯 Selector 匹配（安全默认）。仅执行一次（topoHashMigrated 标记持久化）。
+         */
+        static migrateTopoHashes() {
+            try {
+                if (storage._readKey('topoHashMigrated', false)) return;
+                // 遍历所有域名的 structural 规则（getData() 仅返回当前域名，须直接读 structBlocks 字典）
+                const allStruct = storage._readKey('structBlocks', {});
+                let touched = false;
+                for (const domain in allStruct) {
+                    if (!Object.prototype.hasOwnProperty.call(allStruct, domain)) continue;
+                    const arr = allStruct[domain];
+                    if (!Array.isArray(arr)) continue;
+                    arr.forEach(r => {
+                        if (r && r.topoHash && typeof r.topoHash === 'string' && !r.topoHash.startsWith('mh:')) {
+                            delete r.topoHash; // 旧明文指纹剥离，回退到 Selector 兜底
+                            touched = true;
+                        }
+                    });
+                }
+                if (touched) {
+                    storage._markDirty('structBlocks', allStruct);
+                    storage.invalidateDataCache();
+                    BlockEngine.invalidateCache();
+                }
+                storage._markDirty('topoHashMigrated', true);
+            } catch (e) {
+                console.warn('[Pro Blocker] 拓扑指纹迁移失败：', e);
+            }
         }
 
         /**
@@ -1393,9 +1860,11 @@
             const data = storage.getData();
             if (!data.structural || data.structural.length === 0 || !targetNode) return;
 
-            // 仅处理带 topoHash 的规则
+            // 仅处理带新算法（'mh:' 前缀）topoHash 的规则；旧明文指纹已由 migrateTopoHashes 剥离
             const hashSet = new Set();
-            data.structural.forEach(r => { if (r.topoHash) hashSet.add(r.topoHash); });
+            data.structural.forEach(r => {
+                if (r.topoHash && typeof r.topoHash === 'string' && r.topoHash.startsWith('mh:')) hashSet.add(r.topoHash);
+            });
             if (hashSet.size === 0) return;
 
             // ShadowRoot(DOCUMENT_FRAGMENT_NODE) 与 Element 均可直接 querySelectorAll；
@@ -1608,12 +2077,15 @@
      * 零依赖、微秒级推理：当 evaluate(url) ≥ 阈值时由网络层自动加入拦截队列，减少人工指认成本。
      */
     class AdScorerLR {
-        // 预置权重矩阵（微型推理字典）：正权重=广告特征，负权重=基础设施/白名单降权
-        static weights = {
-            'ad': 2.5, 'ads': 2.8, 'analytics': 1.8, 'track': 2.0,
-            'banner': 2.2, 'pixel': 1.5, 'js': -2.5, 'api': -1.5,
-            'tampermonkey': -3.0, 'entropy_high': 1.8
-        };
+        // 向量化权重（Float32Array 连续内存布局，近似向量点积加速）
+        // 索引 0-5 对应 6 个正向广告特征；索引 6 为 DGA 高熵惩罚特征
+        static weights = new Float32Array([2.5, 2.8, 1.8, 2.0, 2.2, 1.5, 2.0]);
+        // 词元→权重索引映射（O(1) 查表替代对象属性查找）
+        static keywordMap = new Map([
+            ['ad', 0], ['ads', 1], ['analytics', 2], ['track', 3],
+            ['banner', 4], ['pixel', 5]
+        ]);
+        static ENTROPY_INDEX = 6;
         // 基础偏置：抑制默认得分，需累计足够正向特征才能突破拦截阈值
         static bias = -2.5;
         // 自动拦截阈值（0-100）：仅当得分 ≥ 85 才自动拦截，兼顾检测率与误杀控制
@@ -1635,39 +2107,44 @@
             return 1 / (1 + Math.exp(-z));
         }
 
-        // 香农熵：度量字符串随机性，识别 DGA 生成的随机子域名
+        // 香农熵：Uint8Array 计数版，识别 DGA 生成的随机子域名（hostname 为 ASCII，charCodeAt ≤255）
         static getEntropy(str) {
             const len = str.length;
             if (len === 0) return 0;
-            const counts = {};
-            for (let i = 0; i < len; i++) counts[str[i]] = (counts[str[i]] || 0) + 1;
-            return Object.values(counts).reduce((sum, c) => {
-                const p = c / len;
-                return sum - (p * Math.log2(p));
-            }, 0);
+            const counts = new Uint8Array(256);
+            for (let i = 0; i < len; i++) counts[str.charCodeAt(i)]++;
+            let entropy = 0;
+            for (let i = 0; i < 256; i++) {
+                if (counts[i] > 0) {
+                    const p = counts[i] / len;
+                    entropy -= p * Math.log2(p);
+                }
+            }
+            return entropy;
         }
 
         // 主干推理：输出 0-100 标准化得分。无效 URL 放行（返回 0）
+        // 仅取 hostname 分词（路径信号由 DOM 扫描层覆盖，hostname 更稳定不易误杀）
         static evaluate(urlStr) {
             let z = this.bias;
             try {
                 const url = new URL(urlStr, location.href);
-                const tokens = (url.hostname + url.pathname).toLowerCase().split(/[^a-z0-9]/).filter(w => w.length > 1);
-                // 1. 词元特征匹配与权重累加
-                tokens.forEach(token => {
-                    if (this.weights[token]) z += this.weights[token];
-                });
-                // 2. 结构特征：规避型子域名高熵检测（DGA 对抗）
-                const parts = url.hostname.split('.');
-                const subDomain = parts.slice(0, -2).join('');
-                if (subDomain.length >= 8 && this.getEntropy(subDomain) > 3.5) {
-                    z += this.weights['entropy_high'];
+                const tokens = url.hostname.toLowerCase().split(/[^a-z0-9]/);
+                // 1. 词元特征匹配与权重累加（Map 查表 + Float32Array 索引）
+                for (let i = 0; i < tokens.length; i++) {
+                    const idx = this.keywordMap.get(tokens[i]);
+                    if (idx !== undefined) z += this.weights[idx];
+                }
+                // 2. 结构特征：规避型子域名高熵检测（DGA 对抗），取首个子域标签
+                const sub = url.hostname.split('.')[0];
+                if (sub.length >= 8 && this.getEntropy(sub) > 3.6) {
+                    z += this.weights[this.ENTROPY_INDEX];
                 }
             } catch (e) {
                 return 0;
             }
-            // 3. 概率映射 → 0-100
-            return Math.round(this.sigmoid(z) * 100);
+            // 3. 概率映射 → 0-100；z≤0 时直接返回 0（普通域名默认低分，无需 sigmoid 计算）
+            return z > 0 ? Math.round(this.sigmoid(z) * 100) : 0;
         }
 
         // 自动拦截判定：同源/安全 CDN 豁免，仅高分广告域自动拦截
@@ -1921,6 +2398,13 @@
                 .gd-toolbar label input[type="checkbox"] { width: auto; margin: 0; }
                 .gd-toolbar button { flex: none; padding: 7px 10px; font-size: 12px; }
                 .gd-stats { font-size: 11px; color: #aaa; margin-bottom: 8px; }
+
+                /* 自动化泛化管理面板 */
+                .gen-section { margin-bottom: 12px; }
+                .gen-sec-title { font-size: 12px; font-weight: 600; color: #ddd; margin: 8px 0 4px; }
+                .gen-rule { font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; color: #ff9f0a; word-break: break-all; }
+                .fused-item { opacity: 0.55; }
+                .fused-item .gen-rule { color: #aaa; text-decoration: line-through; }
                 .gd-domain-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 10px; border-radius: 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); cursor: pointer; transition: background 0.15s; }
                 .gd-domain-row:hover { background: rgba(255,255,255,0.12); }
                 .gd-domain-row.selected { border-color: rgba(255,111,0,0.7); background: rgba(255,111,0,0.18); }
@@ -3057,6 +3541,7 @@
                 <div class="btn-group" style="margin-top: 10px;">
                     <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
                     <button class="btn-info" id="btn-all-sites">🗂 按网站查看规则</button>
+                    <button class="btn-info" id="btn-gen">🤖 自动化泛化规则</button>
                     <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
                     <button class="btn-primary" id="btn-close-manager">完成</button>
                 </div>
@@ -3118,6 +3603,7 @@
             panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
             panel.querySelector('#btn-ag-export').addEventListener('click', () => this.showAdGuardExportPanel());
             panel.querySelector('#btn-all-sites').addEventListener('click', () => this.showAllSitesPanel());
+            panel.querySelector('#btn-gen').addEventListener('click', () => this.showGeneralizationPanel());
 
             panel.querySelector('#btn-clear-all').addEventListener('click', () => {
                 if (confirm('警告：此操作将清空【当前域名】下的所有拦截规则和配置（不影响全局域名黑名单）。确认继续？')) {
@@ -3630,6 +4116,103 @@
             });
         }
 
+        // 自动化泛化规则管理面板：展示双轨（域名/路径）泛化结果与熔断日志，支持删除与重新泛化
+        showGeneralizationPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            // 仅重渲染列表容器，不重置整个 panel，避免重复 makeDraggable 导致监听器泄漏（同 Bug6 规避）
+            const renderList = () => {
+                const data = storage.getGeneralized();
+                const fillList = (ulId, arr, type, allowDelete) => {
+                    const ul = panel.querySelector('#' + ulId);
+                    if (!ul) return;
+                    if (!arr || arr.length === 0) {
+                        ul.innerHTML = '<li class="empty-tip">暂无规则。新增 ≥3 个同基域名或 ≥2 个相似路径后将自动生成。</li>';
+                        return;
+                    }
+                    ul.innerHTML = arr.map((r, i) => `
+                        <li class="rule-item${type === 'fused' ? ' fused-item' : ''}">
+                            <div class="rule-content">
+                                <span class="gen-rule">${escapeHTML(r.rule || '')}</span>
+                                <span class="as-site" style="margin-left:6px;">${escapeHTML(r.meta || '')}</span>
+                            </div>
+                            ${allowDelete ? `<button class="btn-danger btn-delete" style="flex:none; width:60px; padding:6px;" data-type="${type}" data-index="${i}">删除</button>` : ''}
+                        </li>
+                    `).join('');
+                };
+                fillList('gen-domain-list', data.domain, 'domain', true);
+                fillList('gen-path-list', data.path, 'path', true);
+                fillList('gen-fused-list', data.fused, 'fused', false);
+
+                const stats = panel.querySelector('#gen-stats');
+                if (stats) {
+                    stats.textContent = `域名轨 ${data.domain.length} 条 · 路径轨 ${data.path.length} 条 · 熔断 ${data.fused.length} 条`;
+                }
+            };
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">🤖 自动化泛化规则</h3>
+                <p>双轨自动推导：域名轨用反向基数树将 ≥3 个同基子域收敛为 <code>*.base</code>；路径轨用多序列对齐将相似路径归并为 <code>/a/*/b</code>。泛化规则自动接入网络层与 DOM 扫描拦截，规则增删后会自动重新泛化。</p>
+                <div class="gd-stats" id="gen-stats"></div>
+                <div class="gen-section">
+                    <div class="gen-sec-title">🌐 域名轨 (Reverse Trie)</div>
+                    <div class="selection-info" style="max-height:160px; overflow-y:auto;">
+                        <ul class="rule-list" id="gen-domain-list"></ul>
+                    </div>
+                </div>
+                <div class="gen-section">
+                    <div class="gen-sec-title">📂 路径轨 (MSA 对齐)</div>
+                    <div class="selection-info" style="max-height:160px; overflow-y:auto;">
+                        <ul class="rule-list" id="gen-path-list"></ul>
+                    </div>
+                </div>
+                <div class="gen-section">
+                    <div class="gen-sec-title">⚠️ 熔断日志 (防误杀，已自动废弃)</div>
+                    <div class="selection-info" style="max-height:120px; overflow-y:auto;">
+                        <ul class="rule-list" id="gen-fused-list"></ul>
+                    </div>
+                </div>
+                <div class="section-divider"></div>
+                <div class="btn-group">
+                    <button class="btn-primary" id="gen-rebuild">🔄 重新泛化</button>
+                    <button class="btn-warning" id="gen-refresh">刷新列表</button>
+                    <button class="btn-outline" id="gen-back">返回管理</button>
+                    <button class="btn-outline" id="gen-close">关闭</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+            renderList();
+
+            // 重新泛化：同步触发 AutoGeneralizer.run()，立即刷新列表
+            panel.querySelector('#gen-rebuild').addEventListener('click', () => {
+                AutoGeneralizer.run();
+                renderList();
+                alert('已重新泛化，结果已更新。');
+            });
+            panel.querySelector('#gen-refresh').addEventListener('click', renderList);
+            panel.querySelector('#gen-back').addEventListener('click', () => this.showManager());
+            panel.querySelector('#gen-close').addEventListener('click', () => this.clearPanel());
+
+            // 事件委托：删除域名/路径轨规则（熔断日志不可删）
+            const delegate = (ulId) => {
+                panel.querySelector('#' + ulId).addEventListener('click', (e) => {
+                    const btn = e.target.closest('.btn-delete');
+                    if (!btn) return;
+                    const type = btn.getAttribute('data-type');
+                    const index = parseInt(btn.getAttribute('data-index'), 10);
+                    if (!confirm(`确认删除泛化规则 #${index}（${type}）？删除后该规则不再参与拦截。`)) return;
+                    storage.removeGeneralizedRule(type, index);
+                    renderList();
+                });
+            };
+            delegate('gen-domain-list');
+            delegate('gen-path-list');
+        }
+
         showImportPanel() {
             this.clearPanel();
             const panel = document.createElement('div');
@@ -3714,6 +4297,8 @@
     NetworkInterceptor.init();
     // Shadow DOM 穿透须在页面脚本调用 attachShadow 前完成代理
     BlockEngine.hookAttachShadow();
+    // 旧版明文拓扑指纹迁移至 MurmurHash3（一次性，幂等）
+    BlockEngine.migrateTopoHashes();
     BlockEngine.fastInject();
     BlockEngine.startObserver();
 
@@ -3730,6 +4315,7 @@
         GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
         GM_registerMenuCommand('🗂 按网站查看所有规则', () => getUI().showAllSitesPanel());
+        GM_registerMenuCommand('🤖 自动化泛化规则', () => getUI().showGeneralizationPanel());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
         GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => getUI().showAdGuardExportPanel());
         GM_registerMenuCommand('📥 导入规则', () => getUI().showImportPanel());

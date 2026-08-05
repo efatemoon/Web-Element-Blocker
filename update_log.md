@@ -1,5 +1,64 @@
 # 更新日志
 
+## v0.2.12 — 2026-08-05
+
+### 优化方案 v2 全量落地：自动化泛化引擎 + 模糊拓扑指纹 + 构造样式表
+
+对照更新版 `优化方案.md` 逐项实现六大新维度（倒排索引接入、MurmurHash3 模糊拓扑、Constructable Stylesheets、双轨自动化泛化），并修复审查发现的迁移范围 Bug。
+
+#### 一、网络层倒排索引接入（PathInvertedIndex）
+
+- 新增 [PathInvertedIndex](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L453) 类：提取每条 pattern 最长 ≥4 字符 token 建 `Map<token, Set<pattern>>`，匹配时仅对 URL 中出现的 token 对应候选 pattern 做字面子串校验，将 O(N) 线性遍历降为 O(tokens) 查找。
+- [BlockEngine.isUrlBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L800) 路径匹配改走倒排索引（网络层高频调用受益最大）；新增 [\_ensurePathIndex](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L739) 懒构建，[invalidateCache](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L725) 重置 `_cachedPathIndex`。
+- DOM 扫描仍用 [getPathMatcher](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L760) 合并正则以保留 `.exec()` 提取匹配串日志。
+
+#### 二、模糊拓扑指纹（MurmurHash3 + 父链骨架）
+
+- 新增 [murmur32](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1779)：`Math.imul` 32-bit 整数乘法 + 位运算的非加密哈希。
+- 重写 [generateTopologyFingerprint](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1806)：抛弃脆弱的兄弟节点索引（广告脚本插入空 div 即可破坏），改为沿父链上溯至 body（最多 5 层），仅采集 `Tag + className 长度分布`（不采 class 名，抗随机化），经 MurmurHash3 压缩为 hex，带 `mh:` 前缀标记新算法。
+- 新增 [migrateTopoHashes](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1827)：一次性剥离旧版明文拓扑指纹（无 `mh:` 前缀），让规则退化为纯 Selector 兜底；[applyTopologyRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1859) 仅匹配 `mh:` 前缀哈希。
+
+#### 三、Constructable Stylesheets 零解析注入
+
+- 新增 [\_getSheet](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1089)：Feature Detection `'adoptedStyleSheets' in document` 优先构造 `CSSStyleSheet` + `adoptedStyleSheets`，不支持时降级到 `<style>.sheet`。
+- [applyCSSRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1004) 构造样式表路径走 `replaceSync` 一次性 C++ 注入（不触发 HTML 解析器，且无法被 `document.querySelector('style')` 探查，自带防反屏蔽）；整体替换失败（某条 `:has()` 选择器非法）时降级到逐条 `insertRule` 隔离，单条非法不影响其余。
+- [\_clearSheetRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1119) 统一清空任意 CSSStyleSheet，兼容两种路径。
+
+#### 四、自动化泛化引擎（双轨推导）
+
+- [DomainGeneralizer](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L517)：反向基数树 (Reverse Radix Trie)，某基准域名下子域密度 ≥3 时收敛为 `*.base` 规则；**安全约束**：仅在 ≥2 层（com.xxx）时输出通配，杜绝 `*.com` 灾难性规则。
+- [PathGeneralizer](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L575)：多序列对齐 (MSA) 的 Token 级通配推导，仅将变异维度替换为 `*`，严格保留尾部特征；**熔断条件**：有效字符 < 8 / 通配符 > 2 / 退化为 `/*` → 判定误杀风险废弃。按首段聚类后逐组对齐。
+- [AutoGeneralizer](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L639)：防抖编排器，读取全局域名黑名单与全站路径模式，驱动双轨泛化并写入 `generalizedRules` 存储。
+
+#### 五、泛化规则全链路集成
+
+- StorageManager 新增 [getGeneralized/setGeneralized/removeGeneralizedRule](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L235) CRUD，独立存储键 `generalizedRules = { domain:[], path:[], fused:[] }`。
+- [BlockEngine](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L772) 新增 `getGeneralizedDomainSet`（`*.` 剥前缀复用 `hostnameBlocked` 父域上探）与 `getGeneralizedPathRegex`（`*` → `[^/]*`，其余转义）；[isUrlBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L800) 与 DOM 扫描均接入泛化域名/路径匹配。
+- 触发钩子：`addRule`/`removeRule`（domainBlock）、`saveData`/`removeRuleForDomain`（pathPattern）、`clearDomain`、`importAll` 均防抖调用 `AutoGeneralizer.schedule()`。
+- [exportAll/importAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L286) 含泛化规则（合并去重 / 覆盖替换）。
+
+#### 六、泛化管理面板
+
+- 新增 [showGeneralizationPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L4120)：三段式展示域名轨 / 路径轨 / 熔断日志，支持删除与"重新泛化"，复用既有面板设计令牌；菜单注册 `🤖 自动化泛化规则`，管理面板新增入口按钮。
+- 仅重渲染列表容器（同 Bug6 规避），`makeDraggable` 全程一次，杜绝监听器泄漏。
+
+#### Bug 修复（代码审查发现）
+
+1. **`migrateTopoHashes` 仅迁移当前域名**（[migrateTopoHashes](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1827)）：原实现经 `storage.getData().structural` 只取当前域名规则，而 `topoHashMigrated` 标记为全局，导致升级用户在其他域名的旧明文拓扑指纹永不被清理 → 改为直接读 `structBlocks` 字典遍历所有域名。
+2. **`PathInvertedIndex` 声明未接入**：`_cachedPathIndex` 字段已声明但 `invalidateCache` 未重置、`isUrlBlocked` 未调用 → 补 `_ensurePathIndex` 懒构建并在 `invalidateCache` 重置标记。
+3. **`DomainGeneralizer` sources 元数据错位**：`childDomains` 过滤比较时 reverse 切片（`com.ads`）与正向拼接（`ads.com`）顺序不一致，导致 sources 恒为空 → 统一为 `[...currentPath, key].join('.')` 倒序键。
+
+### 验证
+
+- `node --check` 语法检查通过（user.js + meta.js）
+- MurmurHash3 确定性验证：相同输入产相同 hex；空串与多层级输入均稳定
+- DomainGeneralizer 边界用例：3 子域 → `*.ads.com`（sources 正确填充）；google/facebook/amazon → `[]`（`*.com` 守卫生效）；< threshold → `[]`
+- PathGeneralizer 边界用例：`/ads/banner/1.js` 等 3 路径 → `/ads/banner/*`（vc=9≥8 通过）；`/a/b` vs `/a/c` → null（vc=1<8 熔断）
+- Constructable Stylesheets 降级链：支持时 `replaceSync` 快路径 → 整体失败时 `insertRule` 隔离 → 不支持时 `<style>` 降级
+- 六大维度全部落地：倒排索引 ✅ / MurmurHash3 模糊拓扑 ✅ / Constructable Stylesheets ✅ / 域名泛化 ✅ / 路径泛化 ✅ / 泛化面板 ✅
+
+---
+
 ## v0.2.11 — 2026-08-05
 
 ### 优化方案六大维度终检 + 隐藏 Bug 修复
