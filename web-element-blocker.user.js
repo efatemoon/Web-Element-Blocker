@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.68
+// @version      0.2.00
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -355,10 +355,13 @@
         static _cachedDomainList = null;
         static _cachedDomainSet = null;
         static _cachedPathPatterns = null;
+        static _cachedPathRegex = null; // 合并路径正则缓存：false 表示无路径规则
         static _loggedDomains = new Set();
         static _loggedPatterns = new Set();
         static _loggedOverlays = new Set();
         static _addedNodesBuffer = [];
+        // 拦截统计：供管理面板看板展示，衡量网络层与 DOM 层拦截成效
+        static stats = { networkBlocks: 0, domBlocks: 0 };
         // 本次页面加载是否检测到广告闪现（fastInject 重置，detectFlashAndMark 置位）
         // load 事件据此判断是否为"干净加载"，驱动 flashList 自愈
         static _flashDetectedThisLoad = false;
@@ -367,6 +370,58 @@
             this._cachedDomainList = null;
             this._cachedDomainSet = null;
             this._cachedPathPatterns = null;
+            this._cachedPathRegex = null;
+        }
+
+        // 获取域名集合（与 _cachedDomainList 同生命周期），供网络拦截器与动态扫描复用
+        static getDomainSet() {
+            if (this._cachedDomainSet === null) {
+                const list = this._cachedDomainList !== null ? this._cachedDomainList : GM_getValue('domainBlocks', []);
+                if (this._cachedDomainList === null) this._cachedDomainList = list;
+                this._cachedDomainSet = new Set(list);
+            }
+            return this._cachedDomainSet;
+        }
+
+        // 获取合并路径正则：多条路径模式合并为单个 RegExp，O(L) 一次匹配替代 O(n) 线性遍历
+        // 返回 RegExp 或 false（无路径规则时）
+        static getPathMatcher() {
+            if (this._cachedPathRegex !== null) return this._cachedPathRegex;
+            const patterns = (this._cachedPathPatterns !== null ? this._cachedPathPatterns : storage.getData().pathPattern)
+                .map(r => r && r.pattern).filter(Boolean)
+                .map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+            this._cachedPathRegex = patterns.length > 0 ? new RegExp(patterns.join('|')) : false;
+            return this._cachedPathRegex;
+        }
+
+        // URL 拦截判定：域名黑名单 + 路径模式，供 NetworkInterceptor 与动态扫描复用
+        static isUrlBlocked(url) {
+            if (!url || typeof url !== 'string') return false;
+            try {
+                const absUrl = new URL(url, location.href);
+                if (absUrl.hostname && absUrl.hostname !== location.hostname &&
+                    !absUrl.hostname.endsWith('.' + location.hostname) &&
+                    this.hostnameBlocked(absUrl.hostname, this.getDomainSet())) {
+                    return true;
+                }
+                const matcher = this.getPathMatcher();
+                if (matcher && matcher.test(absUrl.pathname + absUrl.search)) {
+                    return true;
+                }
+            } catch (e) { }
+            return false;
+        }
+
+        // ReDoS 防护：截断超长文本 + 耗时熔断，避免灾难性回溯阻塞主线程
+        static safeRegexTest(regex, text, timeoutMs = 8) {
+            const truncated = text.length > 2000 ? text.slice(0, 2000) : text;
+            const start = performance.now();
+            const result = regex.test(truncated);
+            if (performance.now() - start > timeoutMs) {
+                console.warn('[Pro Blocker] ReDoS 熔断：正则执行超时，已跳过该规则');
+                return false;
+            }
+            return result;
         }
 
         /**
@@ -677,6 +732,7 @@
                     // 闪现检测必须在隐藏之前：display:none 会使 getBoundingClientRect 返回 0×0
                     // 元素已渲染出非零尺寸才说明它"闪现"过 → 标记域名，下次进入自动启用 preemptive
                     this.detectFlashAndMark(el, matchedDomain ? `https://${matchedDomain}/` : '');
+                    this.stats.domBlocks++;
                     target.style.setProperty('display', 'none', 'important');
                     target.style.setProperty('opacity', '0', 'important');
                     target.style.setProperty('visibility', 'hidden', 'important');
@@ -718,7 +774,7 @@
                     const walker = document.createTreeWalker(targetNode, NodeFilter.SHOW_TEXT, null, false);
                     let node;
                     while ((node = walker.nextNode())) {
-                        if (regex.test(node.textContent)) {
+                        if (this.safeRegexTest(regex, node.textContent || '')) {
                             let element = node.parentElement;
                             // 文本节点可能已脱离 DOM（如被框架缓存），parentElement 可能为 null
                             if (!element) continue;
@@ -728,6 +784,7 @@
                                 } else break;
                             }
                             if (element && element.style.display !== 'none') {
+                                this.stats.domBlocks++;
                                 element.style.setProperty('display', 'none', 'important');
                             }
                         }
@@ -1139,13 +1196,14 @@
 
             domainMeta.forEach((meta, host) => {
                 let score = 0;
+                // 评分矩阵：keyword 40 / script 25 / data-attr 15 / style 10 / srcset+attr 10 / 频次上限 20(λ=2) / 安全CDN -50
                 if (AD_KEYWORDS.test(host)) score += 40;
-                if (meta.sources.has('script-text') || meta.sources.has('script-var')) score += 20;
+                if (meta.sources.has('script-text') || meta.sources.has('script-var')) score += 25;
                 if (meta.sources.has('inline-style') || meta.sources.has('stylesheet')) score += 10;
                 if (meta.sources.has('srcset') || meta.sources.has('attr')) score += 10;
                 if (meta.sources.has('data-attr')) score += 15;
                 score += Math.min(meta.count * 2, 20);
-                if (KNOWN_SAFE_CDNS.has(host)) score -= 30;
+                if (KNOWN_SAFE_CDNS.has(host)) score -= 50;
                 if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) score -= 1000;
                 meta.score = Math.max(0, score);
             });
@@ -1196,6 +1254,81 @@
          */
         static findOutermostAdContainer(element) {
             return this.findSingleChildWrapper(element, 50);
+        }
+    }
+
+    /**
+     * 网络层拦截器：在 document-start 阶段劫持 fetch / XHR / script.src，
+     * 命中全局域名黑名单或路径模式时直接丢弃请求，从源头阻止广告资源加载（而非等 DOM 渲染后再隐藏）。
+     * 判定逻辑复用 BlockEngine.isUrlBlocked，与 DOM 层拦截规则完全一致，避免双标。
+     */
+    class NetworkInterceptor {
+        static init() {
+            this.hookFetch();
+            this.hookXHR();
+            this.hookScriptSrc();
+        }
+
+        static isUrlBlocked(url) {
+            return BlockEngine.isUrlBlocked(url);
+        }
+
+        static hookFetch() {
+            if (!window.fetch || window.fetch.__proBlockerHooked) return;
+            const origFetch = window.fetch;
+            const hooked = function (input, init) {
+                let url = '';
+                if (typeof input === 'string') url = input;
+                else if (input && typeof input.url === 'string') url = input.url;
+                if (NetworkInterceptor.isUrlBlocked(url)) {
+                    BlockEngine.stats.networkBlocks++;
+                    // 返回空 200 响应，避免页面 fetch().then 抛错影响正常逻辑
+                    return Promise.resolve(new Response('', { status: 200, statusText: 'blocked by Pro Blocker' }));
+                }
+                return origFetch.apply(this, arguments);
+            };
+            hooked.__proBlockerHooked = true;
+            window.fetch = hooked;
+        }
+
+        static hookXHR() {
+            if (!window.XMLHttpRequest || XMLHttpRequest.prototype.open.__proBlockerHooked) return;
+            const origOpen = XMLHttpRequest.prototype.open;
+            const hooked = function (method, url) {
+                if (NetworkInterceptor.isUrlBlocked(url)) {
+                    BlockEngine.stats.networkBlocks++;
+                    // 改写为 about:blank（同源空响应），XHR 正常完成但无广告数据
+                    arguments[1] = 'about:blank';
+                }
+                return origOpen.apply(this, arguments);
+            };
+            hooked.__proBlockerHooked = true;
+            XMLHttpRequest.prototype.open = hooked;
+        }
+
+        // 拦截动态 <script src="...">：仅拦截黑名单 URL，合法脚本不受影响
+        static hookScriptSrc() {
+            const desc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+            if (!desc || !desc.set || desc.set.__proBlockerHooked) return;
+            const origSet = desc.set;
+            const hooked = function (url) {
+                if (NetworkInterceptor.isUrlBlocked(url)) {
+                    BlockEngine.stats.networkBlocks++;
+                    return; // 静默丢弃：不设置 src，广告脚本永不加载
+                }
+                return origSet.call(this, url);
+            };
+            hooked.__proBlockerHooked = true;
+            try {
+                Object.defineProperty(HTMLScriptElement.prototype, 'src', {
+                    get: desc.get,
+                    set: hooked,
+                    configurable: true,
+                    enumerable: desc.enumerable
+                });
+            } catch (e) {
+                // 某些环境 src 描述符不可重定义，静默跳过（DOM 层仍会拦截）
+            }
         }
     }
 
@@ -1589,9 +1722,13 @@
             const el = this._actionPreview.el;
             if (el) {
                 el.style.removeProperty('display');
-                el.classList.remove('pro-blocker-selected');
             }
             this._actionPreview = { active: false, el: null };
+            // 恢复显示后必须重新挂上红框：预览时元素 display:none 不可见无需移除类，
+            // 恢复后若不还原 pro-blocker-selected，用户将看不到当前选定元素（红框消失 bug 根因）
+            if (this.currentSelectedEl && this._isElementInDOM(this.currentSelectedEl)) {
+                this.currentSelectedEl.classList.add('pro-blocker-selected');
+            }
             const btn = panel.querySelector('#btn-preview');
             if (btn) btn.textContent = '🔍 预览效果';
         }
@@ -1841,7 +1978,8 @@
                     return;
                 }
                 this._actionPreview = { active: true, el };
-                el.classList.remove('pro-blocker-selected');
+                // 预览隐藏元素：display:none 已使红框不可见，无需移除 pro-blocker-selected 类
+                // （移除后恢复时若忘记还原会导致红框永久消失，故保留类，由 _resetActionPreview 兜底还原）
                 el.style.setProperty('display', 'none', 'important');
                 e.target.textContent = '👁 恢复显示';
             });
@@ -2442,6 +2580,11 @@
                     <div style="font-size:11px; color:#999; margin:2px 0 6px;">${modeHint}</div>
                     <div><strong>系统评估：</strong> ${flashStatus}</div>
                     <div><strong>全局域名黑名单：</strong> 共 ${domainCount} 个域名（跨站点生效）</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1);">
+                        <div>🌐 <strong>网络拦截：</strong><span style="color:#4aa3ff;"> ${BlockEngine.stats.networkBlocks}</span> 次</div>
+                        <div>🧩 <strong>DOM 屏蔽：</strong><span style="color:#34c759;"> ${BlockEngine.stats.domBlocks}</span> 个</div>
+                    </div>
+                    <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
                 </div>
 
                 <div style="max-height: 280px; overflow-y: auto; margin-bottom: 15px; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px;">
@@ -3094,6 +3237,8 @@
 
     // ================= 初始化与执行流 =================
 
+    // 网络层拦截须最先执行：在页面任何 fetch/XHR/script 加载前完成 hook，确保广告请求被源头丢弃
+    NetworkInterceptor.init();
     BlockEngine.fastInject();
     BlockEngine.startObserver();
 

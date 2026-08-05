@@ -1,5 +1,60 @@
 # 更新日志
 
+## v0.2.00 — 2026-08-05
+
+### Bug 修复：预览→恢复后红框消失
+
+#### Bug 10：点击"预览效果"再点"恢复显示"，选定元素红框不再显示
+
+- **位置**：`UIManager._resetActionPreview` / `#btn-preview` 点击处理
+- **根因**：预览时执行 `el.classList.remove('pro-blocker-selected')` 移除红框类，但 `_resetActionPreview` 恢复 `display` 时只做了 `classList.remove('pro-blocker-selected')`（再次移除），**从未重新添加**。导致恢复后选定元素的红框（`pro-blocker-selected`）永久消失，用户看不到当前框选的是哪个元素。
+- **修复**：
+  1. 预览时不再移除 `pro-blocker-selected`（`display:none` 已使红框不可见，移除无意义）。
+  2. `_resetActionPreview` 恢复 `display` 后，重新为 `currentSelectedEl` 挂上 `pro-blocker-selected` 类，红框复原。
+  3. 缩放按钮调用链（先 `_resetActionPreview` 再 `_applySelectionHighlight`）经验证无双重红框问题。
+
+### 网络层全量拦截架构（NetworkInterceptor）
+
+按优化方案落地网络层拦截，在 `document-start` 阶段劫持三类请求入口，命中黑名单域名或路径模式时**源头丢弃请求**，而非等 DOM 渲染后再隐藏，节省带宽并消除广告闪现。
+
+- **Fetch 劫持**：命中返回空 `200 Response`，避免页面 `fetch().then` 抛错。
+- **XHR 劫持**：命中改写 `open` 的 url 为 `about:blank`（同源空响应），XHR 正常完成但无广告数据。
+- **`<script src>` 劫持**：命中静默不设置 src，广告脚本永不加载。
+- **判定复用** [BlockEngine.isUrlBlocked()](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L398)，与 DOM 层规则完全一致（域名 Set + 路径合并正则），避免双标。已用 8 个用例验证（含同域自托管广告路径拦截、子域、相对 URL）。
+
+### 核心算法与数据结构升级
+
+#### 合并路径正则（替代 Aho-Corasick 的轻量方案）
+
+- 新增 [getPathMatcher()](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L388)：多条路径模式转义后合并为单个 `RegExp`，一次 `test` 完成 O(L) 匹配，替代原 O(n) 线性 `includes` 遍历。缓存与 `_cachedPathPatterns` 同生命周期，`invalidateCache` 一并失效。
+- AC 自动机对当前规则量（个位数~数十条）收益有限且实现复杂，合并正则在可读性与性能间取得最佳平衡。
+
+#### ReDoS 灾难性回溯防护
+
+- 新增 [safeRegexTest()](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L416)：截断超长文本（>2000 字符）+ 耗时熔断（>8ms 告警跳过），`applyRegexRules` 改用此方法，防止用户输入的低效正则阻塞主线程。
+
+#### 域名集合与 URL 判定收敛
+
+- 新增 [getDomainSet()](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L377) 统一暴露域名 Set，网络拦截器与动态扫描共用同一缓存，避免重复 `new Set`。
+
+### 拦截统计看板
+
+- `BlockEngine.stats = { networkBlocks, domBlocks }`：网络层与 DOM 层拦截分别计数。
+- 管理面板状态栏新增 `🌐 网络拦截 N 次 / 🧩 DOM 屏蔽 N 个` 看板（本页会话累计，刷新归零），提升工具透明度。
+
+### 广告域评分矩阵对齐方案
+
+[extractResourceDomains](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1197) 评分对齐方案矩阵：脚本来源 `+20→+25`、安全 CDN `-30→-50`（更严格抑制误报），其余权重（keyword 40 / data-attr 15 / style 10 / srcset+attr 10 / 频次上限 20）保持不变。
+
+### 验证
+
+- `node --check` 语法检查通过
+- `isUrlBlocked` 8 用例全通过（黑名单域、子域、同域路径、相对 URL、合法资源放行）
+- 红框 bug 修复路径核对：预览不移除类 → 恢复重加类，缩放链无双重红框
+- 网络拦截 hook 均带 `__proBlockerHooked` 幂等标记，重复 init 不重入
+
+---
+
 ## v0.1.68 — 2026-08-05
 
 ### 逐菜单功能复核与检测算法深度优化
