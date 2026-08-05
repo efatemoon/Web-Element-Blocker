@@ -1,5 +1,42 @@
 # 更新日志
 
+## v0.1.66 — 2026-08-05
+
+### 新功能
+
+- **按网站查看所有规则**（`showAllSitesPanel`）：坍缩视图，一次性列出所有"按域名隔离"的规则（静态/动态/正则/属性/位置/积木/路径 7 类），每条带 `[网站][类型][内容][删除]`，顶部支持按关键字与类型筛选。便于跨站管理误加的网站专属规则。
+  - 入口：菜单 `🗂 按网站查看所有规则`，以及"管理规则与防御策略"面板内新增 `🗂 按网站查看规则` 按钮。
+  - 全局域名黑名单（`domainBlock`）不区分网站，按用户要求不在本面板出现，仍由"管理规则"维护。
+- **StorageManager 新增两个方法**：
+  - `getAllSiteRules()`：遍历 7 个按域名隔离的存储字典，扁平化输出 `{domain, index, type, label, tag, rule}` 记录。
+  - `removeRuleForDomain(domain, type, index)`：跨域名删除任意站点下的单条规则，删除后若该域名规则清空则移除域名键，避免空键残留；并按类型触发 `applyCSSRules`/`applyRegexRules`/`applyComplexRules` 即时生效。
+
+### 修复的关键 Bug
+
+#### Bug 5 复核：showGlobalDomainPanel 预览泄漏
+
+- 沿用 v0.1.65 的实例属性 `_globalPreviewHidden` 方案，`clearPanel` 中已统一清理预览状态，本版本未引入回归。
+
+#### Bug 6：showAllSitesPanel 重复 makeDraggable 导致 document 监听器泄漏（设计规避）
+
+- **风险点**：若面板内部在筛选/删除后重置整个 `panel.innerHTML` 并再次调用 `makeDraggable`，旧 `_cleanupDrag` 不会被调用，`document` 上的 `mousemove`/`mouseup` 监听器会逐次累积泄漏。
+- **规避设计**：
+  1. `showAllSitesPanel` 开头调用 `this.clearPanel()`，由 `clearPanel` 统一调用旧 panel 的 `_cleanupDrag()` 后再清空 `shadowRoot`，保证进入新面板前旧拖拽监听器已释放。
+  2. 筛选与删除只重渲染列表容器 `#as-list` 的 `innerHTML`，**不重置整个 panel**，`makeDraggable` 全程只调用一次，从根源杜绝重复绑定。
+  3. 删除采用事件委托（绑在 `#as-list` 上），删除后即时 `records = storage.getAllSiteRules()` 重建索引再渲染，避免索引错位。
+
+### 行为说明
+
+- 正则/积木规则删除后，已作用于元素的 inline `display:none` 不会自动清除（与"管理规则"面板一致），需刷新页面恢复显示；本面板为支持连续批量删除误加规则，删除后不强制刷新，仅即时刷新列表与索引，规则本身已从存储移除，下次加载即不再生效。
+
+### 验证
+
+- `node --check` 语法检查通过
+- 入口（菜单 + 管理面板按钮）与既有面板调用链一致性核对通过
+- `clearPanel` → `_cleanupDrag` 清理链复核通过，无新增监听器泄漏
+
+---
+
 ## v0.1.65 — 2026-08-05
 
 ### 修复的关键 Bug

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.1.65
+// @version      0.1.66
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -137,6 +137,60 @@
                 data.splice(index, 1);
                 this.saveData(type, data);
             }
+        }
+
+        // 跨域名删除：供"按网站查看所有规则"面板使用，可删除任意域名下的规则
+        removeRuleForDomain(domain, type, index) {
+            const keyMap = {
+                'static': 'blocks', 'dynamic': 'dynamicBlocks', 'regex': 'regexBlocks',
+                'attribute': 'attrBlocks', 'structural': 'structBlocks',
+                'complex': 'complexBlocks', 'pathPattern': 'pathPatternBlocks'
+            };
+            const key = keyMap[type];
+            if (!key) return false;
+            const allData = GM_getValue(key, {});
+            const arr = allData[domain];
+            if (!Array.isArray(arr) || !arr[index]) return false;
+            arr.splice(index, 1);
+            if (arr.length === 0) delete allData[domain]; // 清空后移除域名键，避免空键残留
+            GM_setValue(key, allData);
+            this.invalidateDataCache();
+            BlockEngine.invalidateCache();
+            BlockEngine.applyCSSRules();
+            if (type === 'regex') BlockEngine.applyRegexRules();
+            if (type === 'complex') BlockEngine.applyComplexRules();
+            return true;
+        }
+
+        // 收集所有"按域名隔离"的规则（不含全局 domainBlock），供跨站管理面板使用
+        getAllSiteRules() {
+            const dictMap = {
+                'blocks': { type: 'static', label: '静态', tag: '' },
+                'dynamicBlocks': { type: 'dynamic', label: '动态', tag: '' },
+                'regexBlocks': { type: 'regex', label: '正则', tag: '' },
+                'attrBlocks': { type: 'attribute', label: '属性', tag: 'attr' },
+                'structBlocks': { type: 'structural', label: '位置', tag: 'struct' },
+                'complexBlocks': { type: 'complex', label: '积木', tag: 'complex' },
+                'pathPatternBlocks': { type: 'pathPattern', label: '路径', tag: 'path' }
+            };
+            const records = [];
+            Object.keys(dictMap).forEach(key => {
+                const allData = GM_getValue(key, {});
+                for (const domain in allData) {
+                    if (!Object.prototype.hasOwnProperty.call(allData, domain)) continue;
+                    const arr = allData[domain];
+                    if (!Array.isArray(arr)) continue;
+                    arr.forEach((r, i) => {
+                        if (!r || typeof r !== 'object') return;
+                        records.push({
+                            domain, index: i,
+                            type: dictMap[key].type, label: dictMap[key].label, tag: dictMap[key].tag,
+                            rule: r
+                        });
+                    });
+                }
+            });
+            return records;
         }
 
         clearDomain() {
@@ -1148,6 +1202,7 @@
                 .tag.complex { background: rgba(227,242,253,0.35); color: #e3f2fd; }
                 .tag.domain { background: rgba(255,205,210,0.35); color: #ffebee; }
                 .tag.path { background: rgba(200,230,201,0.35); color: #e8f5e9; }
+                .as-site { font-size: 10px; padding: 2px 7px; border-radius: 10px; background: rgba(255,111,0,0.55); color: #fff; margin-right: 6px; font-weight: 600; white-space: nowrap; display: inline-block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
                 .status-bar { padding: 11px 12px; background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 14px; font-size: 12px; border: 1px solid rgba(255,255,255,0.1); line-height: 1.7; color: #ccc; }
 
                 .zoom-bar {
@@ -2284,6 +2339,7 @@
                 </div>
                 <div class="btn-group" style="margin-top: 10px;">
                     <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
+                    <button class="btn-info" id="btn-all-sites">🗂 按网站查看规则</button>
                     <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
                     <button class="btn-primary" id="btn-close-manager">完成</button>
                 </div>
@@ -2316,6 +2372,7 @@
             panel.querySelector('#btn-export').addEventListener('click', () => this.showExportPanel());
             panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
             panel.querySelector('#btn-ag-export').addEventListener('click', () => this.showAdGuardExportPanel());
+            panel.querySelector('#btn-all-sites').addEventListener('click', () => this.showAllSitesPanel());
 
             panel.querySelector('#btn-clear-all').addEventListener('click', () => {
                 if (confirm('警告：此操作将清空【当前域名】下的所有拦截规则和配置（不影响全局域名黑名单）。确认继续？')) {
@@ -2706,6 +2763,127 @@
             panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
         }
 
+        showAllSitesPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            let filterText = '';
+            let filterType = '';
+            let records = storage.getAllSiteRules();
+
+            const formatContent = (rec) => {
+                const r = rec.rule;
+                switch (rec.type) {
+                    case 'static': return escapeHTML(r.selector || '');
+                    case 'dynamic': return `类名: ${escapeHTML(r.className || '')}`;
+                    case 'regex': return `匹配: ${escapeHTML(r.regex || '')} (层级: ${r.level})`;
+                    case 'attribute': return `选择器: ${escapeHTML(r.attrSelector || '')}`;
+                    case 'structural': return escapeHTML(r.structSelector || '');
+                    case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
+                    case 'complex': {
+                        const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
+                        const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
+                        const condText = (r.conditions || []).map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic || 'AND')}</span> `);
+                        return `${condText} (层级: ${r.level})`;
+                    }
+                    default: return '';
+                }
+            };
+
+            // 仅重渲染列表容器（#as-list），不重置整个 panel，避免重复 makeDraggable 导致 document 监听器泄漏（Bug6 规避）
+            const renderList = () => {
+                const list = panel.querySelector('#as-list');
+                const stats = panel.querySelector('#as-stats');
+                if (!list) return;
+                const filtered = records.filter(rec => {
+                    if (filterType && rec.type !== filterType) return false;
+                    if (filterText) {
+                        const hay = (rec.domain + ' ' + formatContent(rec)).toLowerCase();
+                        if (!hay.includes(filterText)) return false;
+                    }
+                    return true;
+                });
+
+                if (stats) stats.textContent = `共 ${records.length} 条网站规则 · 当前显示 ${filtered.length} 条（全局域名黑名单不区分网站，请在"管理规则"中维护）`;
+
+                if (filtered.length === 0) {
+                    list.innerHTML = '<li class="empty-tip">未匹配到规则。若仅存在全局域名黑名单（不区分网站），则此处为空属正常。</li>';
+                    return;
+                }
+
+                list.innerHTML = filtered.map(rec => `
+                    <li class="rule-item">
+                        <div class="rule-content">
+                            <span class="as-site" title="${escapeHTML(rec.domain)}">${escapeHTML(rec.domain)}</span><span class="tag ${rec.tag}">${rec.label}</span> ${formatContent(rec)}
+                        </div>
+                        <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}">删除</button>
+                    </li>
+                `).join('');
+            };
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">🗂 按网站查看所有规则</h3>
+                <p>列出所有针对特定网站的规则（按域名隔离的 7 类：静态/动态/正则/属性/位置/积木/路径），便于跨站查看与删除。全局域名黑名单不区分网站，请在"管理规则"中维护。</p>
+                <div class="gd-toolbar">
+                    <input type="text" id="as-filter" placeholder="输入网站或规则内容关键字过滤..." />
+                    <select id="as-type-filter">
+                        <option value="">全部类型</option>
+                        <option value="static">静态</option>
+                        <option value="dynamic">动态</option>
+                        <option value="regex">正则</option>
+                        <option value="attribute">属性</option>
+                        <option value="structural">位置</option>
+                        <option value="complex">积木</option>
+                        <option value="pathPattern">路径</option>
+                    </select>
+                </div>
+                <div class="gd-stats" id="as-stats"></div>
+                <div class="selection-info" style="max-height: 360px; overflow-y: auto;">
+                    <ul class="rule-list" id="as-list"></ul>
+                </div>
+                <div class="section-divider"></div>
+                <div class="btn-group">
+                    <button class="btn-warning" id="as-refresh">🔄 刷新列表</button>
+                    <button class="btn-outline" id="as-back">返回管理</button>
+                    <button class="btn-outline" id="as-close">关闭</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+            renderList();
+
+            panel.querySelector('#as-filter').addEventListener('input', (e) => {
+                filterText = e.target.value.trim().toLowerCase();
+                renderList();
+            });
+            panel.querySelector('#as-type-filter').addEventListener('change', (e) => {
+                filterType = e.target.value;
+                renderList();
+            });
+            panel.querySelector('#as-refresh').addEventListener('click', () => {
+                records = storage.getAllSiteRules();
+                renderList();
+            });
+            panel.querySelector('#as-back').addEventListener('click', () => this.showManager());
+            panel.querySelector('#as-close').addEventListener('click', () => this.clearPanel());
+
+            // 事件委托：删除按钮（删除后即时刷新 records 与索引，避免索引错位）
+            panel.querySelector('#as-list').addEventListener('click', (e) => {
+                const btn = e.target.closest('.btn-delete');
+                if (!btn) return;
+                const domain = btn.getAttribute('data-domain');
+                const type = btn.getAttribute('data-type');
+                const index = parseInt(btn.getAttribute('data-index'), 10);
+                if (!confirm(`确认删除【${domain}】的 ${type} 规则 #${index}？`)) return;
+                if (storage.removeRuleForDomain(domain, type, index)) {
+                    records = storage.getAllSiteRules();
+                    renderList();
+                }
+            });
+        }
+
         showImportPanel() {
             this.clearPanel();
             const panel = document.createElement('div');
@@ -2791,6 +2969,7 @@
         GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => getUI().showOverlayScanPanel());
         GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
+        GM_registerMenuCommand('🗂 按网站查看所有规则', () => getUI().showAllSitesPanel());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
         GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => getUI().showAdGuardExportPanel());
         GM_registerMenuCommand('📥 导入规则', () => getUI().showImportPanel());
