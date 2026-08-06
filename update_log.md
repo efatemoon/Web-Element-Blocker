@@ -1,5 +1,69 @@
 # 更新日志
 
+## v0.2.18 — 2026-08-06
+
+### 深度审计：normalPaths 导出修复
+
+#### 审计结论
+
+对 v0.2.17 进行深度代码审计，报告声称的 6 个问题经逐项验证后，**仅 1 个为真实问题**：
+
+| # | 报告声称 | 验证结论 | 原因 |
+|---|---------|---------|------|
+| 1 | `getUI()` 在 document-start 阶段 DOM 竞态 | **不存在** | `UIManager` 通过 `getUI()` 惰性实例化（[L5046](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L5046)），仅在用户点击菜单命令时触发，此时 DOM 已就绪 |
+| 2 | `_matchesPathPattern` #text break 逻辑错误 | **不存在** | 代码库无此函数，复杂规则用 `applyComplexRules`（querySelectorAll + textContent.includes） |
+| 3 | `_debounceScan` 缺少"正在扫描"锁 | **不存在** | 代码库用 `debounce()` 工具（clearTimeout 取消前序定时器），JS 单线程无并发可能 |
+| 4 | AdGuard 导出遗漏 structBlocks/pathRules | **不存在** | `convertRule` 已处理全部 7 类规则（[L4517](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L4517)），v2.0 格式自动补全 `type` 字段 |
+| 5 | `exportAll()` 遗漏 normalPaths | **确认真实** | v2.0 导出格式未包含 `normalPaths`，跨设备迁移丢失误杀检测参照数据 |
+| 6 | fetch 劫持可被页面脚本引用绕过 | **架构限制** | P2 可选项，当前无实际影响 |
+
+#### Bug 修复
+
+1. **P1：normalPaths 导出/导入缺失**：[exportAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L391) 新增 `normalPaths` 字段到 v2.0 导出格式，包含所有站点的正常路径采集数据。[importAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L473) v2.0 导入时合并 `normalPaths` 到现有存储并同步更新 Set 镜像（`_normalPathSets`），保留最近 200 条/站点。修复前跨设备迁移会丢失泛化引擎误杀检测所需的正常路径参照数据，导致新设备泛化规则无法评估误杀风险。
+
+## v0.2.17 — 2026-08-06
+
+### 深度检查：Bug 修复 + 算法优化 + 导出格式升级
+
+#### Bug 修复（4 项）
+
+1. **P0：hostnameBlocked LRU 缓存跨 domainSet 污染**：[hostnameBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1066) 缓存 key 仅为 host，但 [isUrlBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L994) 对同一 host 先后查询精确域名集（Set A）和泛化域名集（Set B）。host 对 Set A 返回 false 被缓存后，对 Set B 的查询直接返回缓存的 false，泛化域名规则完全失效。修复：缓存 key 按 domainSet 引用做命名空间前缀（`'d:'` / `'g:'`），隔离两个缓存域。
+
+2. **P0：recordNormalPath O(N) includes 热路径**：[recordNormalPath](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L479) 用 `Array.includes()` 去重，每个未拦截的 fetch/XHR 都触发，normalPaths 接近 200 条时为 O(200) 字符串比较。修复：内存中维护 `Set` 镜像 `_normalPathSets`，O(1) 查重；同时合并优化5（批量缓冲落盘），满 20 条统一 `_markDirty`，减少 95% 落盘频率。
+
+3. **P1：scanInvisibleOverlays Shadow DOM 递归无深度限制**：[scanInvisibleOverlays](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1102) 递归穿透 Shadow DOM 时无 `_depth` 参数，恶意/异常页面构造循环引用可致栈溢出。修复：添加 `_depth` 参数，最大递归深度 5 层（浏览器 shadow 嵌套通常 ≤3 层）。
+
+4. **P1：_clearSheetRules deleteRule(0) O(N²)**：[_clearSheetRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1394) 逐条 `deleteRule(0)` 删首条，每次删除后剩余规则索引全重排。修复：Constructable 路径走 `replaceSync('')`；`<style>` 降级路径清空 `textContent`；兜底从尾部 `deleteRule(length-1)` 无需索引重排。
+
+> Bug 5（murmur32 种子为 FNV-1a offset basis）：不影响功能，修改会破坏已有指纹，**保持现状**。
+
+#### 算法优化（6 项）
+
+5. **AD_KEYWORDS 正则 → Set 查表**：40+ 交替分支正则在 `extractResourceDomains`、`AdScorerLR`、管理面板中高频使用。替换为 [AD_KEYWORD_SET](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L45) + [isAdKeywordHost](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L55) 按 token 精确查 Set，消除正则回溯。
+
+6. **拓扑指纹 WeakMap 缓存**：[applyTopologyRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L2218) 每次调用对每个候选元素执行 5 层父链遍历 + murmur32。DOMContentLoaded + load + SPA 导航重复调用。新增 [_topoFpCache](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L898) WeakMap，重复调用 O(1) 命中。
+
+7. **DomainGeneralizer O(N²) filter → 构建时记录**：[extractOptimalDomains](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L638) 对每个子键做 `childDomains.filter(d => d.split('.').reverse()...)` 线性扫描，整体 O(N²)。修复：[buildReverseTrie](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L620) 构建时在每个节点记录 `_domains` 数组，traverse 时直接取用。50 域名从 ~1250 次 split+reverse 降为 50 次。
+
+8. **isUrlBlocked URL 级 LRU 缓存**：[isUrlBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L994) 新增 [_urlBlockCache](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L914) Map（容量 100），SPA 场景同一广告 URL 重复请求 O(1) 命中。`invalidateCache` 时一并清空。
+
+9. **normalPaths 批量缓冲落盘**：[recordNormalPath](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L479) 新增 [_normalPathsBuffer](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L59)，满 20 条统一 `_flushNormalPaths`，减少 95% 的 `_markDirty` 调用。`_flush` 时先刷新缓冲。
+
+10. **PathInvertedIndex 预计算小写**：[PathInvertedIndex.build](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L556) 在 build 时存储 `{raw, lower}` 对象，[test](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L586) 中直接用 `p.lower` 字段，消除热路径中每次 `pattern.toLowerCase()` 的字符串分配。
+
+#### 导出数据结构升级（v1.0 → v2.0）
+
+11. **结构化导出格式**：[exportAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L350) 从 v1.0 平铺字典升级为 v2.0 结构化格式：
+    - `meta`：版本号、导出时间、脚本版本、规则计数
+    - `domains`：纯字符串数组（去掉 `_ts` 时间戳）
+    - `sites`：按域名分组，7 类规则各有独立桶（static/dynamic/regex/attribute/structural/complex/pathPattern）
+    - `config` / `flashDomains`：独立顶层键
+    - 每条规则附加 `id`（murmur32 前 4 位），供管理面板按 ID 定位
+
+12. **v1.0 向后兼容**：[importAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L410) 自动检测导入格式：有 `sites` 键为 v2.0，有 `blocks`/`dynamicBlocks` 等平铺键为 v1.0。v2.0 导入时自动展开为 v1.0 平铺字典复用已有合并/覆盖逻辑，剥离 `id` 字段。
+
+13. **generateAdGuardRules 兼容双格式**：[generateAdGuardRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L4411) 同时支持 v2.0（`sites` + `domains`）和 v1.0（平铺字典 + `domainBlocks`）格式，v2.0 模式下自动补全 `type` 字段供 `convertRule` 使用。
+
 ## v0.2.16 — 2026-08-06
 
 ### 真实 Bug 修复 + 算法优化 + 泛化引擎重写

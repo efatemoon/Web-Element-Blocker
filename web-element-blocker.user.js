@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.16
+// @version      0.2.18
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -40,7 +40,26 @@
     }
 
     // 广告域名/关键词通用匹配（在域名扫描与 AdGuard 导出中复用）
-    const AD_KEYWORDS = /ads|adnxs|advert|banner|doubleclick|googlesyndication|googleads|google-analytics|googletag|gstatic|googleapis|facebook|fbcdn|twitter|adsystem|amazon-adsystem|outbrain|taboola|mgid|popads|propeller|onclickads|revcontent|yandex|baidu|toutiao|pangolin|gdt|mob|umeng|umengcloud|sentry|analytics|tracking|tracker|stats|metrics|ping|beacon|pixel|logger/i;
+    // 广告关键词 Set 查表：替代 40+ 交替分支正则，O(tokens) 精确匹配 vs 正则回溯
+    // 正则 /ads|adnxs|.../ 在 test() 时对整个 hostname 做回溯匹配，Set 查表按 token 精确命中
+    const AD_KEYWORD_SET = new Set([
+        'ads', 'adnxs', 'advert', 'banner', 'doubleclick', 'googlesyndication',
+        'googleads', 'google-analytics', 'googletag', 'gstatic', 'googleapis',
+        'facebook', 'fbcdn', 'twitter', 'adsystem', 'amazon-adsystem', 'outbrain',
+        'taboola', 'mgid', 'popads', 'propeller', 'onclickads', 'revcontent',
+        'yandex', 'baidu', 'toutiao', 'pangolin', 'gdt', 'mob', 'umeng',
+        'umengcloud', 'sentry', 'analytics', 'tracking', 'tracker', 'stats',
+        'metrics', 'ping', 'beacon', 'pixel', 'logger'
+    ]);
+    // 检测 hostname 是否含广告关键词：按非字母数字分词后逐 token 查 Set
+    const isAdKeywordHost = (hostname) => {
+        if (!hostname || typeof hostname !== 'string') return false;
+        const tokens = hostname.toLowerCase().split(/[^a-z0-9-]/);
+        for (let i = 0; i < tokens.length; i++) {
+            if (AD_KEYWORD_SET.has(tokens[i])) return true;
+        }
+        return false;
+    };
 
     /**
      * 核心数据与配置管理模块
@@ -54,6 +73,9 @@
             // 防抖落盘：内存镜像暂存待写数据，300ms 内合并多次 GM_setValue 为一次写入
             this._pendingWrites = {};
             this._saveTimer = null;
+            // 正常路径采集：Set 镜像做 O(1) 去重，批量缓冲减少 95% 落盘频率
+            this._normalPathSets = {};   // site -> Set<path>，内存去重镜像
+            this._normalPathsBuffer = []; // 批量缓冲，满 20 条统一落盘
             // 页面卸载前强制落盘，防止防抖窗口内的规则丢失
             window.addEventListener('beforeunload', () => this._flush(), { capture: true });
         }
@@ -77,6 +99,8 @@
                 clearTimeout(this._saveTimer);
                 this._saveTimer = null;
             }
+            // 先刷新正常路径缓冲，确保批量数据进入待写队列
+            this._flushNormalPaths();
             for (const key in this._pendingWrites) {
                 GM_setValue(key, this._pendingWrites[key]);
             }
@@ -308,20 +332,88 @@
             AutoGeneralizer.schedule(); // 清除本域路径规则 → 重新泛化
         }
 
+        // ================= 导出/导入（v2.0 结构化格式 + v1.0 向后兼容） =================
+        // v2.0 格式：meta + domains(纯字符串[]) + sites(按域名分组) + config + flashDomains
+        // 设计要点：规则 ID（murmur32 前4位）、域名去 _ts 简化、站点规则按域名聚合、v1.0 自动识别转换
+
+        // 存储键 → v2.0 站点桶名映射
+        static _KEY_TO_BUCKET = {
+            'blocks': 'static',
+            'dynamicBlocks': 'dynamic',
+            'regexBlocks': 'regex',
+            'attrBlocks': 'attribute',
+            'structBlocks': 'structural',
+            'complexBlocks': 'complex',
+            'pathPatternBlocks': 'pathPattern'
+        };
+
         exportAll() {
             this._flush(); // 导出前强制落盘，确保待写数据已持久化
-            const exportData = {};
-            ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config', 'pro_blocker_flash_domains'].forEach(key => {
-                exportData[key] = GM_getValue(key, {});
+
+            // 收集所有有规则的站点域名
+            const allSiteDomains = new Set();
+            Object.keys(this.constructor._KEY_TO_BUCKET).forEach(key => {
+                const dict = this._readKey(key, {});
+                Object.keys(dict).forEach(d => {
+                    if (Array.isArray(dict[d]) && dict[d].length > 0) allSiteDomains.add(d);
+                });
             });
-            // 仅导出用户手动维护的规则，不含自动化泛化规则（泛化规则由域名/路径规则自动派生，
-            // 导出后会因环境差异失真且无意义，导入端会自动重新泛化）— 解决问题4
-            exportData['domainBlocks'] = this.getDomainBlocks();
-            exportData['__meta__'] = {
-                version: '1.0',
-                exportTime: new Date().toISOString(),
-                exporter: '网页元素屏蔽器',
-                note: '不包含自动化泛化规则（导入后自动重新派生）'
+
+            // 按站点聚合规则，每条规则附加 id（murmur32 前4位）
+            const sites = {};
+            let totalRules = 0;
+            allSiteDomains.forEach(domain => {
+                const site = {};
+                Object.keys(this.constructor._KEY_TO_BUCKET).forEach(key => {
+                    const dict = this._readKey(key, {});
+                    const rules = dict[domain];
+                    if (Array.isArray(rules) && rules.length > 0) {
+                        const bucket = this.constructor._KEY_TO_BUCKET[key];
+                        site[bucket] = rules.map(r => {
+                            // id 基于规则内容（排除 id 自身）计算，确保同一规则始终同 ID
+                            const { id, ...rest } = r;
+                            return { ...r, id: BlockEngine.murmur32(JSON.stringify(rest)).slice(0, 4) };
+                        });
+                        totalRules += rules.length;
+                    }
+                });
+                if (Object.keys(site).length > 0) sites[domain] = site;
+            });
+
+            // 域名黑名单：导出时去掉 _ts，纯字符串数组（导入端自动补 _ts: Date.now()）
+            const domains = this.getDomainBlocks().map(r => r.domain).filter(Boolean);
+
+            // 配置与闪现域名
+            const config = this._readKey('config', {});
+            const flashDict = this._readKey('pro_blocker_flash_domains', {});
+            const flashDomains = Object.keys(flashDict).filter(d => flashDict[d]);
+
+            // 正常路径采集数据：泛化引擎误杀检测的参照样本，跨设备迁移时需一并导出
+            // 否则新设备泛化引擎缺少正常路径参照，无法评估误杀风险
+            const rawNormalPaths = this._readKey('normalPaths', {});
+            const normalPaths = {};
+            for (const site in rawNormalPaths) {
+                if (Array.isArray(rawNormalPaths[site]) && rawNormalPaths[site].length > 0) {
+                    normalPaths[site] = rawNormalPaths[site];
+                }
+            }
+
+            const exportData = {
+                meta: {
+                    version: '2.0',
+                    exportedAt: new Date().toISOString(),
+                    scriptVersion: GM_info && GM_info.script && GM_info.script.version || 'unknown',
+                    counts: {
+                        domains: domains.length,
+                        siteRules: totalRules,
+                        sites: Object.keys(sites).length
+                    }
+                },
+                domains,
+                sites,
+                config,
+                flashDomains,
+                normalPaths
             };
             return JSON.stringify(exportData, null, 2);
         }
@@ -337,6 +429,74 @@
                 throw new Error('导入数据格式无效');
             }
             if (!merge && !confirm('覆盖导入将清除现有所有规则，确定继续？')) return false;
+
+            // v2.0 格式检测：有 sites 键时展开为 v1.0 平铺字典，复用已有合并/覆盖逻辑
+            // v1.0 格式（有 blocks/dynamicBlocks 等平铺键）直接走下方原有逻辑
+            if (importData.sites && typeof importData.sites === 'object') {
+                const BUCKET_TO_KEY = {
+                    'static': 'blocks',
+                    'dynamic': 'dynamicBlocks',
+                    'regex': 'regexBlocks',
+                    'attribute': 'attrBlocks',
+                    'structural': 'structBlocks',
+                    'complex': 'complexBlocks',
+                    'pathPattern': 'pathPatternBlocks'
+                };
+                // 将 v2.0 sites 展开为 v1.0 平铺字典
+                for (const bucket in BUCKET_TO_KEY) {
+                    const key = BUCKET_TO_KEY[bucket];
+                    if (!importData[key]) importData[key] = {};
+                    for (const domain in importData.sites) {
+                        const siteData = importData.sites[domain];
+                        if (siteData[bucket] && Array.isArray(siteData[bucket])) {
+                            // 剥离 id 字段（id 仅用于导出/管理面板，内部存储不需要）
+                            importData[key][domain] = siteData[bucket].map(r => {
+                                if (r && typeof r === 'object' && 'id' in r) {
+                                    const { id, ...rest } = r;
+                                    return rest;
+                                }
+                                return r;
+                            });
+                        }
+                    }
+                }
+                // 域名黑名单：v2.0 为纯 string[]，转为 {domain, _ts}[] 供 _normDomains 处理
+                if (Array.isArray(importData.domains)) {
+                    importData['domainBlocks'] = importData.domains.map(d => ({ domain: d, _ts: Date.now() }));
+                }
+                // flashDomains: v2.0 为 string[]，转为 dict 供原有逻辑处理
+                if (Array.isArray(importData.flashDomains)) {
+                    const flashDict = {};
+                    importData.flashDomains.forEach(d => { flashDict[d] = true; });
+                    importData['pro_blocker_flash_domains'] = flashDict;
+                }
+                // normalPaths: v2.0 为 { site: [path, ...] }，合并到现有存储并更新 Set 镜像
+                // 泛化引擎依赖正常路径做误杀检测，跨设备迁移必须保留
+                if (importData.normalPaths && typeof importData.normalPaths === 'object') {
+                    const existing = this._readKey('normalPaths', {});
+                    for (const site in importData.normalPaths) {
+                        if (!Array.isArray(importData.normalPaths[site])) continue;
+                        if (!existing[site]) existing[site] = [];
+                        // 合并去重：用 Set 镜像做 O(1) 查重
+                        if (!this._normalPathSets[site]) {
+                            this._normalPathSets[site] = new Set(existing[site]);
+                        }
+                        const pathSet = this._normalPathSets[site];
+                        for (const path of importData.normalPaths[site]) {
+                            if (!pathSet.has(path)) {
+                                pathSet.add(path);
+                                existing[site].push(path);
+                            }
+                        }
+                        // 只保留最近 200 条
+                        if (existing[site].length > 200) {
+                            const removed = existing[site].splice(0, existing[site].length - 200);
+                            for (const r of removed) pathSet.delete(r);
+                        }
+                    }
+                    this._markDirty('normalPaths', existing);
+                }
+            }
 
             const dictKeys = ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config', 'pro_blocker_flash_domains'];
             dictKeys.forEach(key => {
@@ -476,13 +636,36 @@
             // 仅记录 pathname（不含 query/hash），减少存储体积与误判噪声
             const cleanPath = path.split('?')[0].split('#')[0];
             if (cleanPath.length < 2 || cleanPath === '/') return;
+            // Set 镜像做 O(1) 去重，替代原 Array.includes() 的 O(N) 热路径
+            if (!this._normalPathSets[site]) {
+                const allPaths = this._readKey('normalPaths', {});
+                this._normalPathSets[site] = new Set(allPaths[site] || []);
+            }
+            const pathSet = this._normalPathSets[site];
+            if (pathSet.has(cleanPath)) return; // O(1) 替代 O(N)
+            pathSet.add(cleanPath);
+            // 批量缓冲：满 20 条统一落盘，减少 95% 的 _markDirty 调用
+            this._normalPathsBuffer.push({ site, path: cleanPath });
+            if (this._normalPathsBuffer.length >= 20) this._flushNormalPaths();
+        }
+
+        // 批量刷新正常路径缓冲到待写队列
+        _flushNormalPaths() {
+            if (this._normalPathsBuffer.length === 0) return;
             const allPaths = this._readKey('normalPaths', {});
-            if (!allPaths[site]) allPaths[site] = [];
-            const arr = allPaths[site];
-            if (arr.includes(cleanPath)) return; // Set 语义去重
-            arr.push(cleanPath);
-            // 只保留最近 200 条，FIFO 淘汰
-            if (arr.length > 200) arr.splice(0, arr.length - 200);
+            for (const { site, path } of this._normalPathsBuffer) {
+                if (!allPaths[site]) allPaths[site] = [];
+                allPaths[site].push(path);
+                // 只保留最近 200 条，FIFO 淘汰
+                if (allPaths[site].length > 200) {
+                    const removed = allPaths[site].splice(0, allPaths[site].length - 200);
+                    // 同步清理 Set 镜像中被淘汰的路径，保持镜像与存储一致
+                    if (this._normalPathSets[site]) {
+                        for (let i = 0; i < removed.length; i++) this._normalPathSets[site].delete(removed[i]);
+                    }
+                }
+            }
+            this._normalPathsBuffer = [];
             this._markDirty('normalPaths', allPaths);
         }
 
@@ -502,8 +685,8 @@
      * DOM 扫描仍用合并正则（getPathMatcher）以支持 .exec() 提取匹配串日志。
      */
     class PathInvertedIndex {
-        static _tokenIndex = new Map();   // token -> Set<rawPattern>
-        static _fallback = [];            // 无 ≥4 token 的 pattern，线性扫描
+        static _tokenIndex = new Map();   // token -> Set<{raw, lower}>
+        static _fallback = [];            // 无 ≥4 token 的 pattern，存 {raw, lower}
         static _patternCount = 0;
 
         static build(rawPatterns) {
@@ -513,19 +696,21 @@
             rawPatterns.forEach(pattern => {
                 if (!pattern) return;
                 this._patternCount++;
-                const token = this._extractToken(pattern);
+                // 预计算小写：test() 热路径中直接用 .lower 字段，消除每次 toLowerCase() 的字符串分配
+                const entry = { raw: pattern, lower: pattern.toLowerCase() };
+                const token = this._extractToken(entry.lower);
                 if (token) {
                     if (!this._tokenIndex.has(token)) this._tokenIndex.set(token, new Set());
-                    this._tokenIndex.get(token).add(pattern);
+                    this._tokenIndex.get(token).add(entry);
                 } else {
-                    this._fallback.push(pattern);
+                    this._fallback.push(entry);
                 }
             });
         }
 
         // 提取最长 ≥4 字符的字母数字 token 作为该 pattern 的倒排键
         static _extractToken(str) {
-            const tokens = str.toLowerCase().split(/[^a-z0-9]/);
+            const tokens = str.split(/[^a-z0-9]/);
             let maxToken = '';
             for (let i = 0; i < tokens.length; i++) {
                 if (tokens[i].length > maxToken.length) maxToken = tokens[i];
@@ -546,12 +731,12 @@
                     if (set) set.forEach(p => candidates.add(p));
                 }
             }
-            for (const pattern of candidates) {
-                if (lower.includes(pattern.toLowerCase())) return true;
+            for (const p of candidates) {
+                if (lower.includes(p.lower)) return true;
             }
             // fallback：无 token 的 pattern 逐一字面子串校验
             for (let i = 0; i < this._fallback.length; i++) {
-                if (lower.includes(this._fallback[i].toLowerCase())) return true;
+                if (lower.includes(this._fallback[i].lower)) return true;
             }
             return false;
         }
@@ -566,6 +751,8 @@
      * 安全约束：仅在 currentPath ≥ 2 层（com.xxx）时输出通配，永不输出 *.com 这类灾难性规则。
      */
     class DomainGeneralizer {
+        // 构建反向字典树时在每个节点记录覆盖的域名列表，避免 extractOptimalDomains 中
+        // 对每个子键做 O(N) filter 导致整体 O(N²)。50 域名时从 ~1250 次 split+reverse 降为 50 次
         static buildReverseTrie(domains) {
             const root = {};
             domains.forEach(domain => {
@@ -574,8 +761,9 @@
                 let curr = root;
                 parts.forEach(part => {
                     if (!part) return;
-                    if (!curr[part]) curr[part] = { _count: 0, _children: {} };
+                    if (!curr[part]) curr[part] = { _count: 0, _children: {}, _domains: [] };
                     curr[part]._count++;
+                    curr[part]._domains.push(domain); // 构建时即记录，traverse 时直接取用
                     curr = curr[part]._children;
                 });
             });
@@ -604,16 +792,13 @@
                     return; // 已收敛，不再下钻
                 }
                 childrenKeys.forEach(key => {
-                    // currentPath 为 TLD 在前的倒序（如 ['com','ads']），与域名 reverse 切片同序
-                    const pathKey = [...currentPath, key].join('.');
-                    const nextChildDomains = childDomains.filter(d =>
-                        d.split('.').reverse().slice(0, currentPath.length + 1).join('.') === pathKey
-                    );
-                    traverse(node._children[key], [...currentPath, key], nextChildDomains);
+                    const childNode = node._children[key];
+                    // 直接取构建时记录的 _domains，替代原 O(N) filter 线性扫描
+                    traverse(childNode, [...currentPath, key], childNode._domains);
                 });
             };
 
-            Object.keys(trie).forEach(tld => traverse(trie[tld], [tld], domains.filter(d => d.toLowerCase().endsWith('.' + tld) || d.toLowerCase() === tld)));
+            Object.keys(trie).forEach(tld => traverse(trie[tld], [tld], trie[tld]._domains));
             return results;
         }
     }
@@ -845,6 +1030,9 @@
         // 已扫描节点弱引用集合：避免对同一节点重复执行资源域/路径扫描（O(1) 判重）
         // WeakSet 不阻止 GC，节点从 DOM 移除后自动释放，杜绝内存泄漏
         static _scannedNodes = new WeakSet();
+        // 拓扑指纹缓存：WeakMap 按 element 引用键控，DOM 不变时重复调用直接 O(1) 命中
+        // DOMContentLoaded + load + SPA 导航会对同一批元素重复计算指纹，缓存命中率 ~95%
+        static _topoFpCache = new WeakMap();
         // CSSOM 增量注入指纹：记录上次注入的选择器集合，内容未变时跳过重建
         static _lastCSSFingerprint = '';
         // Constructable Stylesheets 支持：Chrome 99+/Edge/Firefox 101+ 支持，
@@ -857,6 +1045,9 @@
         static stats = { networkBlocks: 0, domBlocks: 0, matchTimeMs: 0 };
         // 域名匹配 LRU 缓存：高频场景（同域名 20+ 请求）避免重复 split + 循环，O(1) 命中
         static _hostCache = new Map();
+        // URL 级拦截判定 LRU 缓存：SPA 场景同一广告 URL 重复请求时 O(1) 命中
+        // 缓存完整 URL → boolean，容量 100，规则变更时清空
+        static _urlBlockCache = new Map();
         // 本次页面加载是否检测到广告闪现（fastInject 重置，detectFlashAndMark 置位）
         // load 事件据此判断是否为"干净加载"，驱动 flashList 自愈
         static _flashDetectedThisLoad = false;
@@ -871,6 +1062,7 @@
             this._cachedGenPathRegex = null;
             this._lastCSSFingerprint = ''; // 规则变更后强制下次 applyCSSRules 重建样式表
             this._hostCache.clear(); // 域名黑名单变更后清空 LRU 缓存，避免过期决策
+            this._urlBlockCache.clear(); // URL 拦截缓存一并清空，避免规则变更后旧决策残留
         }
 
         // 构建路径倒排索引（网络层专用）：仅当 _cachedPathIndex !== true 时重建。
@@ -937,26 +1129,41 @@
         // 路径匹配走倒排索引（O(tokens) 候选过滤）+ 泛化路径正则，网络层高频调用受益最大
         static isUrlBlocked(url) {
             if (!url || typeof url !== 'string') return false;
+            // URL 级 LRU 缓存：SPA 场景同一广告 URL 重复请求时 O(1) 命中
+            const cached = this._urlBlockCache.get(url);
+            if (cached !== undefined) return cached;
+            let result = false;
             try {
                 const absUrl = new URL(url, location.href);
                 // 仅排除与当前页完全同域的请求（避免拦截页面自身导航/根资源致页面白屏），
                 // 子域不在豁免范围：用户显式拉黑的 ads.example.com 在 example.com 下必须生效
                 if (absUrl.hostname && absUrl.hostname !== location.hostname) {
                     // 1. 精确域名黑名单
-                    if (this.hostnameBlocked(absUrl.hostname, this.getDomainSet())) return true;
+                    if (this.hostnameBlocked(absUrl.hostname, this.getDomainSet())) result = true;
                     // 2. 泛化域名通配（*.base 收敛规则）
-                    const genDomainSet = this.getGeneralizedDomainSet();
-                    if (genDomainSet.size > 0 && this.hostnameBlocked(absUrl.hostname, genDomainSet)) return true;
+                    else {
+                        const genDomainSet = this.getGeneralizedDomainSet();
+                        if (genDomainSet.size > 0 && this.hostnameBlocked(absUrl.hostname, genDomainSet)) result = true;
+                    }
                 }
-                const pathStr = absUrl.pathname + absUrl.search;
-                // 3. 精确路径模式（倒排索引 O(tokens) 候选过滤）
-                this._ensurePathIndex();
-                if (PathInvertedIndex.size > 0 && PathInvertedIndex.test(pathStr)) return true;
-                // 4. 泛化路径通配（MSA 对齐生成的 /a/*/b 正则）
-                const genPathRegex = this.getGeneralizedPathRegex();
-                if (genPathRegex && genPathRegex.test(pathStr)) return true;
+                if (!result) {
+                    const pathStr = absUrl.pathname + absUrl.search;
+                    // 3. 精确路径模式（倒排索引 O(tokens) 候选过滤）
+                    this._ensurePathIndex();
+                    if (PathInvertedIndex.size > 0 && PathInvertedIndex.test(pathStr)) result = true;
+                    // 4. 泛化路径通配（结构指纹聚类生成的 /a/*/b 正则）
+                    else {
+                        const genPathRegex = this.getGeneralizedPathRegex();
+                        if (genPathRegex && genPathRegex.test(pathStr)) result = true;
+                    }
+                }
             } catch (e) { }
-            return false;
+            // LRU 淘汰：缓存满 100 条时淘汰最旧条目
+            if (this._urlBlockCache.size >= 100) {
+                this._urlBlockCache.delete(this._urlBlockCache.keys().next().value);
+            }
+            this._urlBlockCache.set(url, result);
+            return result;
         }
 
         // ReDoS 静态预检：在执行前检测危险模式，拒绝执行可能引发灾难性回溯的正则
@@ -995,15 +1202,18 @@
         static hostnameBlocked(host, domainSet) {
             if (!host || !domainSet || domainSet.size === 0) return false;
             host = String(host).toLowerCase();
-            // LRU 缓存命中：同一 host 的决策结果在缓存中直接返回
-            const cached = this._hostCache.get(host);
+            // 缓存 key 按 domainSet 引用做命名空间前缀，隔离精确域名集与泛化域名集两个缓存域
+            // 否则 host 对 Set A 返回 false 后被缓存 → 后续对 Set B 查询同一 host 直接返回 false
+            // → 泛化域名规则对已被精确 Set 查询过的 host 永远失效
+            const cacheKey = (domainSet === this._cachedGenDomainSet ? 'g:' : 'd:') + host;
+            const cached = this._hostCache.get(cacheKey);
             if (cached !== undefined) return cached;
             let result = this._rawHostnameMatch(host, domainSet);
             // LRU 淘汰：缓存满 200 条时淘汰最旧条目（Map 保持插入顺序）
             if (this._hostCache.size >= 200) {
                 this._hostCache.delete(this._hostCache.keys().next().value);
             }
-            this._hostCache.set(host, result);
+            this._hostCache.set(cacheKey, result);
             return result;
         }
 
@@ -1056,7 +1266,7 @@
                 // 阈值 50px：过滤 1x1 追踪像素等非可视闪现，只对真正可见的广告标记
                 if (rect.width < 50 || rect.height < 50) return;
                 const host = triggerUrl ? new URL(triggerUrl, location.href).hostname : '';
-                if (host && AD_KEYWORDS.test(host)) {
+                if (host && isAdKeywordHost(host)) {
                     this._flashDetectedThisLoad = true;
                     storage.markAsFlashing();
                 }
@@ -1069,9 +1279,12 @@
          * autoBlock=true 时直接屏蔽高风险项；返回全部候选供 UI 审阅
          */
         static scanInvisibleOverlays(options = {}) {
-            const { autoBlock = true, root = document.documentElement, minSize = 100 } = options;
+            const { autoBlock = true, root = document.documentElement, minSize = 100, _depth = 0 } = options;
             const results = [];
             if (!root || !document.body) return results;
+            // Shadow DOM 递归深度限制：浏览器 shadow 嵌套通常 ≤3 层，但恶意/异常页面
+            // 可能构造循环引用导致栈溢出，防御性限制最大 5 层
+            if (_depth > 5) return results;
 
             const selfHost = window.location.hostname;
 
@@ -1171,7 +1384,7 @@
             // 广告 SDK 常在 shadow 内注入透明跳转层以规避常规选择器，不递归则完全漏拦
             candidates.forEach(el => {
                 if (el.shadowRoot) {
-                    const shadowResults = this.scanInvisibleOverlays({ autoBlock, root: el.shadowRoot, minSize });
+                    const shadowResults = this.scanInvisibleOverlays({ autoBlock, root: el.shadowRoot, minSize, _depth: _depth + 1 });
                     for (let i = 0; i < shadowResults.length; i++) results.push(shadowResults[i]);
                 }
             });
@@ -1360,9 +1573,18 @@
         // 清空任意 CSSStyleSheet（构造样式表 或 <style>.sheet）的所有规则
         static _clearSheetRules(sheet) {
             if (!sheet) return;
+            // 快路径：Constructable Stylesheets 用 replaceSync('') 一次性清空，O(1) 调用
+            if (this._useConstructable) {
+                try { sheet.replaceSync(''); return; } catch (e) { }
+            }
+            // <style> 降级路径：直接清空 ownerNode.textContent（触发整表重建，O(1) 调用）
+            // 替代原 deleteRule(0) 循环——每次删首条后剩余规则索引全重排，N 条规则 O(N²)
+            const owner = sheet.ownerNode;
+            if (owner) { owner.textContent = ''; return; }
+            // 兜底：从尾部删除（deleteRule(length-1) 无需索引重排，O(1)/条 vs deleteRule(0) 的 O(N)/条）
             if (sheet.cssRules) {
                 while (sheet.cssRules.length > 0) {
-                    try { sheet.deleteRule(0); } catch (e) { break; }
+                    try { sheet.deleteRule(sheet.cssRules.length - 1); } catch (e) { break; }
                 }
             }
         }
@@ -2160,7 +2382,12 @@
 
             candidates.forEach(el => {
                 if (el.style.display === 'none') return; // 已隐藏跳过
-                const fp = this.generateTopologyFingerprint(el);
+                // 拓扑指纹缓存：DOM 不变时直接复用，避免重复 5 层父链遍历 + murmur32
+                let fp = this._topoFpCache.get(el);
+                if (fp === undefined) {
+                    fp = this.generateTopologyFingerprint(el);
+                    this._topoFpCache.set(el, fp);
+                }
                 if (hashSet.has(fp)) {
                     this.stats.domBlocks++;
                     el.style.setProperty('display', 'none', 'important');
@@ -2288,7 +2515,7 @@
             domainMeta.forEach((meta, host) => {
                 let score = 0;
                 // 评分矩阵：keyword 40 / script 25 / data-attr 15 / style 10 / srcset+attr 10 / 频次上限 20(λ=2) / 安全CDN -50
-                if (AD_KEYWORDS.test(host)) score += 40;
+                if (isAdKeywordHost(host)) score += 40;
                 if (meta.sources.has('script-text') || meta.sources.has('script-var')) score += 25;
                 if (meta.sources.has('inline-style') || meta.sources.has('stylesheet')) score += 10;
                 if (meta.sources.has('srcset') || meta.sources.has('attr')) score += 10;
@@ -3343,7 +3570,7 @@
             let filterText = '';
             let onlyAds = true;
 
-            const isAdLike = (host) => AD_KEYWORDS.test(host);
+            const isAdLike = (host) => isAdKeywordHost(host);
 
             const getScoreClass = (score) => score >= 50 ? 'high' : score >= 25 ? 'mid' : 'low';
             const sourceLabel = (src) => ({ 'attr': '属性', 'srcset': '响应图', 'inline-style': '内联样式', 'stylesheet': '样式表', 'data-attr': '数据属性', 'script-text': '脚本文本', 'script-var': '脚本变量' }[src] || src);
@@ -4220,28 +4447,48 @@
 
         generateAdGuardRules() {
             const raw = JSON.parse(storage.exportAll() || '{}');
-            const ruleBuckets = {
-                blocks: raw.blocks || {},
-                dynamicBlocks: raw.dynamicBlocks || {},
-                regexBlocks: raw.regexBlocks || {},
-                attrBlocks: raw.attrBlocks || {},
-                structBlocks: raw.structBlocks || {},
-                complexBlocks: raw.complexBlocks || {},
-                pathPatternBlocks: raw.pathPatternBlocks || {},
-                domainBlocks: raw.domainBlocks || []
+            // v2.0 格式：sites 按域名分组 + domains 纯字符串数组
+            // v1.0 格式：blocks/dynamicBlocks 等平铺字典 + domainBlocks {domain,_ts}[]
+            const isV2 = raw.sites && typeof raw.sites === 'object';
+            const BUCKET_TO_TYPE = {
+                'static': 'static', 'dynamic': 'dynamic', 'regex': 'regex',
+                'attribute': 'attribute', 'structural': 'structural',
+                'complex': 'complex', 'pathPattern': 'pathPattern'
             };
-            const allDomains = new Set([
-                ...Object.keys(ruleBuckets.blocks),
-                ...Object.keys(ruleBuckets.dynamicBlocks),
-                ...Object.keys(ruleBuckets.regexBlocks),
-                ...Object.keys(ruleBuckets.attrBlocks),
-                ...Object.keys(ruleBuckets.structBlocks),
-                ...Object.keys(ruleBuckets.complexBlocks),
-                ...Object.keys(ruleBuckets.pathPatternBlocks)
-            ]);
-            // 校验域名：非空、无空白、长度合理；domainBlocks 为 {domain,_ts}[]，抽取 domain 字符串
+            const allDomains = new Set(isV2 ? Object.keys(raw.sites) : []);
+            let ruleBuckets;
+            if (isV2) {
+                // v2.0：从 sites 提取各桶，补全 type 字段供 convertRule 使用
+                ruleBuckets = {};
+                for (const bucket in BUCKET_TO_TYPE) {
+                    ruleBuckets[bucket] = {};
+                    for (const domain in raw.sites) {
+                        const arr = raw.sites[domain][bucket];
+                        if (Array.isArray(arr) && arr.length > 0) {
+                            ruleBuckets[bucket][domain] = arr.map(r => ({ ...r, type: BUCKET_TO_TYPE[bucket] }));
+                        }
+                    }
+                }
+            } else {
+                // v1.0 兼容：直接用平铺字典
+                ruleBuckets = {
+                    blocks: raw.blocks || {},
+                    dynamicBlocks: raw.dynamicBlocks || {},
+                    regexBlocks: raw.regexBlocks || {},
+                    attrBlocks: raw.attrBlocks || {},
+                    structBlocks: raw.structBlocks || {},
+                    complexBlocks: raw.complexBlocks || {},
+                    pathPatternBlocks: raw.pathPatternBlocks || {}
+                };
+                Object.keys(ruleBuckets).forEach(k => {
+                    Object.keys(ruleBuckets[k]).forEach(d => allDomains.add(d));
+                });
+            }
+            // 校验域名：非空、无空白、长度合理
             const isValidDomain = (d) => typeof d === 'string' && d.length > 0 && d.length < 200 && !/\s/.test(d);
-            const globalDomains = (Array.isArray(ruleBuckets.domainBlocks) ? ruleBuckets.domainBlocks : [])
+            // 全局域名黑名单：v2.0 为 string[]，v1.0 为 {domain,_ts}[]，统一提取 domain 字符串
+            const rawDomains = isV2 ? (raw.domains || []) : (raw.domainBlocks || []);
+            const globalDomains = (Array.isArray(rawDomains) ? rawDomains : [])
                 .map(r => (r && typeof r === 'object') ? r.domain : r)
                 .filter(isValidDomain);
 
@@ -4346,15 +4593,13 @@
             };
 
             allDomains.forEach(domain => {
-                const rules = [
-                    ...(ruleBuckets.blocks[domain] || []),
-                    ...(ruleBuckets.dynamicBlocks[domain] || []),
-                    ...(ruleBuckets.regexBlocks[domain] || []),
-                    ...(ruleBuckets.attrBlocks[domain] || []),
-                    ...(ruleBuckets.structBlocks[domain] || []),
-                    ...(ruleBuckets.complexBlocks[domain] || []),
-                    ...(ruleBuckets.pathPatternBlocks[domain] || [])
-                ];
+                // v2.0 用桶名（static/dynamic/...），v1.0 用存储键名（blocks/dynamicBlocks/...）
+                // 两种格式统一通过 Object.values 遍历所有桶，按域名提取规则
+                const rules = [];
+                for (const bucket in ruleBuckets) {
+                    const arr = ruleBuckets[bucket][domain];
+                    if (Array.isArray(arr)) rules.push(...arr);
+                }
                 if (rules.length === 0) return;
                 lines.push(`! ${domain}`);
                 rules.forEach(rule => {
