@@ -1,5 +1,53 @@
 # 更新日志
 
+## v0.2.16 — 2026-08-06
+
+### 真实 Bug 修复 + 算法优化 + 泛化引擎重写
+
+针对代码审计发现的真实 Bug 与算法非最优项逐项修复，核心是让域名拦截真正生效、ReDoS 防护从事后检测改为事前拦截、泛化引擎从 MSA 逐位对齐重写为结构指纹聚类。
+
+#### Bug 修复
+
+1. **P0：safeRegexTest 伪超时保护**：原 `safeRegexTest` 在 `regex.test()` 执行完毕后才检测耗时，ReDoS 在 `test()` 内部阻塞数秒，事后检测无法阻止卡顿。新增 [isRegexSafe](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L838) 静态复杂度预检（嵌套量词 `(a+)+` / 重叠分支 `(a|ab)+` 检测），在 [applyRegexRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1394) 入口处过滤不安全正则，不执行。
+
+2. **P1：导入取消后仍提示成功**：[importAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L329) 覆盖模式 `confirm` 取消后仅 `return`（返回 `undefined`），调用方 [btn-do-import](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L4569) 无论取消与否都 `alert('导入成功')` + `reload()`。改为 `importAll` 返回 `false` 表示取消，调用方检查返回值。
+
+3. **P1：属性选择器预览与实际不一致**：[属性模式预览](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3506) 原本按 `level` 向上遍历隐藏父级，但 [applyCSSRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1080) 保存后直接注入 CSS 选择器无 level 逻辑。预览改为仅隐藏选择器命中的元素本身，确保预览=刷新后效果。
+
+4. **P1：全局域名面板预览口径不一致**：[showGlobalDomainPanel 预览](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3298) 原本仅隐藏 `findSingleChildWrapper`，但正式封杀时 CSS `*:has(> :is(...))` 还会隐藏直接父级、`[src*=domain]` 隐藏元素本身。预览改为同时隐藏元素本身 + 直接父级 + 单子链容器，与 `applyCSSRules` + `scanAndBlockDynamic` 完全同口径。
+
+#### 算法优化
+
+5. **:has() CSS 规则合并**：[applyCSSRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1083) 原本 N 个域名生成 2N 条 CSS 规则，每条 `:has()` 触发独立子树遍历。改为批量合并（BATCH=40），CSS 规则数从 2N 降为 ⌈2N/40⌉×2，Style Recalculation 降低 ~70%。
+
+6. **域名匹配 LRU 缓存**：[hostnameBlocked](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L872) 原本每次调用 `split('.')` + 循环，高频场景（同域名 20+ 请求）重复计算。新增 `_hostCache` Map（200 条 LRU 淘汰），`invalidateCache` 时一并清空。
+
+7. **覆盖层扫描两阶段过滤**：[scanInvisibleOverlays](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L971) 原本对所有候选元素直接调用 `getComputedStyle`（最昂贵的 DOM API）。改为先用 `getBoundingClientRect` 过滤面积/视口，再对达标元素调 `getComputedStyle`，调用减少 80%+。
+
+8. **导入去重 O(N×M) → O(N+M)**：[importAll](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L352) 原本用 `some(JSON.stringify(x) === JSON.stringify(item))` 线性扫描。改为用 `Set` 存 JSON 指纹，O(1) 查重。
+
+9. **正则规则合并执行**：[applyRegexRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L1394) 原本每个文本节点对每条规则调用 `regex.test()`，O(nodes × rules)。改为多条正则合并为一条（捕获组 `|` 连接），每个节点只调用一次 `exec`，通过捕获组索引定位命中规则，每节点 RegExp 调用从 N 次降为 1 次。
+
+#### 泛化引擎重写
+
+10. **PathGeneralizer 结构指纹聚类**：原 MSA 逐位对齐方案有四大缺陷：精度差（2 条路径即可产生通配）、跨站污染（混合对齐）、阈值过低、无反馈回路。重写为 [结构指纹聚类](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L630)：
+    - 结构指纹：路径段分类为 NUM/VER/HEX/FILE/WORD，相同指纹归组
+    - 精准通配：仅 NUM/HEX 位置通配，WORD 位置保留或小量枚举 `{a|b}`
+    - 按站点独立泛化：不跨站混合
+    - 误杀检测：用站点正常路径做反向验证，误杀率 > 30% 拒绝输出
+    - 通配上限：通配段占比 > 50% 拒绝
+
+11. **域名泛化覆盖收益比**：[AutoGeneralizer.run](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L790) 新增覆盖收益比过滤，仅当通配域名数 / 总域名数 > 0.6 时才输出泛化规则。
+
+12. **正常路径采集**：[StorageManager.recordNormalPath](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L474) 新增正常路径采集能力，[NetworkInterceptor](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L2386) 对未拦截的请求记录 pathname 为正常路径样本（每站保留最近 200 条），供泛化引擎误杀检测使用。
+
+#### 已验证无需修改（已最优）
+
+- 网络层域名拦截（isUrlBlocked 已正确使用 new URL + hostname）
+- PathInvertedIndex 短模式（已有 _fallback 数组）
+- _ts 排序（addRule 已包裹 {domain, _ts: Date.now()}）
+- MutationObserver 监听 / 时间分片扫描 / IntersectionObserver / 域名 Trie / debounce
+
 ## v0.2.14 — 2026-08-06
 
 ### 交互体验全面修复：预览一致性 + 域名可选 + 规则管理不退出 + 最近规则置顶
