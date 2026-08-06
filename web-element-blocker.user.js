@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.19
+// @version      0.2.20
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。新增三算法协同系统：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）、智能自学习泛化引擎（置信度追踪+自动衰减）。
 // @author       EFate
 // @match        *://*/*
@@ -1567,18 +1567,24 @@
         static restoreAllInlineStyles() {
             const _clearStyle = (node) => {
                 if (!node || !node.style) return;
-                // 仅清除脚本设置的内联隐藏样式（display:none + opacity:0 + visibility:hidden）
-                // 保留页面自身设置的其他样式
-                if (node.style.getPropertyValue('display') === 'none' &&
-                    node.style.getPropertyPriority('display') === 'important') {
+                // 仅清除脚本设置的内联隐藏样式（display:none + opacity:0 + visibility:hidden + pointer-events:none）
+                // 判定标准：任一属性为 important 且值为隐藏值，则视为脚本设置，一并清除四个属性
+                // 保留页面自身设置的非 important 或非隐藏值的样式
+                const isHidden = (
+                    (node.style.getPropertyValue('display') === 'none' && node.style.getPropertyPriority('display') === 'important') ||
+                    (node.style.getPropertyValue('visibility') === 'hidden' && node.style.getPropertyPriority('visibility') === 'important') ||
+                    (node.style.getPropertyValue('opacity') === '0' && node.style.getPropertyPriority('opacity') === 'important') ||
+                    (node.style.getPropertyValue('pointer-events') === 'none' && node.style.getPropertyPriority('pointer-events') === 'important')
+                );
+                if (isHidden) {
                     node.style.removeProperty('display');
                     node.style.removeProperty('opacity');
                     node.style.removeProperty('visibility');
                     node.style.removeProperty('pointer-events');
                 }
             };
-            // 遍历所有可能被隐藏的元素：带内联 display:none!important 的元素
-            document.querySelectorAll('[style*="display: none"], [style*="display:none"]').forEach(el => {
+            // 遍历所有可能被隐藏的元素：带内联 display:none / visibility:hidden / opacity:0 / pointer-events:none 的元素
+            document.querySelectorAll('[style*="display: none"], [style*="display:none"], [style*="visibility: hidden"], [style*="visibility:hidden"], [style*="opacity: 0"], [style*="opacity:0"], [style*="pointer-events: none"], [style*="pointer-events:none"]').forEach(el => {
                 _clearStyle(el);
             });
         }
@@ -2736,6 +2742,16 @@
      * 判定逻辑复用 BlockEngine.isUrlBlocked，与 DOM 层拦截规则完全一致，避免双标。
      */
     class NetworkInterceptor {
+        // GE 命中计数防抖落盘：避免每个拦截请求都触发 _save
+        static _geDirtyTimer = null;
+        static _markGEDirty() {
+            if (this._geDirtyTimer) return;
+            this._geDirtyTimer = setTimeout(() => {
+                this._geDirtyTimer = null;
+                try { GeneralizationEngine.flush(); } catch(e){}
+            }, 5000);
+        }
+
         static init() {
             this.hookFetch();
             this.hookXHR();
@@ -2748,6 +2764,19 @@
             // 2. LR 置信度自动拦截：高分广告域自动加入拦截队列，减少人工指认成本
             //    阈值 85 + 同源/安全 CDN 豁免，确保不误伤基础设施与同站资源
             if (AdScorerLR.shouldAutoBlock(url)) return true;
+            // 3. GeneralizationEngine 自学习规则：置信度 ≥ 0.5 的 domain/url/path 自动拦截
+            //    覆盖深度扫描学习到的博彩/色情/追踪域名与 URL 模式
+            try {
+                const m = GeneralizationEngine.matchUrl(url);
+                if (m.blocked) {
+                    if (m.rule) {
+                        m.rule.hits = (m.rule.hits || 0) + 1;
+                        if (m.rule.confidence < 1.0) m.rule.confidence = Math.min(1.0, m.rule.confidence + 0.05);
+                        NetworkInterceptor._markGEDirty();
+                    }
+                    return true;
+                }
+            } catch(e){}
             return false;
         }
 
@@ -3441,12 +3470,30 @@
         function enableNavigationInterceptor(blockedDomains) {
             if (_navInterceptorActive) return;
             _navInterceptorActive = true;
+            // 初始快照仅用于启动期；后续命中通过 GE.matchNavigation 实时查询，
+            // 使深度扫描学习到的新 nav 规则能立即生效
+            const _checkNav = (url) => {
+                if (!url) return false;
+                // 优先 GE 实时匹配（覆盖后续学习的规则 + 同步命中计数）
+                try {
+                    const m = GeneralizationEngine.matchNavigation(url);
+                    if (m.blocked) {
+                        if (m.rule) {
+                            m.rule.hits = (m.rule.hits || 0) + 1;
+                            NetworkInterceptor._markGEDirty();
+                        }
+                        return true;
+                    }
+                } catch(e){}
+                // 兜底：启动期快照 + 静态特征（IP/短链/博彩色情词元）
+                return _isBlockedNav(url, blockedDomains);
+            };
 
             // ① 拦截 window.open
             const _origOpen = window.open;
             window.open = function(url) {
                 const args = Array.prototype.slice.call(arguments);
-                if (_isBlockedNav(url, blockedDomains)) {
+                if (_checkNav(url)) {
                     _navBlocked.push({ type: 'window.open', url: url, time: Date.now() });
                     console.warn('[OverlayAdScanner] 拦截 window.open:', url);
                     return null;
@@ -3459,7 +3506,7 @@
                 const link = e.target.closest && e.target.closest('a');
                 if (!link) return;
                 const href = link.href || '';
-                if (href && _isBlockedNav(href, blockedDomains)) {
+                if (href && _checkNav(href)) {
                     e.preventDefault();
                     e.stopPropagation();
                     _navBlocked.push({ type: 'link.click', url: href, time: Date.now() });
@@ -3475,7 +3522,7 @@
                 if (desc && desc.set) {
                     Object.defineProperty(Location.prototype, 'href', {
                         set(val) {
-                            if (_isBlockedNav(val, blockedDomains)) {
+                            if (_checkNav(val)) {
                                 _navBlocked.push({ type: 'location.href', url: val, time: Date.now() });
                                 console.warn('[OverlayAdScanner] 拦截 location:', val);
                                 return;
@@ -3491,7 +3538,7 @@
             // ④ 拦截 form 提交
             document.addEventListener('submit', function(e) {
                 const action = e.target.action || '';
-                if (action && _isBlockedNav(action, blockedDomains)) {
+                if (action && _checkNav(action)) {
                     e.preventDefault();
                     e.stopPropagation();
                     _navBlocked.push({ type: 'form.submit', url: action, time: Date.now() });
@@ -3728,16 +3775,16 @@
                 for (const r of rules.domain) {
                     if (r.confidence < CONFIDENCE_MIN) continue;
                     if (host === r.hostname || host.endsWith('.' + r.hostname)) {
-                        r.hits++; _save(); return { blocked: true, rule: r, type: 'domain' };
+                        return { blocked: true, rule: r, type: 'domain' };
                     }
                 }
                 for (const r of rules.url) {
                     if (r.confidence < CONFIDENCE_MIN) continue;
-                    try { if (new RegExp(r.pattern, 'i').test(url)) { r.hits++; return { blocked: true, rule: r, type: 'url' }; } } catch(e){}
+                    try { if (new RegExp(r.pattern, 'i').test(url)) { return { blocked: true, rule: r, type: 'url' }; } } catch(e){}
                 }
                 for (const r of rules.path) {
                     if (r.confidence < CONFIDENCE_MIN) continue;
-                    if (u.pathname.includes(r.pattern)) { r.hits++; return { blocked: true, rule: r, type: 'path' }; }
+                    if (u.pathname.includes(r.pattern)) { return { blocked: true, rule: r, type: 'path' }; }
                 }
             } catch(e){}
             return { blocked: false };
@@ -3750,7 +3797,7 @@
                 for (const r of rules.nav) {
                     if (r.confidence < CONFIDENCE_MIN) continue;
                     if (host === r.hostname || host.endsWith('.' + r.hostname)) {
-                        r.hits++; return { blocked: true, rule: r, type: 'nav' };
+                        return { blocked: true, rule: r, type: 'nav' };
                     }
                 }
             } catch(e){}
@@ -3963,11 +4010,28 @@
             return merged;
         }
 
+        function matchNavigation(url) {
+            if (!url) return { blocked: false };
+            try {
+                const host = new URL(url, location.href).hostname.toLowerCase();
+                for (const r of rules.nav) {
+                    if (r.confidence < CONFIDENCE_MIN) continue;
+                    if (host === r.hostname || host.endsWith('.' + r.hostname)) {
+                        return { blocked: true, rule: r, type: 'nav' };
+                    }
+                }
+            } catch(e){}
+            return { blocked: false };
+        }
+
+        // 批量落盘：供 NetworkInterceptor 防抖调用，避免每次命中都 _save
+        function flush() { _save(); }
+
         return {
             learnFromDomainScan, learnFromOverlayScan, learnFromManualSelect,
             feedbackFalsePositive, feedbackConfirm,
             matchUrl, matchNavigation, getBlockedDomains,
-            decay, optimize, getStatus, getRulesSnapshot, mergeRules, rules
+            decay, optimize, getStatus, getRulesSnapshot, mergeRules, flush, rules
         };
     })();
 
@@ -4182,6 +4246,10 @@
                 .gd-toolbar label input[type="checkbox"] { width: auto; margin: 0; }
                 .gd-toolbar button { flex: none; padding: 7px 10px; font-size: 12px; }
                 .gd-stats { font-size: 11px; color: #aaa; margin-bottom: 8px; }
+                .gd-scroll-area { max-height: 320px; overflow-y: auto; padding-right: 4px; }
+                .gd-scroll-area::-webkit-scrollbar { width: 6px; }
+                .gd-scroll-area::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 3px; }
+                .gd-scroll-area::-webkit-scrollbar-track { background: transparent; }
 
                 /* 自动化泛化管理面板 */
                 .gen-section { margin-bottom: 12px; }
@@ -4713,6 +4781,9 @@
                     container.style.setProperty('display', 'none', 'important');
                     container.style.setProperty('opacity', '0', 'important');
                 }
+
+                // 同步学习到泛化引擎：用户手动确认 = 高置信度信号
+                try { AdBlockOrchestrator.onUserSelect(this.currentSelectedEl); } catch(e){}
 
                 // 扫描全页命中选中域名的资源：隐藏元素本身 + 直接父级 + 单子链容器
                 // 口径与 applyCSSRules（[src*=domain] 与 *:has(>...)）+ scanAndBlockDynamic
@@ -5676,24 +5747,21 @@
                     BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                 } else if (scope === 'current') {
                     storage.removeRule(type, index);
-                    // 所有类型删除后都需还原内联样式 + 重建 CSS 表 + 重扫，避免残留隐藏
+                    // restoreAllInlineStyles 清除所有内联隐藏（含 regex/complex/pathPattern/domainBlock），
+                    // 必须重新应用所有基于内联样式的拦截，否则其他类型规则的隐藏会丢失
                     BlockEngine.restoreAllInlineStyles();
                     BlockEngine.applyCSSRules();
-                    if (type === 'regex') BlockEngine.applyRegexRules();
-                    if (type === 'complex') BlockEngine.applyComplexRules();
-                    if (type === 'pathPattern') {
-                        BlockEngine.restoreInlineForPath(value);
-                        BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
-                    }
+                    BlockEngine.applyRegexRules();
+                    BlockEngine.applyComplexRules();
+                    BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                 } else {
-                    // 跨站规则：删除后需还原内联 + 重建 CSS 表 + 重扫
+                    // 跨站规则：同上，需重新应用所有内联拦截
                     storage.removeRuleForDomain(domain, type, index);
                     BlockEngine.restoreAllInlineStyles();
                     BlockEngine.applyCSSRules();
-                    if (type === 'pathPattern') {
-                        BlockEngine.restoreInlineForPath(value);
-                        BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
-                    }
+                    BlockEngine.applyRegexRules();
+                    BlockEngine.applyComplexRules();
+                    BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                 }
                 records = buildRecords();
                 renderList();
@@ -5794,7 +5862,8 @@
             panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
         }
 
-        generateAdGuardRules() {
+        generateAdGuardRules(options = {}) {
+            const { includeGE = true } = options;
             const raw = JSON.parse(storage.exportAll() || '{}');
             // v2.0 格式：sites 按域名分组 + domains 纯字符串数组
             // v1.0 格式：blocks/dynamicBlocks 等平铺字典 + domainBlocks {domain,_ts}[]
@@ -5970,33 +6039,35 @@
             }
 
             // GeneralizationEngine 自学习规则导出（置信度 ≥ 0.5 的规则才输出）
-            try {
+            // 可通过选项 includeGE=false 跳过（用户在面板可切换）
+            if (includeGE) try {
                 const geRules = GeneralizationEngine.getRulesSnapshot();
                 const geLines = [];
+                const isValidHost = (h) => typeof h === 'string' && h.length > 0 && h.length < 200 && !/\s/.test(h);
                 // 域名规则 → ||hostname^$third-party
-                (geRules.domain || []).filter(r => r.confidence >= 0.5 && r.hostname).forEach(r => {
+                (geRules.domain || []).filter(r => r.confidence >= 0.5 && isValidHost(r.hostname)).forEach(r => {
                     geLines.push(`||${r.hostname}^$third-party`);
                 });
                 // 跳转拦截规则 → ||hostname^$third-party
-                (geRules.nav || []).filter(r => r.confidence >= 0.5 && r.hostname).forEach(r => {
+                (geRules.nav || []).filter(r => r.confidence >= 0.5 && isValidHost(r.hostname)).forEach(r => {
                     geLines.push(`||${r.hostname}^$third-party`);
                 });
-                // URL 正则规则 → AdGuard URL 过滤
+                // URL 正则规则 → AdGuard 正则基本规则（必须用 /.../ 定界符）
                 (geRules.url || []).filter(r => r.confidence >= 0.5 && r.pattern).forEach(r => {
-                    try { new RegExp(r.pattern); geLines.push(r.pattern); } catch(e){}
+                    try { new RegExp(r.pattern); geLines.push(`/${escapeAdGuardRegex(r.pattern)}/`); } catch(e){}
                 });
-                // CSS 选择器规则 → 全站元素隐藏
+                // CSS 选择器规则 → 全站元素隐藏（## 为标准元素隐藏标记）
                 (geRules.css || []).filter(r => r.confidence >= 0.5 && r.selector).forEach(r => {
                     geLines.push(`##${r.selector}`);
                 });
                 // 属性规则 → 全站属性选择器隐藏
-                (geRules.attr || []).filter(r => r.confidence >= 0.5 && r.value).forEach(r => {
-                    const tag = r.tag && r.tag !== '*' ? r.tag : '';
+                (geRules.attr || []).filter(r => r.confidence >= 0.5 && r.value && /^[a-zA-Z-]+$/.test(r.attr || '')).forEach(r => {
+                    const tag = r.tag && r.tag !== '*' && /^[a-zA-Z]+$/.test(r.tag) ? r.tag : '';
                     geLines.push(`##${tag}[${r.attr}*="${escapeCssValue(r.value)}"]`);
                 });
-                // 路径规则 → URL 路径匹配
+                // 路径规则 → AdGuard 基本规则（URL 子串匹配，无需 * 通配符）
                 (geRules.path || []).filter(r => r.confidence >= 0.5 && r.pattern).forEach(r => {
-                    geLines.push(`*${r.pattern}*`);
+                    geLines.push(r.pattern);
                 });
                 if (geLines.length > 0) {
                     lines.push('! GeneralizationEngine 自学习规则（置信度 ≥ 0.5）');
@@ -6012,11 +6083,18 @@
             this.clearPanel();
             const panel = document.createElement('div');
             panel.className = 'panel';
-            const rulesText = this.generateAdGuardRules();
+
+            // 默认包含 GE 规则；用户可通过复选框切换，切换后实时重新生成
+            let includeGE = true;
+            let rulesText = this.generateAdGuardRules({ includeGE });
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
-                <p class="hint-text">已将当前所有拦截规则与泛化引擎自学习规则（置信度 ≥ 0.5）转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
+                <p class="hint-text">已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
+                <label style="display:flex; align-items:center; gap:6px; margin:8px 0; font-size:12px; color:#ddd; cursor:pointer;">
+                    <input type="checkbox" id="ag-include-ge" checked style="cursor:pointer;" />
+                    <span>包含泛化引擎自学习规则（置信度 ≥ 0.5 的 domain/url/css/attr/nav/path）</span>
+                </label>
                 <textarea class="export-box" id="ag-export-box" readonly></textarea>
                 <div class="btn-group">
                     <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
@@ -6029,15 +6107,21 @@
             this.shadowRoot.appendChild(panel);
 
             const box = panel.querySelector('#ag-export-box');
+            const geCheckbox = panel.querySelector('#ag-include-ge');
             box.value = rulesText;
+
+            // 切换 GE 规则开关：实时重新生成并刷新文本框
+            geCheckbox.addEventListener('change', (e) => {
+                includeGE = e.target.checked;
+                rulesText = this.generateAdGuardRules({ includeGE });
+                box.value = rulesText;
+            });
 
             panel.querySelector('#btn-ag-copy').addEventListener('click', async () => {
                 try {
                     await navigator.clipboard.writeText(rulesText);
                     alert('AdGuard 规则已复制到剪贴板！');
                 } catch (e) {
-                    // textarea.select() + execCommand 在 Shadow DOM 中可靠（浏览器原生处理选区），
-                    // 优于 createRange+selectNode 对 Shadow DOM 节点的程序化选区（跨浏览器不一致）
                     box.select();
                     try { document.execCommand('copy'); alert('AdGuard 规则已复制到剪贴板！'); }
                     catch (e2) { alert('复制失败，请手动选中文本复制。'); }
