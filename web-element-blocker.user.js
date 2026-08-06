@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.21
+// @version      0.2.22
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。新增三算法协同系统：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）、智能自学习泛化引擎（置信度追踪+自动衰减）。
 // @author       EFate
 // @match        *://*/*
@@ -4175,7 +4175,15 @@
                     box-sizing: border-box;
                 }
                 @media (max-width: 600px) {
-                    .panel { background: rgba(25, 25, 30, 0.52); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); max-width: calc(100vw - 48px); max-height: 70vh; padding: 16px; }
+                    .panel { background: rgba(25, 25, 30, 0.52); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); max-width: calc(100vw - 64px); max-height: 70vh; padding: 16px; }
+                }
+                @media (max-width: 480px) {
+                    .panel { padding: 16px; border-radius: 14px; max-height: 72vh; width: calc(100vw - 56px); max-width: calc(100vw - 56px); }
+                    .panel h3 { font-size: 15px; }
+                    .panel p, .panel .hint-text { font-size: 12px; }
+                    .btn-group button { padding: 8px 10px; font-size: 12px; }
+                    .gd-domain-row { padding: 8px; }
+                    .gd-domain-row .gd-host { font-size: 11px; }
                 }
                 h3 {
                     margin-top: 0; font-size: 17px; font-weight: 600; color: #fff; margin-bottom: 14px;
@@ -4374,7 +4382,8 @@
             const onMouseMove = (e) => {
                 if (!isDragging) return;
                 const rect = panel.getBoundingClientRect();
-                const padding = 24;
+                // 拖拽边距保护与 CSS 响应式边距保持一致（Bug2）
+                const padding = window.innerWidth <= 480 ? 28 : (window.innerWidth <= 600 ? 32 : 24);
                 let nextLeft = initialLeft + (e.clientX - startX);
                 let nextTop = initialTop + (e.clientY - startY);
                 nextLeft = clamp(nextLeft, padding, window.innerWidth - rect.width - padding);
@@ -5110,6 +5119,13 @@
                 const input = panel.querySelector('#gd-manual-input');
                 const host = input.value.trim().toLowerCase();
                 if (!host) return;
+                // 拒绝添加已封杀域名：避免UI误导用户以为该域名未封杀（Bug1）
+                const currentBlocked = new Set(storage.getDomainBlocks().map(r => r.domain));
+                if (currentBlocked.has(host)) {
+                    alert(`域名 ${host} 已在黑名单中，无需重复添加。`);
+                    input.value = '';
+                    return;
+                }
                 if (!allDomains.find(d => d.host === host)) {
                     allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1, viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 });
                 }
@@ -5391,20 +5407,28 @@
                 this._previewAffectedElements = [];
 
                 if (mode === 'path') {
-                    // 路径模式预览：隐藏全页 src/href/data-*/srcset 含该路径片段的资源容器（解决问题6）
+                    // 路径模式预览：与正式 pathPattern 拦截同口径
+                    // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
                     const text = panel.querySelector('#path-input').value.trim();
                     if (!text) { alert('校验失败：请输入路径片段。'); return; }
                     const esc = escapeCSSAttr(text);
                     const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [data-href*="${esc}"], [data-url*="${esc}"], [data-link*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`;
                     let hit = 0;
+                    const hideNode = (node) => {
+                        if (!node || node === document.body || node === document.documentElement) return false;
+                        if (node.style.display === 'none') return false;
+                        node.style.setProperty('display', 'none', 'important');
+                        node.style.setProperty('opacity', '0', 'important');
+                        this._previewAffectedElements.push({ el: node });
+                        return true;
+                    };
                     document.querySelectorAll(sel).forEach(el => {
-                        const t = BlockEngine.findSingleChildWrapper(el, 4);
-                        if (t && t.style.display !== 'none') {
-                            this._previewAffectedElements.push({ el: t });
-                            t.style.setProperty('display', 'none', 'important');
-                            t.style.setProperty('opacity', '0', 'important');
-                            hit++;
-                        }
+                        let counted = false;
+                        if (hideNode(el)) counted = true;
+                        if (el.parentElement && hideNode(el.parentElement)) counted = true;
+                        const wrapper = BlockEngine.findSingleChildWrapper(el, 4);
+                        if (hideNode(wrapper)) counted = true;
+                        if (counted) hit++;
                     });
                     if (hit === 0) { alert('当前页面未匹配到含该路径片段的资源，预览为空。'); return; }
                     isPreviewing = true;
@@ -6268,7 +6292,16 @@
                             if (blockedDomains.has(h)) return true;
                         } catch(e){}
                     }
+                    // 内联隐藏（脚本封杀后打的内联样式）
                     if (rec.el && rec.el.style && rec.el.style.getPropertyPriority('display') === 'important' && rec.el.style.display === 'none') return true;
+                    // CSS 规则隐藏：OAS 独有结果未经过 BlockEngine 的 getComputedStyle 过滤（Bug1）
+                    // 通过计算样式检查，避免已封杀的元素再次出现在扫描列表
+                    if (rec.el && document.contains(rec.el)) {
+                        try {
+                            const cs = window.getComputedStyle(rec.el);
+                            if (cs.display === 'none' || cs.visibility === 'hidden') return true;
+                        } catch(e){}
+                    }
                     return false;
                 };
 
@@ -6474,15 +6507,20 @@
                     }
                 });
                 // ③ 勾选域名时，同步预览全页该域名资源的隐藏效果（与正式拦截同口径）
+                // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
                 this._overlayPreview.hiddenDomains.forEach(d => {
                     const esc = escapeCSSAttr(d);
                     document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
-                        const t = BlockEngine.findSingleChildWrapper(target, 4);
-                        if (t && t.style.display !== 'none') {
-                            t.style.setProperty('display', 'none', 'important');
-                            t.style.setProperty('opacity', '0', 'important');
-                            this._overlayPreview.elements.push(t);
-                        }
+                        const hideNode = (node) => {
+                            if (!node || node === document.body || node === document.documentElement) return;
+                            if (node.style.display === 'none') return;
+                            node.style.setProperty('display', 'none', 'important');
+                            node.style.setProperty('opacity', '0', 'important');
+                            this._overlayPreview.elements.push(node);
+                        };
+                        hideNode(target);
+                        if (target.parentElement) hideNode(target.parentElement);
+                        hideNode(BlockEngine.findSingleChildWrapper(target, 4));
                     });
                 });
             };
