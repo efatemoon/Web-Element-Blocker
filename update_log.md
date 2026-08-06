@@ -1,5 +1,42 @@
 # 更新日志
 
+## v0.2.14 — 2026-08-06
+
+### 交互体验全面修复：预览一致性 + 域名可选 + 规则管理不退出 + 最近规则置顶
+
+针对用户反馈的 7 项交互问题逐项修复，核心是让「预览所见 = 实际生效」、「删除规则不再被迫重开面板」、「最近过滤的规则一眼可见」。
+
+#### Bug 修复
+
+1. **手动选区域名不可选（问题1）**：[showActionPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L2767) 检测出的第三方域名原版只能全量封杀，误杀正常域名。改为域名 pill 可点击切换选中/取消（默认全选，灰色+删除线表示已取消），「彻底封杀」仅封杀选中项。
+
+2. **预览与实际不一致（问题2&6）**：[手动选区预览](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L2972) 原本只隐藏当前选定元素，与「彻底封杀域名」后全页该域资源被隐藏的实际效果不符，导致用户刷新后发现正常元素也被过滤。预览改为隐藏「选中域名命中的全页元素 + 当前广告容器」，与正式封杀完全同口径；封杀前先 `resetActionPreview` 还原预览态避免叠加。
+
+3. **规则管理删除导致退出（问题3）**：[showManager 删除按钮](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3681) 原对 regex/complex/pathPattern/domainBlock 调用 `window.location.reload()`，面板被关闭需重开脚本继续删除。改为统一 `this.showManager()` 原地重渲染 + 保留滚动位置，并补齐 `applyRegexRules/applyComplexRules/scanAndBlockDynamic` 重应用，使剩余规则即刻生效（与「按网站查看所有规则」面板行为一致）。
+
+4. **规则列表最近置顶（问题4&7）**：[addRule](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L126) 为规则对象追加 `_ts` 时间戳；[showManager](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3563) 各类型按 `_ts` 倒序、域名黑名单置顶展示；[getAllSiteRules](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L230) 跨站记录按 `_ts` 倒序。旧规则无 `_ts` 视为 0，稳定排序保持原顺序。
+
+5. **覆盖层扫描无预览/域名强制封杀（问题5&6）**：[showOverlayScanPanel](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L4000) 原本无预览且拦截时强制把跳转域名加入黑名单。新增「🔍 预览效果」按钮（预览隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏，与正式拦截一致）与「同时封杀跳转域名」复选框（默认勾选，可取消仅隐藏元素不入黑名单）。新增 `this._overlayPreview` 实例状态，`clearPanel` 跨面板切换兜底还原 visibility/pointer-events/display/opacity。
+
+6. **路径模式无法预览（问题6）**：[正则面板 path 模式](file:///d:/github%20repositories/ad-block/web-element-blocker.user.js#L3343) 原提示「路径模式无法预览」。改为隐藏全页 src/href/data-*/srcset 含该路径片段的资源容器，命中 0 项时提示空预览。
+
+#### 其他
+
+- 新增 CSS：`.domain-item.unselected`（灰色删除线）、`.rule-list .rule-section-title`（域名置顶小标题）。
+- `_resetActionPreview` / `clearPanel` 适配多元素预览（`elements` 数组），保留旧单元素字段向后兼容。
+- 构造函数初始化 `_overlayPreview` / `_actionHosts` / `_actionHostsEl` 实例属性。
+
+### 验证
+
+- `node --check` 语法检查通过（user.js + meta.js）
+- 手动选区：域名 pill 点击切换 → 按钮文案「封杀 N/总数」联动 → 预览仅隐藏选中域资源 ✓
+- 规则管理：删除任意类型规则 → 面板原地重渲染、滚动位置保留、可连续删除 ✓
+- 覆盖层扫描：预览隐藏选中项 + 勾选域名时全页同域资源同步隐藏；取消勾选仅隐藏元素不入黑名单 ✓
+- 路径模式预览：输入路径片段 → 命中资源容器隐藏，恢复显示还原 ✓
+- 版本同步：user.js + meta.js 均 0.2.13 → 0.2.14
+
+---
+
 ## v0.2.13 — 2026-08-05
 
 ### 核心过滤功能深度审计 + 5 处 Bug 修复

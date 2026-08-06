@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.13
+// @version      0.2.14
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -147,6 +147,8 @@
                 (type === 'pathPattern' && item.pattern === rule.pattern)
             );
             if (!isDuplicate) {
+                // 记录添加时间戳，供"规则与防御管理 / 按网站查看所有规则"面板按最近过滤时间倒序展示
+                rule._ts = Date.now();
                 data.push(rule);
                 this.saveData(type, data);
             }
@@ -225,6 +227,8 @@
                     });
                 }
             });
+            // 按 _ts 倒序：最近添加的规则置顶（解决问题7）。旧规则无 _ts 视为 0，稳定排序保持原顺序。
+            records.sort((a, b) => (b.rule._ts || 0) - (a.rule._ts || 0));
             return records;
         }
 
@@ -2291,9 +2295,14 @@
             this.originalSelectedEl = null;
             this.selectionStack = [];
             this._previewAffectedElements = [];
-            this._actionPreview = { active: false, el: null };
+            this._actionPreview = { active: false, el: null, elements: [] };
             // 全局域名面板预览状态：必须为实例属性，clearPanel 才能跨面板切换时清理，避免预览隐藏的元素永久残留
             this._globalPreview = { active: false, elements: [] };
+            // 覆盖层扫描面板预览状态：同为实例属性，clearPanel 跨面板切换时还原 visibility/display
+            this._overlayPreview = { active: false, elements: [] };
+            // 手动选区面板域名选择状态：默认全选检测到的域名，用户可逐个取消
+            this._actionHosts = null;
+            this._actionHostsEl = null;
             this._contextmenuHandler = null;
             this._handleMouseOver = this._handleMouseOver.bind(this);
             this._handleClick = this._handleClick.bind(this);
@@ -2400,6 +2409,10 @@
                     word-break: break-all; font-weight: 500; cursor: pointer; transition: filter 0.15s;
                 }
                 .selection-info .domain-item:hover { filter: brightness(1.15); }
+                /* 未选中的域名：灰色，提示用户该项不会被封杀 */
+                .selection-info .domain-item.unselected { background: rgba(120,120,120,0.55); color: #ccc; text-decoration: line-through; }
+                /* 规则与防御管理：域名规则置顶的小标题 */
+                .rule-list .rule-section-title { list-style: none; font-size: 11px; color: #ff8a80; font-weight: 700; margin: 6px 0 2px; padding: 2px 4px; border-bottom: 1px dashed rgba(255,138,128,0.4); }
                 .domain-scroll { display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto; padding-right: 4px; }
                 .domain-scroll .domain-item { display: flex; justify-content: space-between; align-items: center; width: 100%; box-sizing: border-box; margin: 0; padding: 6px 10px; border-radius: 8px; font-size: 12px; }
                 .domain-scroll::-webkit-scrollbar { width: 4px; }
@@ -2669,11 +2682,21 @@
 
         _resetActionPreview(panel) {
             if (!this._actionPreview.active) return;
+            // 新版预览隐藏「所选域名命中的全部元素 + 当前广告容器」，需逐个还原
+            if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length > 0) {
+                this._actionPreview.elements.forEach(el => {
+                    if (el) {
+                        el.style.removeProperty('display');
+                        el.style.removeProperty('opacity');
+                    }
+                });
+            }
+            // 兼容旧版单元素字段
             const el = this._actionPreview.el;
             if (el) {
                 el.style.removeProperty('display');
             }
-            this._actionPreview = { active: false, el: null };
+            this._actionPreview = { active: false, el: null, elements: [] };
             // 恢复显示后必须重新挂上红框：预览时元素 display:none 不可见无需移除类，
             // 恢复后若不还原 pro-blocker-selected，用户将看不到当前选定元素（红框消失 bug 根因）
             if (this.currentSelectedEl && this._isElementInDOM(this.currentSelectedEl)) {
@@ -2708,10 +2731,22 @@
             }
 
             const domainBox = panel.querySelector('#info-domains');
+            // 域名选择状态：元素切换时重置为「全选」（默认推荐封杀全部检测到的域名，用户可逐个取消）
+            if (!this._actionHosts || this._actionHostsEl !== el) {
+                this._actionHosts = new Set(resourceResult.domains);
+                this._actionHostsEl = el;
+            } else {
+                const current = new Set(resourceResult.domains);
+                Array.from(this._actionHosts).forEach(h => { if (!current.has(h)) this._actionHosts.delete(h); });
+                current.forEach(h => { if (!this._actionHosts.has(h)) this._actionHosts.add(h); });
+            }
             if (domainBox) {
                 if (resourceResult.domains.length > 0) {
-                    domainBox.innerHTML = '<span class="info-label">🔍 发现第三方资源域：</span>' +
-                        resourceResult.domains.map(d => `<span class="domain-item">${escapeHTML(d)}</span>`).join('');
+                    domainBox.innerHTML = '<span class="info-label">🔍 发现第三方资源域（点击可取消选择，仅封杀选中项）：</span>' +
+                        resourceResult.domains.map(d => {
+                            const checked = this._actionHosts.has(d);
+                            return `<span class="domain-item${checked ? '' : ' unselected'}" data-host="${escapeHTML(d)}">${checked ? '✓ ' : ''}${escapeHTML(d)}</span>`;
+                        }).join('');
                 } else {
                     domainBox.innerHTML = '<span class="info-label" style="color:#bbb;">🔍 当前框选范围内未发现第三方资源域</span>';
                 }
@@ -2728,9 +2763,11 @@
 
             const btnDomain = panel.querySelector('#btn-domain');
             if (btnDomain) {
-                if (resourceResult.domains.length > 0) {
-                    btnDomain.disabled = false;
-                    btnDomain.textContent = `🔥 彻底封杀 ${resourceResult.domains.length} 个广告域名（推荐）`;
+                const total = resourceResult.domains.length;
+                const sel = this._actionHosts.size;
+                if (total > 0) {
+                    btnDomain.disabled = sel === 0;
+                    btnDomain.textContent = `🔥 彻底封杀 ${sel}/${total} 个广告域名（推荐）`;
                 } else {
                     btnDomain.disabled = true;
                     btnDomain.textContent = '🔥 当前框选未发现第三方域名';
@@ -2744,7 +2781,10 @@
             this.originalSelectedEl = element;
             this.currentSelectedEl = element;
             this.selectionStack = [];
-            this._actionPreview = { active: false, el: null };
+            this._actionPreview = { active: false, el: null, elements: [] };
+            // 域名选择状态：默认全选检测到的域名，用户可在面板内逐个取消（解决问题1：原版只能全量封杀）
+            this._actionHosts = null;
+            this._actionHostsEl = null;
 
             const panel = document.createElement('div');
             panel.className = 'panel';
@@ -2862,7 +2902,20 @@
                 this.clearPanel();
             });
 
-            // 彻底封杀域名（核心：解决刷新复活）
+            // 域名选择切换：点击域名 pill 可取消/恢复选中，仅封杀选中项（解决问题1）
+            panel.querySelector('#info-domains').addEventListener('click', (e) => {
+                const item = e.target.closest('.domain-item');
+                if (!item || !this._actionHosts) return;
+                const host = item.dataset.host;
+                if (!host) return;
+                if (this._actionHosts.has(host)) this._actionHosts.delete(host);
+                else this._actionHosts.add(host);
+                // 域名选择变化后，重置旧预览并重渲染选择态
+                this._resetActionPreview(panel);
+                this._refreshSelectionInfo(panel);
+            });
+
+            // 彻底封杀域名（核心：解决刷新复活）— 仅封杀用户选中的域名，与预览保持一致（解决问题2）
             panel.querySelector('#btn-domain').addEventListener('click', () => {
                 if (!this._isElementInDOM(this.currentSelectedEl)) {
                     alert('目标元素已从页面移除，请重新选择。');
@@ -2874,10 +2927,17 @@
                     alert('当前框选范围内未发现第三方资源域，无法执行域名封杀。');
                     return;
                 }
-                const confirmMsg = `将封杀以下 ${result.domains.length} 个域名（全局生效，所有页面都将拦截）：\n\n${result.domains.join('\n')}\n\n同时会隐藏当前框选的整个广告容器。确认继续？`;
+                const list = Array.from(this._actionHosts || []);
+                if (list.length === 0) {
+                    alert('已取消全部域名选择，请至少保留一个域名再封杀。');
+                    return;
+                }
+                const confirmMsg = `将封杀以下 ${list.length} 个域名（全局生效，所有页面都将拦截）：\n\n${list.join('\n')}\n\n同时会隐藏当前框选的整个广告容器。确认继续？`;
                 if (!confirm(confirmMsg)) return;
+                // 封杀前先还原预览隐藏的元素，避免预览状态残留与正式封杀叠加
+                this._resetActionPreview(panel);
 
-                result.domains.forEach(d => {
+                list.forEach(d => {
                     storage.addRule('domainBlock', { domain: d, type: 'domainBlock' });
                 });
 
@@ -2902,8 +2962,8 @@
                 container.style.setProperty('display', 'none', 'important');
                 container.style.setProperty('opacity', '0', 'important');
 
-                // 扫描全页删除该域所有资源（含 srcset）
-                result.domains.forEach(d => {
+                // 扫描全页删除选中域名的所有资源（含 srcset）
+                list.forEach(d => {
                     const esc = escapeCSSAttr(d);
                     document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
                         const t = BlockEngine.findSingleChildWrapper(el, 4);
@@ -2914,10 +2974,10 @@
 
                 const pathNote = pathCandidates.size > 0 ? '，并记录 ' + pathCandidates.size + ' 条路径模式' : '';
                 this.clearPanel();
-                alert(`已封杀 ${result.domains.length} 个域名${pathNote}。\n后续刷新与所有页面都将自动拦截。`);
+                alert(`已封杀 ${list.length} 个域名${pathNote}。\n后续刷新与所有页面都将自动拦截。`);
             });
 
-            // 预览效果
+            // 预览效果：预览「选中域名命中的全页元素 + 当前广告容器」，与点击「彻底封杀」后的实际效果一致（解决问题2&6）
             panel.querySelector('#btn-preview').addEventListener('click', (e) => {
                 if (this._actionPreview.active) {
                     this._resetActionPreview(panel);
@@ -2929,10 +2989,29 @@
                     this.clearPanel();
                     return;
                 }
-                this._actionPreview = { active: true, el };
-                // 预览隐藏元素：display:none 已使红框不可见，无需移除 pro-blocker-selected 类
-                // （移除后恢复时若忘记还原会导致红框永久消失，故保留类，由 _resetActionPreview 兜底还原）
-                el.style.setProperty('display', 'none', 'important');
+                this._actionPreview = { active: true, el: null, elements: [] };
+                // 命中选中域名的全页元素 → 隐藏其单子链容器（与正式封杀同口径）
+                const hosts = Array.from(this._actionHosts || []);
+                if (hosts.length > 0) {
+                    hosts.forEach(d => {
+                        const esc = escapeCSSAttr(d);
+                        document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
+                            const t = BlockEngine.findSingleChildWrapper(target, 4);
+                            if (t && t.style.display !== 'none') {
+                                t.style.setProperty('display', 'none', 'important');
+                                t.style.setProperty('opacity', '0', 'important');
+                                this._actionPreview.elements.push(t);
+                            }
+                        });
+                    });
+                }
+                // 同时隐藏当前框选的广告容器（正式封杀也会隐藏容器），与实际效果对齐
+                const container = BlockEngine.findSingleChildWrapper(el, 4);
+                if (container && container.style.display !== 'none') {
+                    container.style.setProperty('display', 'none', 'important');
+                    container.style.setProperty('opacity', '0', 'important');
+                    this._actionPreview.elements.push(container);
+                }
                 e.target.textContent = '👁 恢复显示';
             });
 
@@ -3262,7 +3341,24 @@
                 this._previewAffectedElements = [];
 
                 if (mode === 'path') {
-                    alert('路径模式无法预览（影响全局资源），请直接保存查看效果。');
+                    // 路径模式预览：隐藏全页 src/href/data-*/srcset 含该路径片段的资源容器（解决问题6）
+                    const text = panel.querySelector('#path-input').value.trim();
+                    if (!text) { alert('校验失败：请输入路径片段。'); return; }
+                    const esc = escapeCSSAttr(text);
+                    const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [data-href*="${esc}"], [data-url*="${esc}"], [data-link*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`;
+                    let hit = 0;
+                    document.querySelectorAll(sel).forEach(el => {
+                        const t = BlockEngine.findSingleChildWrapper(el, 4);
+                        if (t && t.style.display !== 'none') {
+                            this._previewAffectedElements.push({ el: t });
+                            t.style.setProperty('display', 'none', 'important');
+                            t.style.setProperty('opacity', '0', 'important');
+                            hit++;
+                        }
+                    });
+                    if (hit === 0) { alert('当前页面未匹配到含该路径片段的资源，预览为空。'); return; }
+                    isPreviewing = true;
+                    e.target.textContent = '👁 恢复显示';
                     return;
                 }
 
@@ -3492,25 +3588,39 @@
                 </li>
             `;
 
-            data.static.forEach((r, i) => rulesHTML += renderItem('静态', escapeHTML(r.selector), i));
-            data.dynamic.forEach((r, i) => rulesHTML += renderItem('动态', `类名: ${escapeHTML(r.className)}`, i));
-            data.regex.forEach((r, i) => rulesHTML += renderItem('正则', `匹配: ${escapeHTML(r.regex)} (层级: ${r.level})`, i));
-            data.attribute.forEach((r, i) => rulesHTML += renderItem('属性', `选择器: ${escapeHTML(r.attrSelector)}`, i, 'attr'));
-            data.structural.forEach((r, i) => rulesHTML += renderItem('位置', escapeHTML(r.structSelector), i, 'struct'));
-            data.pathPattern.forEach((r, i) => rulesHTML += renderItem('路径', `模式: ${escapeHTML(r.pattern)}`, i, 'path'));
+            // 按 _ts 倒序展示：最近添加的规则置顶；data-index 仍为原数组下标，确保删除定位正确（解决问题4）
+            const byTsDesc = (a, b) => (b.r._ts || 0) - (a.r._ts || 0);
+            const eachSorted = (arr, fn) => arr.map((r, i) => ({ r, i })).sort(byTsDesc).forEach(fn);
 
-            data.complex.forEach((r, i) => {
-                const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
-                const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
-                const condText = r.conditions.map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic)}</span> `);
-                rulesHTML += renderItem('积木', `${condText} (层级: ${r.level})`, i, 'complex');
-            });
+            const totalRules = data.static.length + data.dynamic.length + data.regex.length +
+                data.attribute.length + data.structural.length + data.pathPattern.length +
+                data.complex.length + data.domainBlock.length;
 
-            data.domainBlock.forEach((d, i) => rulesHTML += renderItem('域名', escapeHTML(d), i, 'domain'));
-
-            if (rulesHTML === '<ul class="rule-list">') {
+            if (totalRules === 0) {
                 rulesHTML = '<p class="empty-tip">当前暂无屏蔽规则</p>';
-            } else { rulesHTML += '</ul>'; }
+            } else {
+                // 域名黑名单置顶（用户最常过滤的类型），按添加顺序倒序（数组末尾=最近添加）
+                if (data.domainBlock.length > 0) {
+                    rulesHTML += '<li class="rule-section-title">🔥 最近过滤的域名规则（全局生效）</li>';
+                    data.domainBlock.map((d, i) => ({ d, i })).reverse().forEach(({ d, i }) =>
+                        rulesHTML += renderItem('域名', escapeHTML(d), i, 'domain')
+                    );
+                }
+
+                eachSorted(data.static, ({ r, i }) => rulesHTML += renderItem('静态', escapeHTML(r.selector), i));
+                eachSorted(data.dynamic, ({ r, i }) => rulesHTML += renderItem('动态', `类名: ${escapeHTML(r.className)}`, i));
+                eachSorted(data.regex, ({ r, i }) => rulesHTML += renderItem('正则', `匹配: ${escapeHTML(r.regex)} (层级: ${r.level})`, i));
+                eachSorted(data.attribute, ({ r, i }) => rulesHTML += renderItem('属性', `选择器: ${escapeHTML(r.attrSelector)}`, i, 'attr'));
+                eachSorted(data.structural, ({ r, i }) => rulesHTML += renderItem('位置', escapeHTML(r.structSelector), i, 'struct'));
+                eachSorted(data.pathPattern, ({ r, i }) => rulesHTML += renderItem('路径', `模式: ${escapeHTML(r.pattern)}`, i, 'path'));
+                eachSorted(data.complex, ({ r, i }) => {
+                    const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
+                    const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
+                    const condText = r.conditions.map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic)}</span> `);
+                    rulesHTML += renderItem('积木', `${condText} (层级: ${r.level})`, i, 'complex');
+                });
+                rulesHTML += '</ul>';
+            }
 
             // 防御策略状态：区分"手动开启"与"闪现自动启用"，并展示自愈进度
             const isManualPreemptive = data.config.mode === 'preemptive';
@@ -3601,16 +3711,21 @@
                     const typeMap = { '静态': 'static', '动态': 'dynamic', '正则': 'regex', '属性': 'attribute', '位置': 'structural', '积木': 'complex', '路径': 'pathPattern', '域名': 'domainBlock' };
                     const type = typeMap[e.target.getAttribute('data-type')];
                     const index = parseInt(e.target.getAttribute('data-index'), 10);
+                    // 删除前保留滚动位置，删除后原地重渲染列表，避免每次删除都被迫重开面板（解决问题3）
+                    const scrollBox = panel.querySelector('.rule-list')?.parentElement;
+                    const savedScroll = scrollBox ? scrollBox.scrollTop : 0;
                     storage.removeRule(type, index);
-                    // regex/complex 经 applyRegexRules/applyComplexRules 设 inline display:none；
-                    // pathPattern/domainBlock 经 scanAndBlockDynamic 对动态加载资源也设 inline display:none。
-                    // 删除规则只重建样式表（移除 CSS 层），inline 样式残留 → 需刷新才能恢复显示。
-                    // static/dynamic/attribute/structural 仅靠 CSS 样式表隐藏，删除即可恢复，无需刷新。
-                    if (type === 'regex' || type === 'complex' || type === 'pathPattern' || type === 'domainBlock') {
-                        window.location.reload();
-                    } else {
-                        this.showManager();
-                    }
+                    // removeRule 不会自动重应用 regex/complex/pathPattern 的 inline 隐藏；
+                    // 此处补齐重应用，使剩余规则即刻生效（被删规则残留的 inline 样式需手动刷新恢复，与"按网站查看所有规则"面板一致）
+                    if (type === 'regex') BlockEngine.applyRegexRules();
+                    if (type === 'complex') BlockEngine.applyComplexRules();
+                    if (type === 'pathPattern') BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                    this.showManager();
+                    // 恢复滚动位置，连续删除无需重新向下翻找
+                    requestAnimationFrame(() => {
+                        const newBox = this.shadowRoot.querySelector('.panel .rule-list')?.parentElement;
+                        if (newBox) newBox.scrollTop = savedScroll;
+                    });
                 });
             });
 
@@ -3970,11 +4085,16 @@
                 <div class="selection-info" style="max-height: 280px; overflow-y: auto;">
                     <div class="info-row" id="overlay-list"></div>
                 </div>
+                <label style="display:flex; align-items:center; gap:6px; margin:8px 0; font-size:12px; color:#ddd; cursor:pointer;">
+                    <input type="checkbox" id="ov-block-domain" checked style="cursor:pointer;" />
+                    <span>同时封杀跳转域名（加入全局黑名单，并预览/拦截全页该域资源）</span>
+                </label>
                 <div class="btn-group">
                     <button class="btn-danger" id="btn-block-overlay" style="flex:100%; font-weight:bold;">🛡️ 拦截选中的覆盖层</button>
                 </div>
                 <div class="section-divider"></div>
                 <div class="btn-group">
+                    <button class="btn-warning" id="btn-preview-overlay">🔍 预览效果</button>
                     <button class="btn-warning" id="btn-rescan">🔄 重新扫描</button>
                     <button class="btn-outline" id="btn-close-overlay">关闭</button>
                 </div>
@@ -3984,17 +4104,84 @@
             this.shadowRoot.appendChild(panel);
             render();
 
+            // 预览状态：实例属性，clearPanel 切换/关闭面板时兜底还原，避免预览隐藏的元素永久残留
+            this._overlayPreview = { active: false, elements: [] };
+            const resetOverlayPreview = (btn) => {
+                if (!this._overlayPreview.active) return;
+                this._overlayPreview.elements.forEach(el => {
+                    if (el) {
+                        el.style.removeProperty('display');
+                        el.style.removeProperty('opacity');
+                        el.style.removeProperty('visibility');
+                        el.style.removeProperty('pointer-events');
+                    }
+                });
+                this._overlayPreview = { active: false, elements: [] };
+                if (btn) btn.textContent = '🔍 预览效果';
+            };
+            const previewBtn = panel.querySelector('#btn-preview-overlay');
+
             panel.querySelector('#overlay-list').addEventListener('click', (e) => {
                 const row = e.target.closest('.gd-domain-row');
                 if (!row) return;
                 const idx = parseInt(row.dataset.idx, 10);
                 if (selectedSet.has(idx)) selectedSet.delete(idx);
                 else selectedSet.add(idx);
+                // 选择变化后重置旧预览，避免预览态与新选择不一致
+                resetOverlayPreview(previewBtn);
                 render();
+            });
+
+            // 预览效果：预览「隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏」，与正式拦截效果一致（解决问题5&6）
+            previewBtn.addEventListener('click', (e) => {
+                if (this._overlayPreview.active) {
+                    resetOverlayPreview(e.target);
+                    return;
+                }
+                if (selectedSet.size === 0) {
+                    alert('请先选择需要预览的覆盖层。');
+                    return;
+                }
+                const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
+                this._overlayPreview = { active: true, elements: [] };
+                const hiddenDomains = new Set();
+                Array.from(selectedSet).forEach(idx => {
+                    const r = records[idx];
+                    if (!r || !r.el || !document.contains(r.el)) return;
+                    if (r.el.style.display !== 'none') {
+                        r.el.style.setProperty('display', 'none', 'important');
+                        r.el.style.setProperty('pointer-events', 'none', 'important');
+                        r.el.style.setProperty('visibility', 'hidden', 'important');
+                        this._overlayPreview.elements.push(r.el);
+                    }
+                    if (blockDomainToo && r.triggerUrl) {
+                        try {
+                            const u = new URL(r.triggerUrl, location.href);
+                            if (u.hostname !== window.location.hostname) hiddenDomains.add(u.hostname);
+                        } catch (e) { }
+                    }
+                });
+                // 勾选「封杀域名」时，同步预览全页该域名资源的隐藏效果（与正式拦截同口径）
+                hiddenDomains.forEach(d => {
+                    const esc = escapeCSSAttr(d);
+                    document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
+                        const t = BlockEngine.findSingleChildWrapper(target, 4);
+                        if (t && t.style.display !== 'none') {
+                            t.style.setProperty('display', 'none', 'important');
+                            t.style.setProperty('opacity', '0', 'important');
+                            this._overlayPreview.elements.push(t);
+                        }
+                    });
+                });
+                e.target.textContent = '👁 恢复显示';
             });
 
             panel.querySelector('#btn-block-overlay').addEventListener('click', () => {
                 if (selectedSet.size === 0) return;
+                const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
+                // 正式拦截前先还原预览，避免预览态与正式拦截叠加造成状态混乱
+                resetOverlayPreview(previewBtn);
+                let domainCount = 0;
                 // 仅修改 record 属性不删除数组元素，无需降序遍历；直接 forEach
                 Array.from(selectedSet).forEach(idx => {
                     const r = records[idx];
@@ -4003,22 +4190,25 @@
                     r.el.style.setProperty('pointer-events', 'none', 'important');
                     r.el.style.setProperty('visibility', 'hidden', 'important');
                     r.blocked = true;
-                    // 若有跨域跳转 URL，同时加入域名黑名单，杜绝后续复活
-                    if (r.triggerUrl) {
+                    // 仅在勾选「封杀域名」时加入全局黑名单（解决问题5：可选域名封杀）
+                    if (blockDomainToo && r.triggerUrl) {
                         try {
                             const u = new URL(r.triggerUrl, location.href);
                             if (u.hostname !== window.location.hostname) {
                                 storage.addRule('domainBlock', { domain: u.hostname, type: 'domainBlock' });
+                                domainCount++;
                             }
                         } catch (e) { }
                     }
                 });
                 selectedSet.clear();
                 render();
-                alert('已拦截选中的覆盖层。跨域跳转域名已加入全局黑名单。');
+                const domainNote = blockDomainToo ? `，${domainCount} 个跨域跳转域名已加入全局黑名单` : '（未封杀域名）';
+                alert(`已拦截选中的覆盖层${domainNote}。`);
             });
 
             panel.querySelector('#btn-rescan').addEventListener('click', () => {
+                resetOverlayPreview(previewBtn);
                 records = BlockEngine.scanInvisibleOverlays({ autoBlock: false });
                 selectedSet = new Set(records.filter(r => r.highRisk).map((r, i) => i));
                 render();
@@ -4287,11 +4477,20 @@
 
         clearPanel() {
             if (this._actionPreview && this._actionPreview.active) {
+                // 还原域名预览隐藏的全部元素（新版预览可能隐藏多个容器）
+                if (Array.isArray(this._actionPreview.elements)) {
+                    this._actionPreview.elements.forEach(el => {
+                        if (el) {
+                            el.style.removeProperty('display');
+                            el.style.removeProperty('opacity');
+                        }
+                    });
+                }
                 const el = this._actionPreview.el;
                 if (el) {
                     el.style.removeProperty('display');
                 }
-                this._actionPreview = { active: false, el: null };
+                this._actionPreview = { active: false, el: null, elements: [] };
             }
             if (this._previewAffectedElements && this._previewAffectedElements.length > 0) {
                 this._previewAffectedElements.forEach(item => {
@@ -4311,6 +4510,18 @@
                     }
                 });
                 this._globalPreview = { active: false, elements: [] };
+            }
+            // 覆盖层扫描面板预览：还原 visibility/pointer-events/display/opacity，避免预览元素残留
+            if (this._overlayPreview && this._overlayPreview.active) {
+                this._overlayPreview.elements.forEach(el => {
+                    if (el) {
+                        el.style.removeProperty('display');
+                        el.style.removeProperty('opacity');
+                        el.style.removeProperty('visibility');
+                        el.style.removeProperty('pointer-events');
+                    }
+                });
+                this._overlayPreview = { active: false, elements: [] };
             }
             this._clearSelectionHighlight();
 
