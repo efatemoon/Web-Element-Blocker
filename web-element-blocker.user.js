@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.22
+// @version      0.2.23
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。新增三算法协同系统：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）、智能自学习泛化引擎（置信度追踪+自动衰减）。
 // @author       EFate
 // @match        *://*/*
@@ -6477,6 +6477,14 @@
             // 实时更新预览：根据当前 selectedSet 和域名勾选状态，增量隐藏/还原元素
             const updatePreview = () => {
                 if (!this._overlayPreview.active) return;
+                // 安全保护：绝不隐藏 panel 自身或其祖先（shadowHost），否则面板会消失
+                const isProtected = (node) => {
+                    if (!node) return true;
+                    if (node === document.body || node === document.documentElement) return true;
+                    if (node.id === 'pro-blocker-ui-host') return true;
+                    if (node.closest && node.closest('#pro-blocker-ui-host')) return true;
+                    return false;
+                };
                 // ① 先还原所有预览元素
                 this._overlayPreview.elements.forEach(el => {
                     if (el) {
@@ -6493,6 +6501,7 @@
                 Array.from(selectedSet).forEach(idx => {
                     const r = records[idx];
                     if (!r || !r.el || !document.contains(r.el)) return;
+                    if (isProtected(r.el)) return;
                     if (r.el.style.display !== 'none') {
                         r.el.style.setProperty('display', 'none', 'important');
                         r.el.style.setProperty('pointer-events', 'none', 'important');
@@ -6509,19 +6518,21 @@
                 // ③ 勾选域名时，同步预览全页该域名资源的隐藏效果（与正式拦截同口径）
                 // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
                 this._overlayPreview.hiddenDomains.forEach(d => {
-                    const esc = escapeCSSAttr(d);
-                    document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
-                        const hideNode = (node) => {
-                            if (!node || node === document.body || node === document.documentElement) return;
-                            if (node.style.display === 'none') return;
-                            node.style.setProperty('display', 'none', 'important');
-                            node.style.setProperty('opacity', '0', 'important');
-                            this._overlayPreview.elements.push(node);
-                        };
-                        hideNode(target);
-                        if (target.parentElement) hideNode(target.parentElement);
-                        hideNode(BlockEngine.findSingleChildWrapper(target, 4));
-                    });
+                    try {
+                        const esc = escapeCSSAttr(d);
+                        document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
+                            const hideNode = (node) => {
+                                if (isProtected(node)) return;
+                                if (node.style.display === 'none') return;
+                                node.style.setProperty('display', 'none', 'important');
+                                node.style.setProperty('opacity', '0', 'important');
+                                this._overlayPreview.elements.push(node);
+                            };
+                            hideNode(target);
+                            if (target.parentElement) hideNode(target.parentElement);
+                            hideNode(BlockEngine.findSingleChildWrapper(target, 4));
+                        });
+                    } catch(e) {} // querySelectorAll 可能因特殊字符抛出 SyntaxError
                 });
             };
 
@@ -6577,7 +6588,8 @@
 
             // 预览效果：预览「隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏」，与正式拦截效果一致
             // 激活后选择变化自动实时更新预览（Bug1&2），再次点击关闭预览
-            previewBtn.addEventListener('click', () => {
+            previewBtn.addEventListener('click', (e) => {
+                e.stopPropagation(); // 防止事件冒泡触发其他监听器
                 if (this._overlayPreview.active) {
                     resetOverlayPreview();
                     return;
@@ -6587,7 +6599,14 @@
                     return;
                 }
                 this._overlayPreview = { active: true, elements: [], hiddenDomains: new Set() };
-                updatePreview();
+                try {
+                    updatePreview();
+                } catch(err) {
+                    console.error('[Pro Blocker] 覆盖层预览失败:', err);
+                    this._overlayPreview.active = false;
+                    alert('预览失败：' + err.message);
+                    return;
+                }
                 previewBtn.textContent = '👁 恢复显示';
             });
 
@@ -6933,6 +6952,8 @@
                 });
                 this._overlayPreview = { active: false, elements: [] };
             }
+            // 切换/关闭面板时停止选择模式，避免 _handleClick 残留导致 panel 内点击被拦截
+            this.stopSelection();
             this._clearSelectionHighlight();
 
             const oldPanel = this.shadowRoot.querySelector('.panel');
