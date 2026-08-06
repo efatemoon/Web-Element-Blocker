@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.18
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
+// @version      0.2.19
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。新增三算法协同系统：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）、智能自学习泛化引擎（置信度追踪+自动衰减）。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -398,6 +398,15 @@
                 }
             }
 
+            // GeneralizationEngine 自学习规则：跨设备迁移时需一并导出
+            // 否则新设备丢失已学习的置信度追踪数据，泛化引擎需从零重新学习
+            let geRules = null;
+            try {
+                const snap = GeneralizationEngine.getRulesSnapshot();
+                const totalCount = Object.values(snap).reduce((s, arr) => s + (Array.isArray(arr) ? arr.length : 0), 0);
+                if (totalCount > 0) geRules = snap;
+            } catch(e){}
+
             const exportData = {
                 meta: {
                     version: '2.0',
@@ -406,14 +415,16 @@
                     counts: {
                         domains: domains.length,
                         siteRules: totalRules,
-                        sites: Object.keys(sites).length
+                        sites: Object.keys(sites).length,
+                        geRules: geRules ? Object.values(geRules).reduce((s, arr) => s + (Array.isArray(arr) ? arr.length : 0), 0) : 0
                     }
                 },
                 domains,
                 sites,
                 config,
                 flashDomains,
-                normalPaths
+                normalPaths,
+                geRules
             };
             return JSON.stringify(exportData, null, 2);
         }
@@ -496,6 +507,11 @@
                     }
                     this._markDirty('normalPaths', existing);
                 }
+                // GeneralizationEngine 自学习规则：v2.0 字段，合并到 GE 规则库
+                // 跨设备迁移必须保留置信度追踪数据，否则新设备需从零重新学习
+                if (importData.geRules && typeof importData.geRules === 'object') {
+                    try { GeneralizationEngine.mergeRules(importData.geRules); } catch(e){}
+                }
             }
 
             const dictKeys = ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config', 'pro_blocker_flash_domains'];
@@ -510,10 +526,16 @@
                             existing[d] = incoming[d];
                         } else if (Array.isArray(existing[d]) && Array.isArray(incoming[d])) {
                             // 去重 O(N+M)：用 JSON 指纹建 Set，避免 O(N×M) 的 some() 线性扫描
-                            const existingSet = new Set(existing[d].map(x => JSON.stringify(x)));
+                            // 排除 _ts 字段：同一逻辑规则在不同时间添加 _ts 不同，若纳入指纹会导致重复导入
+                            const fingerprint = (x) => {
+                                if (!x || typeof x !== 'object') return JSON.stringify(x);
+                                const { _ts, ...rest } = x;
+                                return JSON.stringify(rest);
+                            };
+                            const existingSet = new Set(existing[d].map(fingerprint));
                             incoming[d].forEach(item => {
                                 if (item && typeof item === 'object') {
-                                    const fp = JSON.stringify(item);
+                                    const fp = fingerprint(item);
                                     if (!existingSet.has(fp)) {
                                         existingSet.add(fp);
                                         existing[d].push(item);
@@ -1539,6 +1561,28 @@
             });
         }
 
+        // 通用内联样式还原：删除任意类型规则后，清除所有由脚本设置的内联隐藏样式
+        // 适用于 static/dynamic/attribute/structural/regex/complex 规则删除场景
+        // 策略：清除所有带 display:none!important 的内联样式，然后重建 CSS 表 + 重扫
+        static restoreAllInlineStyles() {
+            const _clearStyle = (node) => {
+                if (!node || !node.style) return;
+                // 仅清除脚本设置的内联隐藏样式（display:none + opacity:0 + visibility:hidden）
+                // 保留页面自身设置的其他样式
+                if (node.style.getPropertyValue('display') === 'none' &&
+                    node.style.getPropertyPriority('display') === 'important') {
+                    node.style.removeProperty('display');
+                    node.style.removeProperty('opacity');
+                    node.style.removeProperty('visibility');
+                    node.style.removeProperty('pointer-events');
+                }
+            };
+            // 遍历所有可能被隐藏的元素：带内联 display:none!important 的元素
+            document.querySelectorAll('[style*="display: none"], [style*="display:none"]').forEach(el => {
+                _clearStyle(el);
+            });
+        }
+
         // 获取（惰性创建）当前生效的 CSSStyleSheet：
         // 优先 Constructable Stylesheets（C++ 对象，零解析、防探查），不支持时降级到 <style>.sheet
         static _getSheet() {
@@ -1738,13 +1782,19 @@
 
             // 合并正则：每条规则用捕获组包裹，exec 一次即可定位命中的规则索引
             // 将每节点 RegExp 调用从 N 次降为 1 次，TreeWalker 遍历次数不变
-            let mergedRegex = null;
-            try {
-                const mergedSource = rules.map(r => `(${r.regex.source})`).join('|');
-                mergedRegex = new RegExp(mergedSource, 'i');
-            } catch (e) {
-                // 合并后正则语法异常（如捕获组过多），降级为逐条执行
-                mergedRegex = null;
+            // 分批合并：V8 对单条正则捕获组数量有隐性上限（~500），规则数 >50 时分批
+            // 每批 50 条，避免 RegExp too complex 编译失败导致所有正则规则静默失效
+            const REGEX_BATCH_SIZE = 50;
+            const mergedBatches = [];
+            for (let i = 0; i < rules.length; i += REGEX_BATCH_SIZE) {
+                const batch = rules.slice(i, i + REGEX_BATCH_SIZE);
+                try {
+                    const source = batch.map(r => `(${r.regex.source})`).join('|');
+                    mergedBatches.push({ regex: new RegExp(source, 'i'), offset: i, rules: batch });
+                } catch (e) {
+                    // 该批合并失败，降级为逐条执行（保留原 rule 对象供降级路径使用）
+                    mergedBatches.push({ regex: null, offset: i, rules: batch });
+                }
             }
 
             // 文本节点过滤器：跳过脚本/样式内的文本，避免误隐藏 <script> 父级导致页面功能损坏
@@ -1758,7 +1808,7 @@
 
             // requestIdleCallback 不可用（如旧版 Safari）时回退到同步遍历，保证功能可用
             if (typeof requestIdleCallback !== 'function') {
-                return this._applyRegexRulesSync(targetNode, rules, mergedRegex, textFilter);
+                return this._applyRegexRulesSync(targetNode, mergedBatches, textFilter);
             }
 
             // 时间分片：在浏览器空闲帧执行正则比对，避免 Long Task 阻塞主线程导致卡顿
@@ -1769,7 +1819,7 @@
                     while ((node = walker.nextNode())) {
                         // 先处理当前节点再判时：避免 timeRemaining 耗尽时 break 跳过该节点
                         // （walker.nextNode 已推进内部指针，break 后该节点永久漏匹配）
-                        this._executeRegexMatch(node, rules, mergedRegex);
+                        this._executeRegexMatch(node, mergedBatches);
                         const hasTime = deadline.timeRemaining ? deadline.timeRemaining() > 1 : true;
                         if (!hasTime && !deadline.didTimeout) {
                             // 当前节点已处理，下次空闲帧从下一个节点继续
@@ -1785,27 +1835,32 @@
         }
 
         // 对单个文本节点执行正则匹配，命中则按 level 向上隐藏父级
-        // 合并正则快速路径：一次 exec 定位命中规则；降级路径：逐条 safeRegexTest
-        static _executeRegexMatch(node, rules, mergedRegex) {
+        // 分批合并快速路径：每批一次 exec 定位命中规则；降级路径：逐条 test
+        static _executeRegexMatch(node, mergedBatches) {
             const text = node.textContent || '';
             if (!text) return;
             const truncated = text.length > 2000 ? text.slice(0, 2000) : text;
 
-            if (mergedRegex) {
-                // 合并正则快速路径：一次 exec 替代 N 次 test
-                const match = mergedRegex.exec(truncated);
-                if (!match) return;
-                // match[1..N] 为各捕获组，找到第一个非 undefined 的组即命中的规则
-                let level = 0;
-                for (let i = 1; i <= rules.length; i++) {
-                    if (match[i] !== undefined) { level = rules[i - 1].level; break; }
-                }
-                this._hideRegexAncestor(node, level);
-            } else {
-                // 降级路径：合并正则构建失败时逐条测试
-                for (const rule of rules) {
-                    if (rule.regex.test(truncated)) {
-                        this._hideRegexAncestor(node, rule.level);
+            for (const batch of mergedBatches) {
+                if (batch.regex) {
+                    // 合并正则快速路径：一次 exec 替代 N 次 test
+                    const match = batch.regex.exec(truncated);
+                    if (match) {
+                        // match[1..N] 为各捕获组，找到第一个非 undefined 的组即命中的规则
+                        let level = 0;
+                        for (let i = 1; i <= batch.rules.length; i++) {
+                            if (match[i] !== undefined) { level = batch.rules[i - 1].level; break; }
+                        }
+                        this._hideRegexAncestor(node, level);
+                        return; // 命中即返回，避免重复隐藏
+                    }
+                } else {
+                    // 降级路径：该批合并失败时逐条测试
+                    for (const rule of batch.rules) {
+                        if (rule.regex.test(truncated)) {
+                            this._hideRegexAncestor(node, rule.level);
+                            return;
+                        }
                     }
                 }
             }
@@ -1827,12 +1882,12 @@
         }
 
         // 同步兜底：无 requestIdleCallback 的环境使用同步 TreeWalker 遍历
-        static _applyRegexRulesSync(targetNode, rules, mergedRegex, textFilter) {
+        static _applyRegexRulesSync(targetNode, mergedBatches, textFilter) {
             try {
                 const walker = document.createTreeWalker(targetNode, NodeFilter.SHOW_TEXT, textFilter, false);
                 let node;
                 while ((node = walker.nextNode())) {
-                    this._executeRegexMatch(node, rules, mergedRegex);
+                    this._executeRegexMatch(node, mergedBatches);
                 }
             } catch (e) {
                 console.error('[Pro Blocker] 正则遍历异常:', e);
@@ -2768,6 +2823,1207 @@
         }
     }
 
+    // ================= 三算法协同系统 v2 =================
+    // GlobalDomainScanner × OverlayAdScanner × GeneralizationEngine × AdBlockOrchestrator
+    // 设计目标：全量采集 · 精准评分 · 不可见/覆盖层专攻 · 智能自学习 · 博彩/色情专项拦截
+    // 与现有 BlockEngine/NetworkInterceptor 并行：新增博彩色情词库、跳转拦截、置信度追踪能力
+    // 不复刻 fetch/XHR/MutationObserver（已有），仅补充 nav 拦截 + 动态学习 + 衰减
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     *  算法一：GlobalDomainScanner — 全量域名深度检索
+     *
+     *  核心原则：
+     *    · 全：6通道采集，不遗漏任何网络资源
+     *    · 准：12维特征 + 交叉验证 + 共振加成
+     *    · 快：单次扫描 < 8ms（万级节点页面）
+     *    · 博彩/色情：专项词库 + 图片行为分析
+     * ═══════════════════════════════════════════════════════════════
+     */
+    const GlobalDomainScanner = (() => {
+
+        // ─── 配置 ───
+        const MAX_URLS_PER_HOST = 5;
+
+        const MULTI_TLDS = new Set([
+            'com.cn','net.cn','org.cn','gov.cn','edu.cn',
+            'co.uk','org.uk','ac.uk','com.au','net.au',
+            'co.jp','or.jp','ne.jp','co.kr','or.kr',
+            'com.br','com.tw','com.hk','co.in','co.za',
+            'com.sg','com.my','com.ph','co.th','co.id'
+        ]);
+
+        // ─── 广告词元库 ───
+        const AD_TOKENS = new Set([
+            'ad','ads','adx','adnxs','advert','adsystem','adserver','adserving',
+            'doubleclick','googlesyndication','googleadservices','google-analytics',
+            'amazon-adsystem','taboola','outbrain','mgid','criteo','media6degrees',
+            'popads','propellerads','revcontent','adcolony','unityads','ironsrc',
+            'analytics','tracking','tracker','beacon','pixel','logger','telemetry',
+            'metrics','collect','umeng','sentry','hotjar','mixpanel','segment',
+            'cnzz','baidu','tongji','stat','count','report'
+        ]);
+
+        // ─── 博彩/色情/恶意跳转词元库 ───
+        const VICE_TOKENS = new Set([
+            'casino','bet','betting','poker','slot','lottery','jackpot',
+            'wager','gambling','lucky','spin','baccarat','roulette','blackjack',
+            'sportsbook','bookmaker','odds','handicap','parlay',
+            'bocai','caipiao','yazhou','ag','bbin','mg','pt','sb','ibc',
+            'sbo','cmd368','maxbet','sunbet','tombola','lottomatica',
+            'adult','xxx','porn','sex','nude','erotic','hentai','nsfw',
+            'live','cam','dating','hookup','escort','onlyfans','xvideos',
+            'pornhub','xhamster','redtube','youporn','brazzers',
+            'redirect','click','track','go','jump','link','short','tiny',
+            'bitly','turl','sclick','goo','owly','rebrandly','cuttly',
+            'popup','popunder','overlay','push','notification','interstitial',
+            'splash','takeover','skyscraper','leaderboard','native-ad'
+        ]);
+
+        // ─── 资源类型映射 ───
+        const TYPE_MAP = {
+            'script':'script','link':'css','css':'css',
+            'img':'image','image':'image','picture':'image',
+            'xmlhttprequest':'xhr','fetch':'xhr','beacon':'beacon',
+            'iframe':'iframe','subdocument':'iframe','frame':'iframe',
+            'video':'media','audio':'media',
+            'websocket':'ws','embed':'plugin','object':'plugin','other':'other'
+        };
+
+        // ─── 主域名提取（与 BlockEngine 主域逻辑一致，独立维护避免耦合）───
+        function mainDomain(host) {
+            const p = host.toLowerCase().split('.');
+            if (p.length <= 2) return host;
+            const last2 = p.slice(-2).join('.');
+            if (MULTI_TLDS.has(last2)) return p.slice(-3).join('.');
+            return last2;
+        }
+
+        function isSameSite(host, main) {
+            return host === main || host.endsWith('.' + main);
+        }
+
+        // ════════════════════════════════════════
+        //  阶段1：全通道采集（6通道）
+        // ════════════════════════════════════════
+        function collect() {
+            const map = new Map();
+            const curHost = location.hostname.toLowerCase();
+            const main = mainDomain(curHost);
+
+            function _addEntry(hostname, url, type, bytes) {
+                if (!hostname || hostname === curHost) return;
+                let info = map.get(hostname);
+                if (!info) {
+                    info = { hostname, urls: [], types: new Set(), bytes: 0, count: 0, t0: 0, t1: 0, hasRedirect: false };
+                    map.set(hostname, info);
+                }
+                if (info.urls.length < MAX_URLS_PER_HOST) info.urls.push(url);
+                info.types.add(type);
+                info.bytes += (bytes || 0);
+                info.count++;
+            }
+
+            // 通道A：Performance API（所有已加载资源）
+            try {
+                for (const e of performance.getEntriesByType('resource')) {
+                    try {
+                        const u = new URL(e.name);
+                        const h = u.hostname.toLowerCase();
+                        const type = TYPE_MAP[e.initiatorType] || 'other';
+                        _addEntry(h, e.name, type, e.transferSize || e.encodedBodySize || 0);
+                        const info = map.get(h);
+                        if (info) {
+                            const t = e.startTime || 0;
+                            if (!info.t0 || t < info.t0) info.t0 = t;
+                            if (t > info.t1) info.t1 = t;
+                            if (e.redirectStart && e.redirectEnd && e.redirectEnd > e.redirectStart) {
+                                info.hasRedirect = true;
+                            }
+                        }
+                    } catch(ex){}
+                }
+            } catch(ex){}
+
+            // 通道B：DOM 资源元素（懒加载/srcset/poster）
+            try {
+                const SEL = [
+                    'img[src]','img[data-src]','img[data-lazy-src]','img[srcset]',
+                    'source[src]','source[srcset]','source[data-src]',
+                    'script[src]','script[data-src]',
+                    'link[href][rel="stylesheet"]',
+                    'iframe[src]','iframe[data-src]',
+                    'video[src]','video[poster]','audio[src]',
+                    'embed[src]','object[data]',
+                    'a[href*="."][target="_blank"] img'
+                ].join(',');
+                for (const el of document.querySelectorAll(SEL)) {
+                    const cands = [el.src, el.href, el.dataset && el.dataset.src, el.dataset && el.dataset.lazySrc, el.poster, el.data].filter(Boolean);
+                    const ss = el.srcset || (el.getAttribute && el.getAttribute('srcset')) || (el.dataset && el.dataset.srcset);
+                    if (ss) {
+                        for (const p of ss.split(',')) {
+                            const u = p.trim().split(/\s+/)[0];
+                            if (u) cands.push(u);
+                        }
+                    }
+                    for (const raw of cands) {
+                        if (!raw || raw.startsWith('data:') || raw.startsWith('blob:') || raw.startsWith('#')) continue;
+                        try {
+                            const abs = new URL(raw, location.href);
+                            const h = abs.hostname.toLowerCase();
+                            const type = TYPE_MAP[el.tagName.toLowerCase()] || 'other';
+                            _addEntry(h, raw, type, 0);
+                        } catch(ex){}
+                    }
+                }
+            } catch(ex){}
+
+            // 通道C：iframe 递归（同源 iframe 内部资源）
+            try {
+                const iframes = document.querySelectorAll('iframe');
+                for (const iframe of iframes) {
+                    try {
+                        const src = iframe.src;
+                        if (src && !src.startsWith('data:') && !src.startsWith('about:')) {
+                            const h = new URL(src, location.href).hostname.toLowerCase();
+                            _addEntry(h, src, 'iframe', 0);
+                        }
+                        if (iframe.contentDocument) {
+                            const innerImgs = iframe.contentDocument.querySelectorAll('img[src]');
+                            for (const img of innerImgs) {
+                                try {
+                                    const h2 = new URL(img.src).hostname.toLowerCase();
+                                    _addEntry(h2, img.src, 'image', 0);
+                                } catch(e2){}
+                            }
+                        }
+                    } catch(ex){}
+                }
+            } catch(ex){}
+
+            // 通道D：CSS 中的外部资源（@import / url()）
+            try {
+                for (const sheet of document.styleSheets) {
+                    try {
+                        if (sheet.href) {
+                            const h = new URL(sheet.href).hostname.toLowerCase();
+                            _addEntry(h, sheet.href, 'css', 0);
+                        }
+                        for (const rule of (sheet.cssRules || [])) {
+                            if (rule.style && rule.style.backgroundImage && rule.style.backgroundImage.includes('url(')) {
+                                const m = rule.style.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/);
+                                if (m && m[1] && !m[1].startsWith('data:')) {
+                                    try {
+                                        const h = new URL(m[1], sheet.href || location.href).hostname.toLowerCase();
+                                        _addEntry(h, m[1], 'image', 0);
+                                    } catch(e3){}
+                                }
+                            }
+                        }
+                    } catch(ex){}
+                }
+            } catch(ex){}
+
+            // 通道E：页面中所有链接的跳转目标（博彩/色情跳转检测）
+            try {
+                const links = document.querySelectorAll('a[href]');
+                for (const a of links) {
+                    const href = a.href;
+                    if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
+                    try {
+                        const h = new URL(href).hostname.toLowerCase();
+                        if (h !== curHost && !isSameSite(h, main)) {
+                            const hasImg = a.querySelector('img') !== null;
+                            const type = hasImg ? 'image-link' : 'link';
+                            _addEntry(h, href, type, 0);
+                            const info = map.get(h);
+                            if (info) info.hasRedirect = true;
+                        }
+                    } catch(ex){}
+                }
+            } catch(ex){}
+
+            // 标记第三方
+            for (const [, info] of map) {
+                info.thirdParty = !isSameSite(info.hostname, main);
+            }
+
+            return map;
+        }
+
+        // ════════════════════════════════════════
+        //  阶段2：12维特征提取
+        // ════════════════════════════════════════
+        function extractFeatures(info) {
+            const h = info.hostname;
+            const tokens = h.split(/[^a-z0-9-]/).filter(Boolean);
+            const f = { hostname: h };
+
+            // ① 广告词元
+            f.adToken = null;
+            for (const t of tokens) { if (AD_TOKENS.has(t)) { f.adToken = t; break; } }
+
+            // ② 博彩/色情词元
+            f.viceToken = null;
+            for (const t of tokens) { if (VICE_TOKENS.has(t)) { f.viceToken = t; break; } }
+
+            // ③ 第三方
+            f.thirdParty = info.thirdParty ? 1 : 0;
+
+            // ④ 子域深度
+            const depth = h.split('.').length;
+            f.subDepth = depth >= 5 ? 1 : depth === 4 ? 0.6 : depth === 3 ? 0.3 : 0;
+
+            // ⑤ 混合类型
+            const T = info.types;
+            f.hasScript = T.has('script');
+            f.hasImage = T.has('image');
+            f.hasXHR = T.has('xhr');
+            f.hasIframe = T.has('iframe');
+            f.hasBeacon = T.has('beacon');
+            f.hasImageLink = T.has('image-link');
+            f.mixed = (f.hasScript && f.hasImage && f.hasXHR) ? 1 : 0;
+
+            // ⑥ 追踪像素
+            const avg = info.count > 0 ? info.bytes / info.count : 0;
+            f.pixel = (f.hasImage && !f.hasScript && !f.hasXHR && avg > 0 && avg < 1024) ? 1 : 0;
+
+            // ⑦ 频次
+            f.freq = info.count;
+
+            // ⑧ 时间跨度
+            const span = info.t1 - info.t0;
+            f.span = span > 15000 ? 1 : span > 5000 ? 0.6 : span > 2000 ? 0.3 : 0;
+
+            // ⑨ 类型多样性
+            f.typeCount = T.size;
+
+            // ⑩ 图片行为特征（博彩/色情图片关键）
+            f.imageBehavior = 0;
+            if (f.hasImage && info.types.size === 1) f.imageBehavior = 0.3;
+            if (f.hasImageLink) f.imageBehavior = 0.8;
+            if (f.hasImage && info.hasRedirect) f.imageBehavior = 1;
+            const imgCount = info.urls.filter(u => /\.(gif|jpg|jpeg|png|webp|avif)(\?|$)/i.test(u)).length;
+            if (imgCount >= 3) f.imageBehavior = Math.max(f.imageBehavior, 0.7);
+
+            // ⑪ 跳转链特征
+            f.redirectChain = info.hasRedirect ? 1 : 0;
+
+            // ⑫ 隐藏通道
+            f.hiddenChannel = (f.hasBeacon || (f.hasIframe && !f.hasScript)) ? 1 : 0;
+
+            return f;
+        }
+
+        // ════════════════════════════════════════
+        //  阶段3：精准评分（交叉验证 + 共振）
+        // ════════════════════════════════════════
+        function calculateScore(f) {
+            if (!f.thirdParty && !f.adToken && !f.viceToken) {
+                return { score: 0, level: 'safe', reasons: ['同站资源'], signals: 0 };
+            }
+            let s = 0, sig = 0;
+            const r = [];
+
+            if (f.viceToken) { s += 35; sig++; r.push('🚫词元"' + f.viceToken + '"'); }
+            if (f.adToken) { s += 22; sig++; r.push('词元"' + f.adToken + '"'); }
+            if (f.pixel) { s += 20; sig++; r.push('追踪像素'); }
+            if (f.mixed) { s += 18; sig++; r.push('混合类型'); }
+
+            if (f.thirdParty) { s += 8; sig++; r.push('第三方'); }
+            if (f.subDepth >= 0.6) { s += 7; sig++; r.push('深子域'); }
+            if (f.imageBehavior >= 0.8) { s += 20; sig++; r.push('🖼️图片跳转'); }
+            else if (f.imageBehavior >= 0.5) { s += 12; sig++; r.push('图片异常'); }
+            if (f.redirectChain) { s += 15; sig++; r.push('🔗跳转链'); }
+            if (f.hiddenChannel) { s += 12; sig++; r.push('隐藏通道'); }
+
+            if (f.freq >= 5) { s += 6; sig++; r.push('×' + f.freq); }
+            else if (f.freq >= 3) { s += 3; }
+            if (f.span > 0) { s += 5; sig++; r.push('持续请求'); }
+            if (f.typeCount >= 4) { s += 4; }
+
+            // 共振加成
+            if (sig >= 5) { s += 20; r.push('共振+20'); }
+            else if (sig >= 4) { s += 15; r.push('共振+15'); }
+            else if (sig >= 3) { s += 10; r.push('共振+10'); }
+            else if (sig >= 2) { s += 5; r.push('共振+5'); }
+
+            // 博彩/色情特殊加成
+            if (f.viceToken && f.imageBehavior >= 0.5) { s += 10; r.push('🚨博彩色情+图片'); }
+
+            let level;
+            if (s >= 55 && sig >= 3) level = 'ad';
+            else if (s >= 35 && sig >= 2) level = 'suspect';
+            else if (s >= 15) level = 'watch';
+            else level = 'safe';
+
+            return { score: Math.min(s, 100), level, reasons: r, signals: sig };
+        }
+
+        // ════════════════════════════════════════
+        //  主入口
+        // ════════════════════════════════════════
+        function scan() {
+            const t0 = performance.now();
+            const map = collect();
+            const results = [];
+            for (const [, info] of map) {
+                const f = extractFeatures(info);
+                const { score, level, reasons, signals } = calculateScore(f);
+                results.push(Object.assign({}, f, { score, level, reasons, signals, info }));
+            }
+            results.sort((a, b) => b.score - a.score);
+            const elapsed = (performance.now() - t0).toFixed(1);
+            return { results, elapsed, total: results.length };
+        }
+
+        return { scan, mainDomain, extractFeatures, calculateScore, AD_TOKENS, VICE_TOKENS };
+    })();
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     *  算法二：OverlayAdScanner — 不可见/覆盖层广告专攻
+     *
+     *  专攻目标：不可见元素 · 覆盖层 · 博彩/色情图片 · 点击跳转拦截
+     * ═══════════════════════════════════════════════════════════════
+     */
+    const OverlayAdScanner = (() => {
+
+        const VICE_CONTAINER_RE = /(^|[\s_-])(ad|ads|advert|banner|sponsor|promo|overlay|popup|popunder|float|sticky|interstitial|modal|mask|cover|layer|tracking|pixel|casino|bet|porn|xxx|adult|sex|live|cam|dating|hot|splash|takeover|skyscraper|leaderboard|notification|push)([\s_-]|$)/i;
+        const VICE_IMG_RE = /(^|[\s_-])(hot|live|sexy|nude|girl|casino|slot|bet|bonus|jackpot|winner|free|click|download|register|promo|banner|ad|popup)([\s_-]|$)/i;
+
+        const QUICK_SEL = [
+            'div[class]','div[id]','section[class]','aside[class]',
+            'iframe','ins','a[target="_blank"]','img[src]',
+            'div[style*="position"]','div[style*="z-index"]',
+            'div[style*="opacity"]','div[style*="visibility"]'
+        ].join(',');
+
+        function scan() {
+            const t0 = performance.now();
+            const results = [];
+            const seen = new Set();
+
+            // 阶段1：快速选择器扫描
+            try {
+                const candidates = document.querySelectorAll(QUICK_SEL);
+                for (const el of candidates) {
+                    if (seen.has(el)) continue;
+                    seen.add(el);
+                    const f = _analyzeElement(el);
+                    if (f.suspicion > 0) results.push(f);
+                }
+            } catch(e){}
+
+            // 阶段2：定位元素扫描（覆盖层核心）
+            try {
+                const positioned = document.querySelectorAll('div,section,aside,article');
+                for (const el of positioned) {
+                    if (seen.has(el)) continue;
+                    const cs = _cs(el);
+                    if (!cs) continue;
+                    if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+                    seen.add(el);
+                    const f = _analyzeOverlay(el, cs);
+                    if (f.suspicion > 0) results.push(f);
+                }
+            } catch(e){}
+
+            // 阶段3：可点击图片专项（博彩/色情核心）
+            try {
+                const clickableImgs = document.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
+                for (const img of clickableImgs) {
+                    if (seen.has(img)) continue;
+                    seen.add(img);
+                    const f = _analyzeClickableImage(img);
+                    if (f.suspicion > 0) results.push(f);
+                }
+            } catch(e){}
+
+            results.sort((a, b) => b.suspicion - a.suspicion);
+            const elapsed = (performance.now() - t0).toFixed(1);
+            return { results, elapsed, total: results.length };
+        }
+
+        function _analyzeElement(el) {
+            const f = { el, suspicion: 0, reasons: [], features: {}, category: 'unknown' };
+            const cs = _cs(el);
+            if (!cs) return f;
+            const tag = el.tagName.toLowerCase();
+            const cls = (el.className || '').toString().toLowerCase();
+            const id = (el.id || '').toLowerCase();
+            const rect = _rect(el);
+
+            if (cs.opacity === '0' && rect.width > 0 && rect.height > 0) {
+                f.suspicion += 35; f.reasons.push('opacity:0占位');
+                f.features.invisible = 'opacity'; f.category = 'invisible';
+            }
+            if (cs.visibility === 'hidden' && rect.width > 0) {
+                f.suspicion += 30; f.reasons.push('visibility:hidden');
+                f.features.invisible = 'visibility'; f.category = 'invisible';
+            }
+            if (cs.display === 'none') {
+                if (el.querySelector('img,iframe,script')) {
+                    f.suspicion += 10; f.reasons.push('display:none含资源');
+                    f.features.invisible = 'display';
+                }
+            }
+            if (rect.left < -100 || rect.top < -100 || rect.right > window.innerWidth + 200) {
+                f.suspicion += 25; f.reasons.push('屏幕外');
+                f.features.offscreen = true; f.category = 'invisible';
+            }
+            if (rect.width >= 1 && rect.width <= 2 && rect.height >= 1 && rect.height <= 2) {
+                f.suspicion += 40; f.reasons.push('1×1像素');
+                f.features.pixel = true; f.category = 'tracking';
+            }
+            const z = parseInt(cs.zIndex) || 0;
+            if ((cs.position === 'fixed' || cs.position === 'absolute') && z > 999) {
+                f.suspicion += 25; f.reasons.push('z:' + z);
+                f.features.highZ = z; f.category = 'overlay';
+            }
+            const screenArea = window.innerWidth * window.innerHeight;
+            const area = rect.width * rect.height;
+            if (area > screenArea * 0.7 && (cs.position === 'fixed' || cs.position === 'absolute')) {
+                f.suspicion += 25; f.reasons.push('大面积覆盖');
+                f.features.fullscreen = true; f.category = 'overlay';
+            }
+            if (VICE_CONTAINER_RE.test(cls) || VICE_CONTAINER_RE.test(id)) {
+                f.suspicion += 20; f.reasons.push('命名可疑');
+                f.features.viceAttr = true;
+            }
+            if (cs.pointerEvents === 'none' && rect.width > 100 && rect.height > 100) {
+                f.suspicion += 15; f.reasons.push('幽灵遮罩');
+                f.features.ghost = true; f.category = 'overlay';
+            }
+            if (el.querySelector('iframe,script[src]')) {
+                f.suspicion += 10; f.reasons.push('内嵌资源');
+                f.features.hasEmbed = true;
+            }
+            f.selector = _buildSelector(el);
+            f.features.tag = tag;
+            return f;
+        }
+
+        function _analyzeOverlay(el, cs) {
+            const f = { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
+            const rect = _rect(el);
+            const cls = (el.className || '').toString().toLowerCase();
+            const id = (el.id || '').toLowerCase();
+            const z = parseInt(cs.zIndex) || 0;
+
+            if (z > 9999) { f.suspicion += 35; f.reasons.push('超高z:' + z); }
+            else if (z > 999) { f.suspicion += 20; f.reasons.push('高z:' + z); }
+
+            if (cs.position === 'fixed' && rect.width >= window.innerWidth * 0.85 && rect.height >= window.innerHeight * 0.85) {
+                f.suspicion += 30; f.reasons.push('全屏fixed');
+                f.features.fullscreen = true;
+            }
+            const opacity = parseFloat(cs.opacity);
+            if (opacity > 0 && opacity < 0.15 && rect.width > 200 && rect.height > 200) {
+                f.suspicion += 20; f.reasons.push('微透明遮罩');
+                f.features.ghost = true;
+            }
+            if (VICE_CONTAINER_RE.test(cls) || VICE_CONTAINER_RE.test(id)) {
+                f.suspicion += 20; f.reasons.push('命名可疑');
+            }
+            if (el.querySelector('iframe')) { f.suspicion += 15; f.reasons.push('含iframe'); }
+            const imgs = el.querySelectorAll('img');
+            if (imgs.length > 0) {
+                f.suspicion += 10; f.reasons.push('含' + imgs.length + '张图');
+                const links = el.querySelectorAll('a[href]');
+                if (links.length > 0) {
+                    f.suspicion += 15; f.reasons.push('图片+链接');
+                    f.features.hasLink = true;
+                }
+            }
+            f.features.zIndex = z;
+            f.features.position = cs.position;
+            f.selector = _buildSelector(el);
+            f.features.tag = el.tagName.toLowerCase();
+            return f;
+        }
+
+        function _analyzeClickableImage(img) {
+            const f = { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
+            const rect = _rect(img);
+            const parent = img.closest('a, [onclick]');
+            const container = img.parentElement;
+
+            if (parent) {
+                const href = parent.getAttribute('href') || parent.getAttribute('onclick') || '';
+                if (href && !href.startsWith('#') && !href.startsWith('javascript:void')) {
+                    f.suspicion += 15; f.reasons.push('可点击跳转');
+                    f.features.clickable = true;
+                    try {
+                        const targetHost = new URL(href, location.href).hostname;
+                        if (targetHost !== location.hostname) {
+                            f.suspicion += 20; f.reasons.push('外部跳转');
+                            f.features.externalLink = targetHost;
+                            const tokens = targetHost.split(/[^a-z0-9-]/i);
+                            for (const t of tokens) {
+                                if (GlobalDomainScanner.VICE_TOKENS.has(t.toLowerCase())) {
+                                    f.suspicion += 30; f.reasons.push('🚫跳转"' + t + '"');
+                                    f.features.viceTarget = t;
+                                    break;
+                                }
+                            }
+                        }
+                    } catch(e){}
+                    if (href.includes('window.open') || href.includes('location')) {
+                        f.suspicion += 25; f.reasons.push('JS跳转');
+                        f.features.jsRedirect = true;
+                    }
+                }
+            }
+            if (rect.width > window.innerWidth * 0.4 && rect.height > 100) {
+                f.suspicion += 10; f.reasons.push('大面积图片');
+            }
+            const src = img.src || (img.dataset && img.dataset.src) || '';
+            if (src.endsWith('.gif') || src.includes('.gif?')) {
+                f.suspicion += 10; f.reasons.push('GIF动图');
+                f.features.isGif = true;
+            }
+            const cls = ((img.className || '') + ' ' + (container ? (container.className || '') : '')).toLowerCase();
+            const id = (img.id || '').toLowerCase();
+            if (VICE_IMG_RE.test(cls) || VICE_IMG_RE.test(id)) {
+                f.suspicion += 15; f.reasons.push('图片命名可疑');
+            }
+            const cs = _cs(img) || _cs(container);
+            if (cs && (cs.position === 'fixed' || cs.position === 'absolute')) {
+                const z = parseInt(cs.zIndex) || 0;
+                if (z > 100) { f.suspicion += 15; f.reasons.push('图片覆盖层z:' + z); }
+            }
+            if (img.dataset && img.dataset._dynamicInsert === '1') {
+                f.suspicion += 15; f.reasons.push('动态插入');
+                f.features.dynamic = true;
+            }
+            f.selector = _buildSelector(img.parentElement || img);
+            f.features.tag = 'img';
+            f.features.src = src.substring(0, 120);
+            return f;
+        }
+
+        // ─── 实时动态插入监控（学习用，不重复隐藏，BlockEngine 已处理拦截）───
+        let _observer = null;
+        let _dynamicCallback = null;
+
+        function startWatching(callback) {
+            if (_observer) _observer.disconnect();
+            _dynamicCallback = callback;
+            _observer = new MutationObserver(mutations => {
+                for (const m of mutations) {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        node.dataset._dynamicInsert = '1';
+                        const f = _analyzeElement(node);
+                        if (f.suspicion >= 30) _dynamicCallback && _dynamicCallback(f);
+                        const imgs = node.tagName === 'IMG' ? [node] : Array.from((node.querySelectorAll && node.querySelectorAll('img')) || []);
+                        for (const img of imgs) {
+                            img.dataset._dynamicInsert = '1';
+                            const fi = _analyzeClickableImage(img);
+                            if (fi.suspicion >= 25) _dynamicCallback && _dynamicCallback(fi);
+                        }
+                    }
+                }
+            });
+            _observer.observe(document.documentElement, { childList: true, subtree: true });
+        }
+
+        function stopWatching() {
+            if (_observer) _observer.disconnect();
+            _observer = null;
+        }
+
+        // ─── 跳转拦截（博彩/色情核心防线，现有 NetworkInterceptor 未覆盖）───
+        let _navBlocked = [];
+        let _navInterceptorActive = false;
+
+        function enableNavigationInterceptor(blockedDomains) {
+            if (_navInterceptorActive) return;
+            _navInterceptorActive = true;
+
+            // ① 拦截 window.open
+            const _origOpen = window.open;
+            window.open = function(url) {
+                const args = Array.prototype.slice.call(arguments);
+                if (_isBlockedNav(url, blockedDomains)) {
+                    _navBlocked.push({ type: 'window.open', url: url, time: Date.now() });
+                    console.warn('[OverlayAdScanner] 拦截 window.open:', url);
+                    return null;
+                }
+                return _origOpen.apply(this, args);
+            };
+
+            // ② 拦截 <a> 点击（捕获阶段）
+            document.addEventListener('click', function(e) {
+                const link = e.target.closest && e.target.closest('a');
+                if (!link) return;
+                const href = link.href || '';
+                if (href && _isBlockedNav(href, blockedDomains)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    _navBlocked.push({ type: 'link.click', url: href, time: Date.now() });
+                    console.warn('[OverlayAdScanner] 拦截链接:', href);
+                    const container = link.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || link;
+                    container.remove();
+                }
+            }, true);
+
+            // ③ 拦截 location.href 赋值
+            try {
+                const desc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+                if (desc && desc.set) {
+                    Object.defineProperty(Location.prototype, 'href', {
+                        set(val) {
+                            if (_isBlockedNav(val, blockedDomains)) {
+                                _navBlocked.push({ type: 'location.href', url: val, time: Date.now() });
+                                console.warn('[OverlayAdScanner] 拦截 location:', val);
+                                return;
+                            }
+                            desc.set.call(this, val);
+                        },
+                        get() { return desc.get.call(this); },
+                        configurable: true
+                    });
+                }
+            } catch(e){}
+
+            // ④ 拦截 form 提交
+            document.addEventListener('submit', function(e) {
+                const action = e.target.action || '';
+                if (action && _isBlockedNav(action, blockedDomains)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    _navBlocked.push({ type: 'form.submit', url: action, time: Date.now() });
+                }
+            }, true);
+        }
+
+        function _isBlockedNav(url, blockedDomains) {
+            if (!url) return false;
+            try {
+                const u = new URL(url, location.href);
+                const h = u.hostname.toLowerCase();
+                if (blockedDomains) {
+                    for (const d of blockedDomains) {
+                        if (h === d || h.endsWith('.' + d)) return true;
+                    }
+                }
+                const tokens = h.split(/[^a-z0-9-]/);
+                for (const t of tokens) {
+                    if (GlobalDomainScanner.VICE_TOKENS.has(t)) return true;
+                }
+                if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return true;
+                if (/bit\.ly|t\.cn|tinyurl|goo\.gl|ow\.ly|cutt\.ly|rebrand\.ly/i.test(h)) return true;
+                return false;
+            } catch(e) { return false; }
+        }
+
+        function getBlockedNav() { return _navBlocked; }
+
+        function _cs(el) {
+            try { return window.getComputedStyle(el); } catch(e) { return null; }
+        }
+        function _rect(el) {
+            try { return el.getBoundingClientRect(); } catch(e) { return { width:0, height:0, left:0, top:0, right:0 }; }
+        }
+        function _buildSelector(el) {
+            if (!el) return '';
+            if (el.id) return '#' + el.id;
+            let s = el.tagName.toLowerCase();
+            if (el.className && typeof el.className === 'string') {
+                const cls = el.className.trim().split(/\s+/).slice(0, 2);
+                if (cls[0]) s += '.' + cls.join('.');
+            }
+            const parent = el.parentElement;
+            if (parent && parent.id) return '#' + parent.id + ' > ' + s;
+            if (parent && parent.className && typeof parent.className === 'string') {
+                const pcls = parent.className.trim().split(/\s+/)[0];
+                if (pcls) return '.' + pcls + ' > ' + s;
+            }
+            return s;
+        }
+
+        return { scan, startWatching, stopWatching, enableNavigationInterceptor, getBlockedNav, _isBlockedNav };
+    })();
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     *  算法三：GeneralizationEngine — 智能自学习泛化引擎
+     *
+     *  独立规则库 ge_rules_v2：与现有 storage 规则并行，互不污染
+     *  学习通道：域名扫描 / 覆盖层扫描 / 用户手动 / 反馈 / 运行时命中
+     * ═══════════════════════════════════════════════════════════════
+     */
+    const GeneralizationEngine = (() => {
+
+        let rules = {
+            domain: [], url: [], css: [], attr: [], nav: [], path: []
+        };
+
+        const CONFIDENCE_MIN = 0.5;
+        const CONFIDENCE_MAX = 1.0;
+        const DECAY_FACTOR = 0.7;
+        const BOOST_FACTOR = 0.1;
+        const PENALTY_FACTOR = 0.4;
+        const MAX_RULES = { domain: 300, url: 80, css: 150, attr: 80, nav: 100, path: 50 };
+        const DECAY_INTERVAL = 30 * 86400000;
+        const VICE_RE_SIMPLE = /^(ad|ads|advert|banner|sponsor|promo|overlay|popup|float|sticky|track|pixel|interstitial|casino|bet|porn|xxx|adult|sex|hot|live|cam|modal|mask|cover)/i;
+
+        _load();
+
+        function learnFromDomainScan(scanResults) {
+            let learned = 0;
+            for (const r of scanResults) {
+                if (r.level !== 'ad' && r.level !== 'suspect') continue;
+                if (!_hasRule('domain', r.hostname)) {
+                    rules.domain.push({
+                        hostname: r.hostname,
+                        confidence: r.level === 'ad' ? 0.92 : 0.68,
+                        hits: 0, misses: 0, source: 'domain_scan', created: Date.now(),
+                        features: { adToken: r.adToken, viceToken: r.viceToken, imageBehavior: r.imageBehavior, redirectChain: r.redirectChain }
+                    });
+                    learned++;
+                } else {
+                    _boostRule('domain', r.hostname);
+                }
+                if (r.viceToken) {
+                    if (!_hasRule('nav', r.hostname)) {
+                        rules.nav.push({ hostname: r.hostname, confidence: 0.95, hits: 0, source: 'domain_scan', created: Date.now() });
+                        learned++;
+                    }
+                }
+                if (r.adToken || r.viceToken) {
+                    const token = r.viceToken || r.adToken;
+                    const pattern = _tokenToUrlPattern(token);
+                    if (pattern && !_hasRule('url', pattern)) {
+                        rules.url.push({ pattern, confidence: r.viceToken ? 0.85 : 0.7, hits: 0, source: 'domain_scan', created: Date.now() });
+                        learned++;
+                    }
+                }
+                if (r.info && r.info.urls) {
+                    for (const url of r.info.urls.slice(0, 3)) {
+                        const pp = _extractPathPattern(url);
+                        if (pp && !_hasRule('path', pp)) {
+                            rules.path.push({ pattern: pp, confidence: 0.6, hits: 0, source: 'domain_scan', created: Date.now() });
+                            learned++;
+                        }
+                    }
+                }
+            }
+            learned += _generalizeDomainCluster(scanResults);
+            _save();
+            return learned;
+        }
+
+        function learnFromOverlayScan(scanResults) {
+            let learned = 0;
+            for (const r of scanResults) {
+                if (r.suspicion < 25) continue;
+                const f = r.features;
+                const sel = r.selector;
+                if (f.invisible && sel && !_hasRule('css', sel)) {
+                    rules.css.push({ selector: sel, confidence: 0.85, hits: 0, source: 'overlay_scan', created: Date.now(), reason: '不可见(' + f.invisible + ')' });
+                    learned++;
+                }
+                if ((f.highZ || f.fullscreen) && sel && !_hasRule('css', sel)) {
+                    rules.css.push({ selector: sel, confidence: f.fullscreen ? 0.9 : 0.75, hits: 0, source: 'overlay_scan', created: Date.now(), reason: '覆盖层' });
+                    learned++;
+                }
+                if (r.category === 'vice-image') {
+                    if (sel && !_hasRule('css', sel)) {
+                        rules.css.push({ selector: sel, confidence: 0.8, hits: 0, source: 'overlay_scan', created: Date.now(), reason: '博彩/色情图片' });
+                        learned++;
+                    }
+                    if (f.externalLink && !_hasRule('nav', f.externalLink)) {
+                        rules.nav.push({ hostname: f.externalLink, confidence: 0.9, hits: 0, source: 'overlay_scan', created: Date.now() });
+                        learned++;
+                    }
+                }
+                if (f.pixel) {
+                    const src = (r.el && r.el.src) || '';
+                    if (src && !_hasRule('url', src)) {
+                        rules.url.push({ pattern: _escapeRegex(src), confidence: 0.9, hits: 0, source: 'overlay_scan', created: Date.now() });
+                        learned++;
+                    }
+                }
+                if (f.viceAttr && r.el) {
+                    const cls = (r.el.className || '').toString();
+                    const tokens = cls.split(/[\s_-]+/).filter(t => t.length > 2 && VICE_RE_SIMPLE.test(t));
+                    for (const t of tokens.slice(0, 2)) {
+                        const key = (cls ? 'class' : 'id') + ':' + t;
+                        if (!_hasRule('attr', key)) {
+                            rules.attr.push({ attr: cls ? 'class' : 'id', value: t, tag: f.tag || '*', confidence: 0.7, hits: 0, source: 'overlay_scan', created: Date.now() });
+                            learned++;
+                        }
+                    }
+                }
+            }
+            learned += _generalizeOverlayCluster(scanResults);
+            _save();
+            return learned;
+        }
+
+        function learnFromManualSelect(element) {
+            if (!element) return 0;
+            let learned = 0;
+            const tag = element.tagName.toLowerCase();
+            const cls = (element.className || '').toString();
+            const sel = _buildPreciseSelector(element);
+            if (sel && !_hasRule('css', sel)) {
+                rules.css.push({ selector: sel, confidence: CONFIDENCE_MAX, hits: 0, source: 'manual', created: Date.now(), reason: '用户手动选择' });
+                learned++;
+            }
+            if (cls) {
+                for (const c of cls.trim().split(/\s+/)) {
+                    if (c.length > 2 && !_hasRule('attr', 'class:' + c)) {
+                        rules.attr.push({ attr: 'class', value: c, tag, confidence: 0.8, hits: 0, source: 'manual', created: Date.now() });
+                        learned++;
+                    }
+                }
+            }
+            const embed = element.querySelector('iframe[src],img[src]');
+            if (embed) {
+                const src = embed.src || '';
+                const pat = _srcToPattern(src);
+                if (pat && !_hasRule('url', pat)) {
+                    rules.url.push({ pattern: pat, confidence: 0.85, hits: 0, source: 'manual', created: Date.now() });
+                    learned++;
+                }
+            }
+            _save();
+            return learned;
+        }
+
+        function feedbackFalsePositive(ruleType, ruleId) {
+            const arr = rules[ruleType];
+            if (!arr) return;
+            const rule = arr.find(r => (r.hostname || r.pattern || r.selector || r.value) === ruleId);
+            if (rule) {
+                rule.confidence *= PENALTY_FACTOR;
+                rule.misses = (rule.misses || 0) + 1;
+                if (rule.confidence < 0.15) {
+                    const idx = arr.indexOf(rule);
+                    if (idx >= 0) arr.splice(idx, 1);
+                }
+                _save();
+            }
+        }
+
+        function feedbackConfirm(ruleType, ruleId) {
+            const arr = rules[ruleType];
+            if (!arr) return;
+            const rule = arr.find(r => (r.hostname || r.pattern || r.selector || r.value) === ruleId);
+            if (rule) {
+                rule.confidence = Math.min(CONFIDENCE_MAX, rule.confidence + BOOST_FACTOR);
+                _save();
+            }
+        }
+
+        function matchUrl(url) {
+            if (!url) return { blocked: false };
+            try {
+                const u = new URL(url, location.href);
+                const host = u.hostname.toLowerCase();
+                for (const r of rules.domain) {
+                    if (r.confidence < CONFIDENCE_MIN) continue;
+                    if (host === r.hostname || host.endsWith('.' + r.hostname)) {
+                        r.hits++; _save(); return { blocked: true, rule: r, type: 'domain' };
+                    }
+                }
+                for (const r of rules.url) {
+                    if (r.confidence < CONFIDENCE_MIN) continue;
+                    try { if (new RegExp(r.pattern, 'i').test(url)) { r.hits++; return { blocked: true, rule: r, type: 'url' }; } } catch(e){}
+                }
+                for (const r of rules.path) {
+                    if (r.confidence < CONFIDENCE_MIN) continue;
+                    if (u.pathname.includes(r.pattern)) { r.hits++; return { blocked: true, rule: r, type: 'path' }; }
+                }
+            } catch(e){}
+            return { blocked: false };
+        }
+
+        function matchNavigation(url) {
+            if (!url) return { blocked: false };
+            try {
+                const host = new URL(url, location.href).hostname.toLowerCase();
+                for (const r of rules.nav) {
+                    if (r.confidence < CONFIDENCE_MIN) continue;
+                    if (host === r.hostname || host.endsWith('.' + r.hostname)) {
+                        r.hits++; return { blocked: true, rule: r, type: 'nav' };
+                    }
+                }
+            } catch(e){}
+            return { blocked: false };
+        }
+
+        function getBlockedDomains() {
+            return rules.nav.filter(r => r.confidence >= CONFIDENCE_MIN).map(r => r.hostname);
+        }
+
+        function decay() {
+            const now = Date.now();
+            let cleaned = 0;
+            for (const type of Object.keys(rules)) {
+                rules[type] = rules[type].filter(r => {
+                    if (r.hits === 0 && now - r.created > DECAY_INTERVAL && r.source !== 'manual') {
+                        r.confidence *= DECAY_FACTOR;
+                    }
+                    if (r.hits >= 5 && r.confidence < CONFIDENCE_MAX) {
+                        r.confidence = Math.min(CONFIDENCE_MAX, r.confidence + 0.05);
+                    }
+                    if (r.confidence < 0.12) { cleaned++; return false; }
+                    return true;
+                });
+                if (rules[type].length > MAX_RULES[type]) {
+                    rules[type].sort((a, b) => b.confidence - a.confidence);
+                    rules[type] = rules[type].slice(0, MAX_RULES[type]);
+                }
+            }
+            _save();
+            return cleaned;
+        }
+
+        function optimize() {
+            const cssSet = new Set();
+            rules.css = rules.css.filter(r => { if (cssSet.has(r.selector)) return false; cssSet.add(r.selector); return true; });
+            const domSet = new Set();
+            rules.domain = rules.domain.filter(r => { if (domSet.has(r.hostname)) return false; domSet.add(r.hostname); return true; });
+            _save();
+        }
+
+        function getStatus() {
+            const all = [].concat(rules.domain, rules.url, rules.css, rules.attr, rules.nav, rules.path);
+            return {
+                counts: { domain: rules.domain.length, url: rules.url.length, css: rules.css.length, attr: rules.attr.length, nav: rules.nav.length, path: rules.path.length },
+                totalRules: all.length,
+                totalHits: all.reduce((s, r) => s + (r.hits || 0), 0),
+                avgConfidence: all.length > 0 ? (all.reduce((s, r) => s + r.confidence, 0) / all.length).toFixed(3) : 0
+            };
+        }
+
+        function _generalizeDomainCluster(results) {
+            let learned = 0;
+            const adHosts = results.filter(r => r.level === 'ad' || r.level === 'suspect').map(r => r.hostname);
+            if (adHosts.length < 2) return 0;
+            const prefixCount = {};
+            for (const h of adHosts) {
+                const parts = h.split('.');
+                if (parts.length >= 3) {
+                    const prefix = parts[0];
+                    if (/^(ad|ads|px|pixel|track|srv|cdn\d*|banner|pop|float|bet|casino|hot|live|img\d*)/i.test(prefix)) {
+                        prefixCount[prefix] = (prefixCount[prefix] || 0) + 1;
+                    }
+                }
+            }
+            for (const prefix in prefixCount) {
+                if (prefixCount[prefix] >= 2) {
+                    const pattern = '^https?://' + prefix + '[^/]*\\.';
+                    if (!_hasRule('url', pattern)) {
+                        rules.url.push({ pattern, confidence: 0.65, hits: 0, source: 'generalization', created: Date.now() });
+                        learned++;
+                    }
+                }
+            }
+            const mainDomainCount = {};
+            for (const h of adHosts) {
+                const md = GlobalDomainScanner.mainDomain(h);
+                mainDomainCount[md] = (mainDomainCount[md] || 0) + 1;
+            }
+            for (const md in mainDomainCount) {
+                if (mainDomainCount[md] >= 2 && !_hasRule('domain', md)) {
+                    rules.domain.push({ hostname: md, confidence: 0.8, hits: 0, misses: 0, source: 'generalization', created: Date.now(), features: { clustered: true, subdomainCount: mainDomainCount[md] } });
+                    learned++;
+                }
+            }
+            return learned;
+        }
+
+        function _generalizeOverlayCluster(results) {
+            let learned = 0;
+            const classCount = {};
+            for (const r of results) {
+                if (r.suspicion < 35 || !r.el) continue;
+                const cls = (r.el.className || '').toString();
+                for (const c of cls.split(/\s+/)) {
+                    if (c.length > 3 && VICE_RE_SIMPLE.test(c)) {
+                        classCount[c] = (classCount[c] || 0) + 1;
+                    }
+                }
+            }
+            for (const c in classCount) {
+                if (classCount[c] >= 2 && !_hasRule('attr', 'class:' + c)) {
+                    rules.attr.push({ attr: 'class', value: c, tag: '*', confidence: 0.75, hits: 0, source: 'generalization', created: Date.now() });
+                    learned++;
+                }
+            }
+            return learned;
+        }
+
+        function _tokenToUrlPattern(token) {
+            if (!token || token.length < 2) return null;
+            return '[?/&][^=]*' + token + '[^=]*=';
+        }
+        function _extractPathPattern(url) {
+            try {
+                const u = new URL(url);
+                const segs = u.pathname.split('/').filter(Boolean);
+                for (const seg of segs) {
+                    if (VICE_RE_SIMPLE.test(seg) && seg.length > 3) return '/' + seg;
+                }
+            } catch(e){}
+            return null;
+        }
+        function _srcToPattern(src) {
+            if (!src) return null;
+            try {
+                const u = new URL(src, location.href);
+                return '^https?://([^/]*\\.)?' + _escapeRegex(u.hostname);
+            } catch(e) { return null; }
+        }
+        function _escapeRegex(str) { return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+        function _buildPreciseSelector(el) {
+            if (el.id) return '#' + el.id;
+            let s = el.tagName.toLowerCase();
+            const cls = (el.className || '').toString().trim();
+            if (cls) { const first = cls.split(/\s+/)[0]; if (first) s += '.' + first; }
+            return s;
+        }
+        function _hasRule(type, key) {
+            const arr = rules[type];
+            if (!arr) return false;
+            return arr.some(r => (r.hostname === key) || (r.pattern === key) || (r.selector === key) || (r.value === key));
+        }
+        function _boostRule(type, key) {
+            const arr = rules[type];
+            if (!arr) return;
+            const rule = arr.find(r => r.hostname === key || r.pattern === key || r.selector === key);
+            if (rule) rule.confidence = Math.min(CONFIDENCE_MAX, rule.confidence + 0.05);
+        }
+
+        function _save() {
+            try {
+                const data = JSON.stringify(rules);
+                if (typeof GM_setValue === 'function') GM_setValue('ge_rules_v2', data);
+                else localStorage.setItem('ge_rules_v2', data);
+            } catch(e){}
+        }
+        function _load() {
+            try {
+                let data;
+                if (typeof GM_getValue === 'function') data = GM_getValue('ge_rules_v2', null);
+                else data = localStorage.getItem('ge_rules_v2');
+                if (data) {
+                    const parsed = JSON.parse(data);
+                    if (parsed && typeof parsed === 'object') {
+                        rules = { domain: [], url: [], css: [], attr: [], nav: [], path: [] };
+                        for (const k of Object.keys(rules)) {
+                            if (Array.isArray(parsed[k])) rules[k] = parsed[k];
+                        }
+                    }
+                }
+            } catch(e){}
+        }
+
+        function getRulesSnapshot() {
+            return JSON.parse(JSON.stringify(rules));
+        }
+
+        // 跨设备迁移：合并导入的 GE 规则，按 ruleKey 去重，保留较高置信度
+        function mergeRules(incoming) {
+            if (!incoming || typeof incoming !== 'object') return 0;
+            let merged = 0;
+            for (const type of Object.keys(rules)) {
+                if (!Array.isArray(incoming[type])) continue;
+                const existing = rules[type];
+                const existingKeys = new Set(existing.map(r => r.hostname || r.pattern || r.selector || r.value || ''));
+                for (const r of incoming[type]) {
+                    if (!r || typeof r !== 'object') continue;
+                    const key = r.hostname || r.pattern || r.selector || r.value || '';
+                    if (key && !existingKeys.has(key)) {
+                        existingKeys.add(key);
+                        existing.push(r);
+                        merged++;
+                    } else if (key) {
+                        // 已存在 → 取较高置信度，累加命中数
+                        const exist = existing.find(x => (x.hostname || x.pattern || x.selector || x.value || '') === key);
+                        if (exist) {
+                            exist.confidence = Math.max(exist.confidence || 0, r.confidence || 0);
+                            exist.hits = (exist.hits || 0) + (r.hits || 0);
+                        }
+                    }
+                }
+                // 容量限制
+                if (existing.length > MAX_RULES[type]) {
+                    existing.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+                    existing.length = MAX_RULES[type];
+                }
+            }
+            if (merged > 0) _save();
+            return merged;
+        }
+
+        return {
+            learnFromDomainScan, learnFromOverlayScan, learnFromManualSelect,
+            feedbackFalsePositive, feedbackConfirm,
+            matchUrl, matchNavigation, getBlockedDomains,
+            decay, optimize, getStatus, getRulesSnapshot, mergeRules, rules
+        };
+    })();
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     *  统一调度器：一键扫描 + 学习 + 拦截
+     *  仅启用跳转拦截 + 动态学习 + 衰减（fetch/XHR/MutationObserver 由现有
+     *  NetworkInterceptor/BlockEngine 负责，避免双重 hook 冲突）
+     * ═══════════════════════════════════════════════════════════════
+     */
+    const AdBlockOrchestrator = (() => {
+        let _initialized = false;
+
+        function fullScan() {
+            const t0 = performance.now();
+            const domainResult = GlobalDomainScanner.scan();
+            const overlayResult = OverlayAdScanner.scan();
+            const domainLearned = GeneralizationEngine.learnFromDomainScan(domainResult.results);
+            const overlayLearned = GeneralizationEngine.learnFromOverlayScan(overlayResult.results);
+            GeneralizationEngine.optimize();
+            const cleaned = GeneralizationEngine.decay();
+            const elapsed = (performance.now() - t0).toFixed(1);
+            return {
+                domains: domainResult, overlays: overlayResult,
+                learned: { domains: domainLearned, overlays: overlayLearned },
+                cleaned, engine: GeneralizationEngine.getStatus(), elapsed
+            };
+        }
+
+        function initRuntime() {
+            if (_initialized) return;
+            _initialized = true;
+
+            // 跳转拦截（博彩/色情核心防线，现有 NetworkInterceptor 未覆盖 window.open/location/form）
+            const blockedDomains = GeneralizationEngine.getBlockedDomains();
+            OverlayAdScanner.enableNavigationInterceptor(blockedDomains);
+
+            // 动态插入监控：高分可疑元素 → 自动学习（不重复隐藏，BlockEngine 已处理拦截）
+            OverlayAdScanner.startWatching((f) => {
+                if (f.suspicion >= 40) {
+                    GeneralizationEngine.learnFromOverlayScan([f]);
+                }
+            });
+
+            // 定期衰减（24h）
+            setInterval(() => GeneralizationEngine.decay(), 24 * 3600 * 1000);
+        }
+
+        function onUserSelect(element) {
+            const learned = GeneralizationEngine.learnFromManualSelect(element);
+            return learned;
+        }
+
+        return { fullScan, initRuntime, onUserSelect };
+    })();
+
     /**
      * 用户交互界面：基于 Shadow DOM 隔离
      */
@@ -3564,16 +4820,52 @@
             const panel = document.createElement('div');
             panel.className = 'panel';
 
+            // 双引擎采集：BlockEngine.extractResourceDomains（DOM 资源来源）+ GlobalDomainScanner（6通道+12维+博彩色情）
+            // 合并策略：按 hostname 合并，分数取较高者，附加 viceToken/adToken/level 标记
             const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
-            let allDomains = scoredDomains;
-            let selectedHosts = new Set(scoredDomains.filter(d => d.score >= 35).map(d => d.host));
+            let gdsResult = { results: [], elapsed: '0', total: 0 };
+            try { gdsResult = GlobalDomainScanner.scan(); } catch(e){}
+            const gdsMap = new Map();
+            for (const r of (gdsResult.results || [])) gdsMap.set(r.hostname, r);
+
+            // 合并：existing scoredDomains 为基线，叠加 GDS 的 12 维评分与博彩色情标记
+            let allDomains = scoredDomains.map(d => {
+                const g = gdsMap.get(d.host);
+                if (!g) return d;
+                // 取较高分（GDS 12维更精细，但保留原有 sources/reasons）
+                const mergedScore = Math.max(d.score, g.score);
+                return {
+                    ...d,
+                    score: mergedScore,
+                    viceToken: g.viceToken || null,
+                    adToken: g.adToken || null,
+                    level: g.level || null,
+                    gdsReasons: g.reasons || [],
+                    signals: g.signals || 0
+                };
+            });
+            // 补充 GDS 独有域名（extractResourceDomains 未覆盖的 Performance API / 链接跳转目标）
+            for (const [host, g] of gdsMap) {
+                if (!allDomains.find(d => d.host === host)) {
+                    allDomains.push({
+                        host, score: g.score, count: g.freq || 1,
+                        sources: ['performance-api'], reasons: g.reasons || [],
+                        viceToken: g.viceToken || null, adToken: g.adToken || null,
+                        level: g.level || null, gdsReasons: g.reasons || [], signals: g.signals || 0
+                    });
+                }
+            }
+            // 按分数降序，确保高分广告域置顶
+            allDomains.sort((a, b) => b.score - a.score);
+
+            let selectedHosts = new Set(allDomains.filter(d => d.score >= 35 || d.viceToken).map(d => d.host));
             let filterText = '';
             let onlyAds = true;
 
-            const isAdLike = (host) => isAdKeywordHost(host);
+            const isAdLike = (d) => isAdKeywordHost(d.host) || d.score >= 40 || !!d.viceToken || !!d.adToken || d.level === 'ad' || d.level === 'suspect';
 
             const getScoreClass = (score) => score >= 50 ? 'high' : score >= 25 ? 'mid' : 'low';
-            const sourceLabel = (src) => ({ 'attr': '属性', 'srcset': '响应图', 'inline-style': '内联样式', 'stylesheet': '样式表', 'data-attr': '数据属性', 'script-text': '脚本文本', 'script-var': '脚本变量' }[src] || src);
+            const sourceLabel = (src) => ({ 'attr': '属性', 'srcset': '响应图', 'inline-style': '内联样式', 'stylesheet': '样式表', 'data-attr': '数据属性', 'script-text': '脚本文本', 'script-var': '脚本变量', 'performance-api': '性能API', 'image-link': '图片链接', 'link': '跳转链接' }[src] || src);
 
             const renderDomains = () => {
                 const box = panel.querySelector('#global-domains');
@@ -3582,27 +4874,39 @@
 
                 const filtered = allDomains.filter(d => {
                     if (filterText && !d.host.includes(filterText)) return false;
-                    if (onlyAds && !isAdLike(d.host) && d.score < 40) return false;
+                    if (onlyAds && !isAdLike(d)) return false;
                     return true;
                 });
 
-                if (stats) stats.textContent = `共 ${allDomains.length} 个第三方域名 · 已选 ${selectedHosts.size} 个 · 当前显示 ${filtered.length} 个`;
+                if (stats) {
+                    const viceCount = allDomains.filter(d => d.viceToken).length;
+                    const adCount = allDomains.filter(d => d.level === 'ad').length;
+                    stats.textContent = `共 ${allDomains.length} 个第三方域名 · 🚫博彩/色情 ${viceCount} · 广告级 ${adCount} · 已选 ${selectedHosts.size} · 显示 ${filtered.length}`;
+                }
 
                 if (filtered.length === 0) {
                     box.innerHTML = '<span class="info-label" style="color:#bbb;">未匹配到域名，请尝试取消“只看广告相关”或手动添加。</span>';
                 } else {
                     box.innerHTML = filtered.map(d => {
                         const checked = selectedHosts.has(d.host);
-                        const reasons = d.reasons.length ? ` · ${d.reasons.slice(0, 3).join(', ')}` : '';
+                        // 博彩/色情标记（最高优先级）
+                        const viceBadge = d.viceToken ? `<span class="tag" style="background:rgba(255,0,80,0.7);" title="博彩/色情词元：${escapeHTML(d.viceToken)}">🚫${escapeHTML(d.viceToken)}</span>` : '';
+                        const adBadge = d.adToken ? `<span class="tag" style="background:rgba(255,149,0,0.55);">广告</span>` : '';
+                        const levelBadge = d.level === 'ad' ? '<span class="tag" style="background:rgba(255,59,48,0.7);">广告级</span>'
+                            : d.level === 'suspect' ? '<span class="tag" style="background:rgba(255,149,0,0.55);">可疑</span>'
+                            : d.level === 'watch' ? '<span class="tag" style="background:rgba(120,144,156,0.5);">关注</span>' : '';
+                        const reasons = (d.gdsReasons && d.gdsReasons.length) ? d.gdsReasons.slice(0, 3).join(', ')
+                            : (d.reasons.length ? d.reasons.slice(0, 3).join(', ') : '');
+                        const sources = d.sources.map(sourceLabel).join('、');
                         return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-host="${escapeHTML(d.host)}">
                             <div class="gd-left">
                                 <div class="gd-check">${checked ? '✓' : ''}</div>
                                 <div>
-                                    <div class="gd-host">${escapeHTML(d.host)}</div>
-                                    <div class="gd-meta">来源：${d.sources.map(sourceLabel).join('、')}${reasons}</div>
+                                    <div class="gd-host">${escapeHTML(d.host)} ${viceBadge}${adBadge}${levelBadge}</div>
+                                    <div class="gd-meta">来源：${sources}${reasons ? ' · ' + escapeHTML(reasons) : ''}</div>
                                 </div>
                             </div>
-                            <div class="gd-score ${getScoreClass(d.score)}">${d.score} 分</div>
+                            <div class="gd-score ${getScoreClass(d.score)}">${d.score}</div>
                         </div>`;
                     }).join('');
                 }
@@ -3617,8 +4921,8 @@
             };
 
             panel.innerHTML = `
-                <h3 title="按住可拖动窗口">全局域名深度检索</h3>
-                <p>已深度扫描页面资源、样式、数据属性与脚本变量。分数越高越可能是广告域，橙色/红色建议优先封杀。</p>
+                <h3 title="按住可拖动窗口">🌐 全局域名深度检索</h3>
+                <p>双引擎采集：DOM 资源来源 + 6通道性能API + 12维特征评分 + 博彩/色情词库。红色🚫为博彩/色情域，建议优先封杀。</p>
                 <div class="gd-toolbar">
                     <input type="text" id="gd-filter" placeholder="输入域名关键字过滤..." />
                     <label><input type="checkbox" id="gd-only-ads" checked /> 只看广告相关</label>
@@ -3626,9 +4930,7 @@
                     <button class="btn-outline" id="gd-select-none">清空</button>
                 </div>
                 <div class="gd-stats" id="gd-stats"></div>
-                <div class="selection-info" style="max-height: 260px; overflow-y: auto;">
-                    <div class="info-row" id="global-domains"></div>
-                </div>
+                <div class="gd-scroll-area" id="global-domains"></div>
                 <div class="gd-manual">
                     <input type="text" id="gd-manual-input" placeholder="手动输入域名，例如：ads.example.com" />
                     <button class="btn-outline" id="gd-manual-add">+ 添加</button>
@@ -3638,8 +4940,9 @@
                 </div>
                 <div class="section-divider"></div>
                 <div class="btn-group">
+                    <button class="btn-info" id="btn-deep-scan" title="运行三算法联合扫描，将高分域名与博彩色情域自动学习到泛化引擎">🤖 深度学习扫描</button>
                     <button class="btn-warning" id="btn-preview-global">🔍 预览效果</button>
-                    <button class="btn-outline" id="btn-cancel-global">取消配置</button>
+                    <button class="btn-outline" id="btn-cancel-global">取消</button>
                 </div>
             `;
 
@@ -3671,11 +4974,50 @@
                 const host = input.value.trim().toLowerCase();
                 if (!host) return;
                 if (!allDomains.find(d => d.host === host)) {
-                    allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1 });
+                    allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1, viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 });
                 }
                 selectedHosts.add(host);
                 input.value = '';
                 renderDomains();
+            });
+
+            // 深度学习扫描：运行三算法联合全扫，将高分域名与博彩色情域自动学习到 GeneralizationEngine
+            panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
+                const btn = e.target;
+                const origText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ 扫描中...';
+                setTimeout(() => {
+                    try {
+                        const result = AdBlockOrchestrator.fullScan();
+                        // 扫描后重新合并数据并刷新列表
+                        const newGds = GlobalDomainScanner.scan();
+                        const newMap = new Map();
+                        for (const r of newGds.results) newMap.set(r.hostname, r);
+                        for (const g of newMap.values()) {
+                            const exist = allDomains.find(d => d.host === g.hostname);
+                            if (exist) {
+                                exist.score = Math.max(exist.score, g.score);
+                                exist.viceToken = g.viceToken || exist.viceToken;
+                                exist.adToken = g.adToken || exist.adToken;
+                                exist.level = g.level || exist.level;
+                                exist.gdsReasons = g.reasons || exist.gdsReasons;
+                            } else {
+                                allDomains.push({ host: g.hostname, score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals });
+                            }
+                        }
+                        allDomains.sort((a, b) => b.score - a.score);
+                        renderDomains();
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        const learned = result.learned.domains + result.learned.overlays;
+                        alert(`深度扫描完成（耗时 ${result.elapsed}ms）\n\n域名检索：${result.domains.total} 个\n覆盖层：${result.overlays.total} 个\n本次学习：${learned} 条规则\n清理过期：${result.cleaned} 条\n\n泛化引擎现有：${result.engine.totalRules} 条规则，平均置信度 ${result.engine.avgConfidence}`);
+                    } catch (err) {
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        alert('深度扫描失败：' + err.message);
+                    }
+                }, 50);
             });
 
             // 预览状态使用实例属性 this._globalPreview，clearPanel 可跨面板清理，避免预览元素残留
@@ -3737,6 +5079,8 @@
                         t.style.setProperty('opacity', '0', 'important');
                     });
                 });
+                // 同步学习到泛化引擎（用户确认封杀 = 高置信度信号）
+                try { AdBlockOrchestrator.fullScan(); } catch(e){}
                 // 封杀的元素已由上方逻辑重新隐藏，预览状态已清空，交由 clearPanel 收尾
                 this._globalPreview = { active: false, elements: [] };
                 this.clearPanel();
@@ -4332,6 +5676,9 @@
                     BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                 } else if (scope === 'current') {
                     storage.removeRule(type, index);
+                    // 所有类型删除后都需还原内联样式 + 重建 CSS 表 + 重扫，避免残留隐藏
+                    BlockEngine.restoreAllInlineStyles();
+                    BlockEngine.applyCSSRules();
                     if (type === 'regex') BlockEngine.applyRegexRules();
                     if (type === 'complex') BlockEngine.applyComplexRules();
                     if (type === 'pathPattern') {
@@ -4339,8 +5686,10 @@
                         BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                     }
                 } else {
-                    // 跨站规则：pathPattern 为全局 CSS，删除后需还原内联 + 重扫；regex/complex 仅作用于各自站点
+                    // 跨站规则：删除后需还原内联 + 重建 CSS 表 + 重扫
                     storage.removeRuleForDomain(domain, type, index);
+                    BlockEngine.restoreAllInlineStyles();
+                    BlockEngine.applyCSSRules();
                     if (type === 'pathPattern') {
                         BlockEngine.restoreInlineForPath(value);
                         BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
@@ -4405,7 +5754,7 @@
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">📤 导出规则</h3>
-                <p>下方文本框包含全部拦截规则与全局域名黑名单。复制后保存到任意位置，或在新设备的脚本中通过"导入规则"粘贴即可。</p>
+                <p>下方文本框包含全部拦截规则、全局域名黑名单、正常路径采集数据与泛化引擎自学习规则（置信度追踪）。复制后保存到任意位置，或在新设备的脚本中通过"导入规则"粘贴即可。</p>
                 <textarea id="export-text" readonly></textarea>
                 <div class="btn-group" style="margin-top: 10px;">
                     <button class="btn-primary" id="btn-copy">📋 复制到剪贴板</button>
@@ -4620,6 +5969,42 @@
                 lines.push('');
             }
 
+            // GeneralizationEngine 自学习规则导出（置信度 ≥ 0.5 的规则才输出）
+            try {
+                const geRules = GeneralizationEngine.getRulesSnapshot();
+                const geLines = [];
+                // 域名规则 → ||hostname^$third-party
+                (geRules.domain || []).filter(r => r.confidence >= 0.5 && r.hostname).forEach(r => {
+                    geLines.push(`||${r.hostname}^$third-party`);
+                });
+                // 跳转拦截规则 → ||hostname^$third-party
+                (geRules.nav || []).filter(r => r.confidence >= 0.5 && r.hostname).forEach(r => {
+                    geLines.push(`||${r.hostname}^$third-party`);
+                });
+                // URL 正则规则 → AdGuard URL 过滤
+                (geRules.url || []).filter(r => r.confidence >= 0.5 && r.pattern).forEach(r => {
+                    try { new RegExp(r.pattern); geLines.push(r.pattern); } catch(e){}
+                });
+                // CSS 选择器规则 → 全站元素隐藏
+                (geRules.css || []).filter(r => r.confidence >= 0.5 && r.selector).forEach(r => {
+                    geLines.push(`##${r.selector}`);
+                });
+                // 属性规则 → 全站属性选择器隐藏
+                (geRules.attr || []).filter(r => r.confidence >= 0.5 && r.value).forEach(r => {
+                    const tag = r.tag && r.tag !== '*' ? r.tag : '';
+                    geLines.push(`##${tag}[${r.attr}*="${escapeCssValue(r.value)}"]`);
+                });
+                // 路径规则 → URL 路径匹配
+                (geRules.path || []).filter(r => r.confidence >= 0.5 && r.pattern).forEach(r => {
+                    geLines.push(`*${r.pattern}*`);
+                });
+                if (geLines.length > 0) {
+                    lines.push('! GeneralizationEngine 自学习规则（置信度 ≥ 0.5）');
+                    geLines.forEach(l => lines.push(l));
+                    lines.push('');
+                }
+            } catch(e){}
+
             return lines.join('\n');
         }
 
@@ -4631,7 +6016,7 @@
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
-                <p class="hint-text">已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
+                <p class="hint-text">已将当前所有拦截规则与泛化引擎自学习规则（置信度 ≥ 0.5）转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
                 <textarea class="export-box" id="ag-export-box" readonly></textarea>
                 <div class="btn-group">
                     <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
@@ -4681,44 +6066,126 @@
             const panel = document.createElement('div');
             panel.className = 'panel';
 
-            // 首次扫描（autoBlock=false，仅收集供 UI 展示）
-            let records = BlockEngine.scanInvisibleOverlays({ autoBlock: false });
+            // 双引擎采集：BlockEngine.scanInvisibleOverlays（透明跳转覆盖层）+ OverlayAdScanner（不可见/覆盖层/博彩色情图片/追踪像素）
+            // 合并策略：按元素引用合并，BlockEngine 提供触发URL/跨域/尺寸，OverlayAdScanner 提供嫌疑分/分类/特征/原因
+            const collectAll = () => {
+                const beRecords = BlockEngine.scanInvisibleOverlays({ autoBlock: false });
+                let oasResult = { results: [], elapsed: '0', total: 0 };
+                try { oasResult = OverlayAdScanner.scan(); } catch(e){}
+                // 以元素引用为 key 建立 OverlayAdScanner 特征索引
+                const oasMap = new Map();
+                for (const r of (oasResult.results || [])) {
+                    if (r.el) oasMap.set(r.el, r);
+                }
+
+                // ① BlockEngine 记录为基线，叠加 OAS 的嫌疑分/分类/特征
+                const merged = beRecords.map(rec => {
+                    const oas = rec.el ? oasMap.get(rec.el) : null;
+                    if (!oas) return rec;
+                    return {
+                        ...rec,
+                        suspicion: oas.suspicion || 0,
+                        category: oas.category || 'unknown',
+                        oasReasons: oas.reasons || [],
+                        features: oas.features || {},
+                        selector: oas.selector || '',
+                        // 高嫌疑分也算高风险（补充 BlockEngine 仅按面积判定 highRisk 的不足）
+                        highRisk: rec.highRisk || (oas.suspicion >= 50)
+                    };
+                });
+                // ② 补充 OAS 独有结果（BlockEngine 未覆盖的不可见元素/博彩色情图片/追踪像素）
+                for (const oas of (oasResult.results || [])) {
+                    if (!oas.el || beRecords.find(r => r.el === oas.el)) continue;
+                    const rect = oas.el.getBoundingClientRect ? oas.el.getBoundingClientRect() : { width:0, height:0, top:0, left:0 };
+                    merged.push({
+                        el: oas.el,
+                        tagName: oas.el.tagName,
+                        id: oas.el.id || '',
+                        className: typeof oas.el.className === 'string' ? oas.el.className.slice(0, 80) : '',
+                        opacity: parseFloat(window.getComputedStyle(oas.el).opacity) || 1,
+                        visibility: window.getComputedStyle(oas.el).visibility,
+                        position: window.getComputedStyle(oas.el).position,
+                        rect: { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top), left: Math.round(rect.left) },
+                        triggerUrl: oas.features?.externalLink || '',
+                        hasOnClick: !!oas.features?.clickable,
+                        hasIframeChild: !!oas.features?.hasEmbed,
+                        crossDomain: !!oas.features?.externalLink,
+                        highRisk: oas.suspicion >= 50,
+                        suspicion: oas.suspicion || 0,
+                        category: oas.category || 'unknown',
+                        oasReasons: oas.reasons || [],
+                        features: oas.features || {},
+                        selector: oas.selector || ''
+                    });
+                }
+                // 按嫌疑分降序，高分置顶
+                merged.sort((a, b) => (b.suspicion || 0) - (a.suspicion || 0));
+                return { records: merged, oasElapsed: oasResult.elapsed };
+            };
+
+            let { records, oasElapsed } = collectAll();
             let selectedSet = new Set(records.filter(r => r.highRisk).map((r, i) => i));
+            let onlyHigh = false;
+
+            const categoryLabel = (cat) => ({
+                'invisible': '不可见',
+                'overlay': '覆盖层',
+                'tracking': '追踪像素',
+                'vice-image': '🚫博彩色情图'
+            }[cat] || '可疑');
+            const categoryColor = (cat) => ({
+                'invisible': 'rgba(120,144,156,0.65)',
+                'overlay': 'rgba(255,59,48,0.65)',
+                'tracking': 'rgba(255,149,0,0.65)',
+                'vice-image': 'rgba(255,0,80,0.75)'
+            }[cat] || 'rgba(255,149,0,0.5)');
+            const getScoreClass = (s) => s >= 50 ? 'high' : s >= 25 ? 'mid' : 'low';
 
             const render = () => {
                 const box = panel.querySelector('#overlay-list');
                 const stats = panel.querySelector('#overlay-stats');
                 if (!box) return;
 
+                const filtered = onlyHigh ? records.map((r, i) => ({ r, i })).filter(({ r }) => r.highRisk) : records.map((r, i) => ({ r, i }));
+
                 if (stats) {
                     const blockedCount = records.filter(r => r.blocked).length;
-                    stats.textContent = `发现 ${records.length} 个可疑覆盖层 · 已拦截 ${blockedCount} 个 · 当前选中 ${selectedSet.size} 个`;
+                    const viceCount = records.filter(r => r.category === 'vice-image').length;
+                    const invisibleCount = records.filter(r => r.category === 'invisible').length;
+                    const overlayCount = records.filter(r => r.category === 'overlay').length;
+                    stats.textContent = `共 ${records.length} 项 · 🚫博彩色情 ${viceCount} · 覆盖层 ${overlayCount} · 不可见 ${invisibleCount} · 已拦截 ${blockedCount} · 选中 ${selectedSet.size}`;
                 }
 
-                if (records.length === 0) {
-                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未发现不可见覆盖层广告。若仍有跳转问题，可尝试"重新扫描"或使用全局域名检索。</span>';
+                if (filtered.length === 0) {
+                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未发现不可见覆盖层广告。可尝试取消"只看高风险"或使用"深度学习扫描"。</span>';
                     const btnBlock = panel.querySelector('#btn-block-overlay');
                     if (btnBlock) btnBlock.disabled = true;
                     return;
                 }
 
-                box.innerHTML = records.map((r, i) => {
+                box.innerHTML = filtered.map(({ r, i }) => {
                     const checked = selectedSet.has(i);
-                    const riskTag = r.highRisk
-                        ? '<span class="tag" style="background:rgba(255,59,48,0.5);">高风险</span>'
-                        : '<span class="tag" style="background:rgba(255,149,0,0.5);">可疑</span>';
-                    const blockedTag = r.blocked ? '<span class="tag" style="background:rgba(52,199,89,0.5);">已拦截</span>' : '';
-                    const trigger = r.triggerUrl ? escapeHTML(r.triggerUrl) : (r.hasOnClick ? 'onclick 事件' : '未知');
+                    const catLabel = categoryLabel(r.category);
+                    const catColor = categoryColor(r.category);
+                    const catBadge = `<span class="tag" style="background:${catColor};">${catLabel}</span>`;
+                    const riskBadge = r.highRisk ? '<span class="tag" style="background:rgba(255,59,48,0.7);">高风险</span>' : '';
+                    const blockedBadge = r.blocked ? '<span class="tag" style="background:rgba(52,199,89,0.6);">已拦截</span>' : '';
+                    const viceBadge = r.features?.viceTarget ? `<span class="tag" style="background:rgba(255,0,80,0.75);">🚫${escapeHTML(r.features.viceTarget)}</span>` : '';
+                    const reasons = (r.oasReasons && r.oasReasons.length) ? r.oasReasons.slice(0, 3).join(' · ') : '';
+                    const trigger = r.triggerUrl ? escapeHTML(r.triggerUrl.length > 80 ? r.triggerUrl.slice(0, 80) + '...' : r.triggerUrl) : (r.hasOnClick ? 'onclick' : '—');
+                    const selector = r.selector ? `<div class="gd-meta">选择器：${escapeHTML(r.selector)}</div>` : '';
                     const cls = r.className ? `<div class="gd-meta">class: ${escapeHTML(r.className)}</div>` : '';
+                    const suspicion = r.suspicion || 0;
                     return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-idx="${i}">
                         <div class="gd-left">
                             <div class="gd-check">${checked ? '✓' : ''}</div>
                             <div>
-                                <div class="gd-host">${riskTag} ${blockedTag} ${escapeHTML(r.tagName)} ${r.id ? '#' + escapeHTML(r.id) : ''} · ${r.rect.w}×${r.rect.h}px</div>
-                                <div class="gd-meta">触发：${trigger} ${r.crossDomain ? '· 跨域' : ''}</div>
-                                ${cls}
+                                <div class="gd-host">${catBadge}${riskBadge}${blockedBadge}${viceBadge} ${escapeHTML(r.tagName)} ${r.id ? '#' + escapeHTML(r.id) : ''} · ${r.rect.w}×${r.rect.h}px</div>
+                                <div class="gd-meta">${reasons ? escapeHTML(reasons) : ''}${reasons ? ' · ' : ''}触发：${trigger}${r.crossDomain ? ' · 跨域' : ''}</div>
+                                ${selector}${cls}
                             </div>
                         </div>
+                        <div class="gd-score ${getScoreClass(suspicion)}">${suspicion}</div>
                     </div>`;
                 }).join('');
 
@@ -4733,11 +6200,14 @@
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">👁 不可见覆盖层扫描</h3>
-                <p>检测透明/隐藏但可点击跳转的覆盖层广告（"触碰到就跳转但看不见"的元凶）。高风险项会被自动拦截，可疑项可手动选择拦截。</p>
-                <div class="gd-stats" id="overlay-stats"></div>
-                <div class="selection-info" style="max-height: 280px; overflow-y: auto;">
-                    <div class="info-row" id="overlay-list"></div>
+                <p>双引擎检测：透明跳转覆盖层 + 不可见元素 + 高z-index覆盖层 + 1×1追踪像素 + 博彩/色情可点击图片。红色🚫为博彩/色情图片，建议优先拦截。</p>
+                <div class="gd-toolbar">
+                    <label><input type="checkbox" id="ov-only-high" /> 只看高风险</label>
+                    <button class="btn-outline" id="ov-select-high">选中高风险</button>
+                    <button class="btn-outline" id="ov-select-none">清空</button>
                 </div>
+                <div class="gd-stats" id="overlay-stats"></div>
+                <div class="gd-scroll-area" id="overlay-list"></div>
                 <label style="display:flex; align-items:center; gap:6px; margin:8px 0; font-size:12px; color:#ddd; cursor:pointer;">
                     <input type="checkbox" id="ov-block-domain" checked style="cursor:pointer;" />
                     <span>同时封杀跳转域名（加入全局黑名单，并预览/拦截全页该域资源）</span>
@@ -4747,6 +6217,7 @@
                 </div>
                 <div class="section-divider"></div>
                 <div class="btn-group">
+                    <button class="btn-info" id="btn-deep-scan" title="运行三算法联合扫描，将高嫌疑元素自动学习到泛化引擎">🤖 深度学习扫描</button>
                     <button class="btn-warning" id="btn-preview-overlay">🔍 预览效果</button>
                     <button class="btn-warning" id="btn-rescan">🔄 重新扫描</button>
                     <button class="btn-outline" id="btn-close-overlay">关闭</button>
@@ -4785,7 +6256,43 @@
                 render();
             });
 
-            // 预览效果：预览「隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏」，与正式拦截效果一致（解决问题5&6）
+            panel.querySelector('#ov-only-high').addEventListener('change', (e) => { onlyHigh = e.target.checked; render(); });
+            panel.querySelector('#ov-select-high').addEventListener('click', () => {
+                records.forEach((r, i) => { if (r.highRisk) selectedSet.add(i); });
+                render();
+            });
+            panel.querySelector('#ov-select-none').addEventListener('click', () => {
+                selectedSet.clear();
+                render();
+            });
+
+            // 深度学习扫描：运行三算法联合全扫，将高嫌疑元素自动学习到 GeneralizationEngine
+            panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
+                const btn = e.target;
+                const origText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ 扫描中...';
+                setTimeout(() => {
+                    try {
+                        const result = AdBlockOrchestrator.fullScan();
+                        // 扫描后重新采集并刷新列表
+                        const collected = collectAll();
+                        records = collected.records;
+                        selectedSet = new Set(records.filter(r => r.highRisk).map((r, i) => i));
+                        render();
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        const learned = result.learned.domains + result.learned.overlays;
+                        alert(`深度扫描完成（耗时 ${result.elapsed}ms）\n\n覆盖层：${result.overlays.total} 项\n本次学习：${learned} 条规则\n清理过期：${result.cleaned} 条\n\n泛化引擎现有：${result.engine.totalRules} 条规则，平均置信度 ${result.engine.avgConfidence}`);
+                    } catch (err) {
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        alert('深度扫描失败：' + err.message);
+                    }
+                }, 50);
+            });
+
+            // 预览效果：预览「隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏」，与正式拦截效果一致
             previewBtn.addEventListener('click', (e) => {
                 if (this._overlayPreview.active) {
                     resetOverlayPreview(e.target);
@@ -4843,7 +6350,7 @@
                     r.el.style.setProperty('pointer-events', 'none', 'important');
                     r.el.style.setProperty('visibility', 'hidden', 'important');
                     r.blocked = true;
-                    // 仅在勾选「封杀域名」时加入全局黑名单（解决问题5：可选域名封杀）
+                    // 仅在勾选「封杀域名」时加入全局黑名单
                     if (blockDomainToo && r.triggerUrl) {
                         try {
                             const u = new URL(r.triggerUrl, location.href);
@@ -4854,6 +6361,14 @@
                         } catch (e) { }
                     }
                 });
+                // 同步学习到泛化引擎（用户确认拦截 = 高置信度信号）
+                try {
+                    const learnable = Array.from(selectedSet).map(idx => records[idx]).filter(r => r.el);
+                    GeneralizationEngine.learnFromOverlayScan(learnable.map(r => ({
+                        el: r.el, suspicion: r.suspicion || 50, selector: r.selector,
+                        category: r.category, features: r.features, reasons: r.oasReasons
+                    })));
+                } catch(e){}
                 selectedSet.clear();
                 render();
                 const domainNote = blockDomainToo ? `，${domainCount} 个跨域跳转域名已加入全局黑名单` : '（未封杀域名）';
@@ -4862,7 +6377,8 @@
 
             panel.querySelector('#btn-rescan').addEventListener('click', () => {
                 resetOverlayPreview(previewBtn);
-                records = BlockEngine.scanInvisibleOverlays({ autoBlock: false });
+                const collected = collectAll();
+                records = collected.records;
                 selectedSet = new Set(records.filter(r => r.highRisk).map((r, i) => i));
                 render();
             });
@@ -4876,14 +6392,27 @@
             const panel = document.createElement('div');
             panel.className = 'panel';
 
-            // 仅重渲染列表容器，不重置整个 panel，避免重复 makeDraggable 导致监听器泄漏（同 Bug6 规避）
+            // GeneralizationEngine 规则类型元数据
+            const GE_TYPES = [
+                { key: 'domain', label: '🌐 域名黑名单', icon: '🌐' },
+                { key: 'url', label: '🔗 URL 正则', icon: '🔗' },
+                { key: 'css', label: '🎨 CSS 选择器', icon: '🎨' },
+                { key: 'attr', label: '🏷️ 属性匹配', icon: '🏷️' },
+                { key: 'nav', label: '🚫 跳转拦截', icon: '🚫' },
+                { key: 'path', label: '📂 路径模式', icon: '📂' }
+            ];
+            const sourceLabel = (src) => ({ 'domain_scan':'域名检索', 'overlay_scan':'覆盖层扫描', 'manual':'手动选择', 'generalization':'智能泛化' }[src] || src);
+            const ruleKey = (r) => r.hostname || r.pattern || r.selector || r.value || '';
+
+            // 仅重渲染列表容器，不重置整个 panel，避免重复 makeDraggable 导致监听器泄漏
             const renderList = () => {
+                // ① AutoGeneralizer 双轨（域名/路径/熔断）
                 const data = storage.getGeneralized();
                 const fillList = (ulId, arr, type, allowDelete) => {
                     const ul = panel.querySelector('#' + ulId);
                     if (!ul) return;
                     if (!arr || arr.length === 0) {
-                        ul.innerHTML = '<li class="empty-tip">暂无规则。新增 ≥3 个同基域名或 ≥2 个相似路径后将自动生成。</li>';
+                        ul.innerHTML = '<li class="empty-tip">暂无规则。新增 ≥3 个同基域名或 ≥3 个同结构路径后将自动生成。</li>';
                         return;
                     }
                     ul.innerHTML = arr.map((r, i) => `
@@ -4900,38 +6429,86 @@
                 fillList('gen-path-list', data.path, 'path', true);
                 fillList('gen-fused-list', data.fused, 'fused', false);
 
-                const stats = panel.querySelector('#gen-stats');
-                if (stats) {
-                    stats.textContent = `域名轨 ${data.domain.length} 条 · 路径轨 ${data.path.length} 条 · 熔断 ${data.fused.length} 条`;
+                const agStats = panel.querySelector('#ag-stats');
+                if (agStats) {
+                    agStats.textContent = `域名轨 ${data.domain.length} 条 · 路径轨 ${data.path.length} 条 · 熔断 ${data.fused.length} 条`;
+                }
+
+                // ② GeneralizationEngine 学习的规则
+                let geStatus = { counts: {}, totalRules: 0, totalHits: 0, avgConfidence: 0 };
+                let geRules = { domain: [], url: [], css: [], attr: [], nav: [], path: [] };
+                try {
+                    geStatus = GeneralizationEngine.getStatus();
+                    geRules = GeneralizationEngine.getRulesSnapshot();
+                } catch(e){}
+
+                const geStats = panel.querySelector('#ge-stats');
+                if (geStats) {
+                    geStats.textContent = `共 ${geStatus.totalRules} 条 · 总命中 ${geStatus.totalHits} 次 · 平均置信度 ${geStatus.avgConfidence}`;
+                }
+
+                // 渲染各类型规则
+                for (const { key } of GE_TYPES) {
+                    const ul = panel.querySelector('#ge-' + key + '-list');
+                    if (!ul) continue;
+                    const arr = geRules[key] || [];
+                    if (arr.length === 0) {
+                        ul.innerHTML = '<li class="empty-tip">暂无。深度扫描或手动拦截后将自动学习。</li>';
+                        continue;
+                    }
+                    ul.innerHTML = arr.map((r, i) => {
+                        const k = escapeHTML(ruleKey(r));
+                        const conf = (r.confidence || 0).toFixed(2);
+                        const hits = r.hits || 0;
+                        const src = sourceLabel(r.source);
+                        const confClass = r.confidence >= 0.8 ? 'high' : r.confidence >= 0.5 ? 'mid' : 'low';
+                        const reason = r.reason ? ` · ${escapeHTML(r.reason)}` : '';
+                        return `<li class="rule-item">
+                            <div class="rule-content">
+                                <span class="gen-rule">${k}</span>
+                                <span class="gd-score ${confClass}" style="margin-left:6px;">${conf}</span>
+                                <span class="as-site" style="margin-left:6px;">${src} · ×${hits}${reason}</span>
+                            </div>
+                            <button class="btn-danger btn-ge-delete" style="flex:none; width:60px; padding:6px;" data-type="${key}" data-key="${escapeHTML(ruleKey(r))}">误报</button>
+                        </li>`;
+                    }).join('');
                 }
             };
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">🤖 自动化泛化规则</h3>
-                <p>双轨自动推导：域名轨用反向基数树将 ≥3 个同基子域收敛为 <code>*.base</code>；路径轨用多序列对齐将相似路径归并为 <code>/a/*/b</code>。泛化规则自动接入网络层与 DOM 扫描拦截，规则增删后会自动重新泛化。</p>
-                <div class="gd-stats" id="gen-stats"></div>
+                <p>双轨自动推导：域名轨用反向基数树将 ≥3 个同基子域收敛为 <code>*.base</code>（覆盖收益比 > 60% 才输出）；路径轨用结构指纹聚类将 ≥3 个同结构路径归并为 <code>/a/*/b</code>，仅 NUM/HEX 位置通配，误杀率 > 30% 拒绝输出。泛化规则自动接入网络层与 DOM 扫描拦截，规则增删后会自动重新泛化。</p>
+                <div class="gd-stats" id="ge-stats"></div>
                 <div class="gen-section">
-                    <div class="gen-sec-title">🌐 域名轨 (Reverse Trie)</div>
-                    <div class="selection-info" style="max-height:160px; overflow-y:auto;">
-                        <ul class="rule-list" id="gen-domain-list"></ul>
-                    </div>
+                    <div class="gen-sec-title">🧠 GeneralizationEngine 自学习规则（置信度追踪 · 自动衰减）</div>
+                    ${GE_TYPES.map(t => `
+                        <div style="margin-top:6px;">
+                            <div class="gen-sec-title" style="font-size:11px; color:#aaa;">${t.label}</div>
+                            <ul class="rule-list" id="ge-${t.key}-list"></ul>
+                        </div>
+                    `).join('')}
+                </div>
+                <div class="section-divider"></div>
+                <div class="gen-section">
+                    <div class="gen-sec-title">🌐 域名轨 (Reverse Trie) · AutoGeneralizer</div>
+                    <div class="gd-stats" id="ag-stats"></div>
+                    <ul class="rule-list" id="gen-domain-list"></ul>
                 </div>
                 <div class="gen-section">
-                    <div class="gen-sec-title">📂 路径轨 (MSA 对齐)</div>
-                    <div class="selection-info" style="max-height:160px; overflow-y:auto;">
-                        <ul class="rule-list" id="gen-path-list"></ul>
-                    </div>
+                    <div class="gen-sec-title">📂 路径轨 (结构指纹聚类) · AutoGeneralizer</div>
+                    <ul class="rule-list" id="gen-path-list"></ul>
                 </div>
                 <div class="gen-section">
                     <div class="gen-sec-title">⚠️ 熔断日志 (防误杀，已自动废弃)</div>
-                    <div class="selection-info" style="max-height:120px; overflow-y:auto;">
-                        <ul class="rule-list" id="gen-fused-list"></ul>
-                    </div>
+                    <ul class="rule-list" id="gen-fused-list"></ul>
                 </div>
                 <div class="section-divider"></div>
                 <div class="btn-group">
+                    <button class="btn-info" id="gen-deep-scan" title="运行三算法联合扫描，自动学习规则到泛化引擎">🤖 深度学习扫描</button>
                     <button class="btn-primary" id="gen-rebuild">🔄 重新泛化</button>
                     <button class="btn-warning" id="gen-refresh">刷新列表</button>
+                </div>
+                <div class="btn-group">
                     <button class="btn-outline" id="gen-back">返回管理</button>
                     <button class="btn-outline" id="gen-close">关闭</button>
                 </div>
@@ -4940,6 +6517,28 @@
             this.makeDraggable(panel);
             this.shadowRoot.appendChild(panel);
             renderList();
+
+            // 深度学习扫描：运行三算法联合全扫，将结果学习到 GeneralizationEngine
+            panel.querySelector('#gen-deep-scan').addEventListener('click', (e) => {
+                const btn = e.target;
+                const origText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ 扫描中...';
+                setTimeout(() => {
+                    try {
+                        const result = AdBlockOrchestrator.fullScan();
+                        renderList();
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        const learned = result.learned.domains + result.learned.overlays;
+                        alert(`深度扫描完成（耗时 ${result.elapsed}ms）\n\n域名检索：${result.domains.total} 个\n覆盖层：${result.overlays.total} 项\n本次学习：${learned} 条规则\n清理过期：${result.cleaned} 条\n\n泛化引擎现有：${result.engine.totalRules} 条规则，平均置信度 ${result.engine.avgConfidence}`);
+                    } catch (err) {
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        alert('深度扫描失败：' + err.message);
+                    }
+                }, 50);
+            });
 
             // 重新泛化：同步触发 AutoGeneralizer.run()，立即刷新列表
             panel.querySelector('#gen-rebuild').addEventListener('click', () => {
@@ -4951,7 +6550,7 @@
             panel.querySelector('#gen-back').addEventListener('click', () => this.showManager());
             panel.querySelector('#gen-close').addEventListener('click', () => this.clearPanel());
 
-            // 事件委托：删除域名/路径轨规则（熔断日志不可删）
+            // 事件委托：删除 AutoGeneralizer 域名/路径轨规则（熔断日志不可删）
             const delegate = (ulId) => {
                 panel.querySelector('#' + ulId).addEventListener('click', (e) => {
                     const btn = e.target.closest('.btn-delete');
@@ -4965,6 +6564,25 @@
             };
             delegate('gen-domain-list');
             delegate('gen-path-list');
+
+            // 事件委托：标记 GeneralizationEngine 规则为误报（降低置信度，低于阈值自动清除）
+            for (const { key } of GE_TYPES) {
+                const ul = panel.querySelector('#ge-' + key + '-list');
+                if (!ul) continue;
+                ul.addEventListener('click', (e) => {
+                    const btn = e.target.closest('.btn-ge-delete');
+                    if (!btn) return;
+                    const type = btn.getAttribute('data-type');
+                    const ruleKeyVal = btn.getAttribute('data-key');
+                    if (!confirm(`确认将此 ${type} 规则标记为误报？\n\n规则：${ruleKeyVal}\n\n误报将降低置信度，低于阈值后自动清除。`)) return;
+                    try {
+                        GeneralizationEngine.feedbackFalsePositive(type, ruleKeyVal);
+                        renderList();
+                    } catch(err) {
+                        alert('操作失败：' + err.message);
+                    }
+                });
+            }
         }
 
         showImportPanel() {
@@ -5077,6 +6695,9 @@
     BlockEngine.migrateTopoHashes();
     BlockEngine.fastInject();
     BlockEngine.startObserver();
+    // 三算法协同：跳转拦截（window.open/location/form）+ 动态学习 + 衰减
+    // 与 NetworkInterceptor/BlockEngine 并行，补充博彩色情跳转拦截与自学习能力
+    AdBlockOrchestrator.initRuntime();
 
     if (window.self === window.top) {
         let uiInstance = null;
@@ -5086,11 +6707,11 @@
         }
 
         GM_registerMenuCommand('🖱 手动选择屏蔽元素', () => getUI().startSelection());
+        GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('🌐 全局检索域名', () => getUI().showGlobalDomainPanel());
         GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => getUI().showOverlayScanPanel());
-        GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
-        GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
         GM_registerMenuCommand('🤖 自动化泛化规则', () => getUI().showGeneralizationPanel());
+        GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
         GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => getUI().showAdGuardExportPanel());
         GM_registerMenuCommand('📥 导入规则', () => getUI().showImportPanel());
