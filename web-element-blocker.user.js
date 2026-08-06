@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.2.14
+// @version      0.2.15
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。
 // @author       EFate
 // @match        *://*/*
@@ -83,6 +83,27 @@
             this._pendingWrites = {};
         }
 
+        // 域名黑名单统一为对象结构 {domain, _ts}：兼容历史 string[] 与对象[]，去重并保留时间戳，
+        // 供管理面板按最近过滤时间倒序展示（"最近过滤规则置顶"）
+        _normDomains(arr) {
+            if (!Array.isArray(arr)) return [];
+            const out = [];
+            const seen = new Set();
+            arr.forEach(item => {
+                const domain = (typeof item === 'string') ? item : (item && item.domain);
+                if (!domain || typeof domain !== 'string' || domain.length === 0 || domain.length >= 200 || seen.has(domain)) return;
+                seen.add(domain);
+                const ts = (item && typeof item === 'object' && typeof item._ts === 'number') ? item._ts : 0;
+                out.push({ domain, _ts: ts });
+            });
+            return out;
+        }
+
+        // 统一读取入口：始终返回归一化后的 {domain, _ts} 对象数组
+        getDomainBlocks() {
+            return this._normDomains(this._readKey('domainBlocks', []));
+        }
+
         getData() {
             if (this._cachedData && this._cachedDataDomain === this.domain) return this._cachedData;
             this._cachedDataDomain = this.domain;
@@ -95,7 +116,7 @@
                 complex: this._readKey('complexBlocks', {})[this.domain] || [],
                 pathPattern: this._readKey('pathPatternBlocks', {})[this.domain] || [],
                 config: this._readKey('config', {})[this.domain] || { mode: 'auto' },
-                domainBlock: this._readKey('domainBlocks', [])
+                domainBlock: this.getDomainBlocks()
             };
             return this._cachedData;
         }
@@ -125,9 +146,9 @@
 
         addRule(type, rule) {
             if (type === 'domainBlock') {
-                const list = this._readKey('domainBlocks', []);
-                if (rule.domain && !list.includes(rule.domain)) {
-                    list.push(rule.domain);
+                const list = this.getDomainBlocks();
+                if (rule.domain && !list.some(r => r.domain === rule.domain)) {
+                    list.push({ domain: rule.domain, _ts: Date.now() });
                     this._markDirty('domainBlocks', list);
                     this.invalidateDataCache();
                     BlockEngine.invalidateCache();
@@ -156,7 +177,7 @@
 
         removeRule(type, index) {
             if (type === 'domainBlock') {
-                const list = this._readKey('domainBlocks', []);
+                const list = this.getDomainBlocks();
                 if (list[index]) {
                     list.splice(index, 1);
                     this._markDirty('domainBlocks', list);
@@ -293,12 +314,14 @@
             ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config', 'pro_blocker_flash_domains'].forEach(key => {
                 exportData[key] = GM_getValue(key, {});
             });
-            exportData['domainBlocks'] = storage._readKey('domainBlocks', []);
-            exportData['generalizedRules'] = storage._readKey('generalizedRules', { domain: [], path: [], fused: [] });
+            // 仅导出用户手动维护的规则，不含自动化泛化规则（泛化规则由域名/路径规则自动派生，
+            // 导出后会因环境差异失真且无意义，导入端会自动重新泛化）— 解决问题4
+            exportData['domainBlocks'] = this.getDomainBlocks();
             exportData['__meta__'] = {
-                version: '0.9',
+                version: '1.0',
                 exportTime: new Date().toISOString(),
-                exporter: '网页元素屏蔽器'
+                exporter: '网页元素屏蔽器',
+                note: '不包含自动化泛化规则（导入后自动重新派生）'
             };
             return JSON.stringify(exportData, null, 2);
         }
@@ -341,45 +364,23 @@
                     this._markDirty(key, (incoming && typeof incoming === 'object') ? incoming : {});
                 }
             });
+            // 域名黑名单：归一化兼容历史 string[] 与新版 {domain,_ts}[]，去重后合并/覆盖
             if (Array.isArray(importData['domainBlocks'])) {
-                const validDomains = importData['domainBlocks'].filter(d => typeof d === 'string' && d.length > 0 && d.length < 200);
+                const incoming = this._normDomains(importData['domainBlocks']);
                 if (merge) {
-                    const existing = this._readKey('domainBlocks', []);
-                    validDomains.forEach(d => {
-                        if (!existing.includes(d)) existing.push(d);
+                    const existing = this.getDomainBlocks();
+                    incoming.forEach(r => {
+                        if (!existing.some(x => x.domain === r.domain)) existing.push(r);
                     });
                     this._markDirty('domainBlocks', existing);
                 } else {
-                    this._markDirty('domainBlocks', validDomains);
+                    this._markDirty('domainBlocks', incoming);
                 }
             } else if (!merge) {
                 this._markDirty('domainBlocks', []); // 覆盖模式缺失则清空全局域名黑名单
             }
-            // 泛化规则：合并模式去重追加，覆盖模式直接替换
-            if (importData['generalizedRules'] && typeof importData['generalizedRules'] === 'object') {
-                const incoming = importData['generalizedRules'];
-                if (merge) {
-                    const existing = this.getGeneralized();
-                    ['domain', 'path', 'fused'].forEach(t => {
-                        const arr = Array.isArray(incoming[t]) ? incoming[t] : [];
-                        arr.forEach(item => {
-                            if (item && typeof item === 'object' && !existing[t].some(x => JSON.stringify(x) === JSON.stringify(item))) {
-                                existing[t].push(item);
-                            }
-                        });
-                    });
-                    this._markDirty('generalizedRules', existing);
-                } else {
-                    this._markDirty('generalizedRules', {
-                        domain: Array.isArray(incoming.domain) ? incoming.domain : [],
-                        path: Array.isArray(incoming.path) ? incoming.path : [],
-                        fused: Array.isArray(incoming.fused) ? incoming.fused : []
-                    });
-                }
-            } else if (!merge) {
-                // 覆盖模式缺失则清空泛化规则，确保"覆盖"语义完整
-                this._markDirty('generalizedRules', { domain: [], path: [], fused: [] });
-            }
+            // 自动化泛化规则不再导入：由导入的域名/路径规则经 AutoGeneralizer.run() 自动重新派生，
+            // 避免不同环境泛化结果失真（与导出端一致，解决问题4）
             BlockEngine.invalidateCache();
             this.invalidateDataCache();
             BlockEngine.applyCSSRules();
@@ -664,8 +665,8 @@
         static run() {
             try {
                 const data = storage.getData();
-                // 域名轨：全局域名黑名单
-                const domains = (data.domainBlock || []).filter(d => d && typeof d === 'string');
+                // 域名轨：全局域名黑名单（domainBlock 已为 {domain,_ts}[]，抽取 domain 字符串）
+                const domains = (data.domainBlock || []).map(r => r.domain).filter(Boolean);
                 const genDomains = DomainGeneralizer.extractOptimalDomains(domains, 3);
 
                 // 路径轨：聚合所有站点的 pathPattern 规则
@@ -757,9 +758,10 @@
         }
 
         // 获取域名集合（与 _cachedDomainList 同生命周期），供网络拦截器与动态扫描复用
+        // domainBlocks 已迁移为 {domain,_ts}[]，此处抽取 domain 字符串构建 Set
         static getDomainSet() {
             if (this._cachedDomainSet === null) {
-                const list = this._cachedDomainList !== null ? this._cachedDomainList : storage._readKey('domainBlocks', []);
+                const list = this._cachedDomainList !== null ? this._cachedDomainList : storage.getDomainBlocks().map(r => r.domain);
                 if (this._cachedDomainList === null) this._cachedDomainList = list;
                 this._cachedDomainSet = new Set(list);
             }
@@ -1037,7 +1039,8 @@
 
             // 全局域名黑名单：覆盖所有可能携带资源 URL 的属性（含 srcset）
             // 同时生成 :has() 规则隐藏父级容器，避免横幅广告仅隐藏 iframe 后留下空白占位
-            data.domainBlock.forEach(domain => {
+            data.domainBlock.forEach(entry => {
+                const domain = entry.domain;
                 if (!domain) return;
                 const esc = escapeCSSAttr(domain);
                 const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [poster*="${esc}"], [srcset*="${esc}"]`;
@@ -1104,6 +1107,50 @@
             this._lastCSSFingerprint = fingerprint;
         }
 
+        // 清除某域名相关元素的内联隐藏样式（删除 domainBlock 规则后调用，解决问题2&5）
+        // scanAndBlockDynamic 会给命中元素的单子链容器打 inline display:none；删除规则只重建 CSS 表，
+        // inline 残留导致"删除规则后元素仍屏蔽"。此处清除该域名命中的资源元素及其父级的内联隐藏，
+        // 随后由 force 重扫重新应用剩余规则。
+        static restoreInlineForDomain(domain) {
+            if (!domain) return;
+            const esc = escapeCSSAttr(domain);
+            const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [poster*="${esc}"], [srcset*="${esc}"]`;
+            const clear = (node) => {
+                if (!node) return;
+                node.style.removeProperty('display');
+                node.style.removeProperty('opacity');
+                node.style.removeProperty('visibility');
+                node.style.removeProperty('pointer-events');
+            };
+            document.querySelectorAll(sel).forEach(el => {
+                clear(el);
+                if (el.parentElement) clear(el.parentElement);
+                // 单子链容器也可能被 scanAndBlockDynamic 隐藏，向上清一层兜底
+                const wrapper = this.findSingleChildWrapper(el, 4);
+                clear(wrapper);
+            });
+        }
+
+        // 清除某路径模式相关元素的内联隐藏样式（删除 pathPattern 规则后调用，同上）
+        static restoreInlineForPath(pattern) {
+            if (!pattern) return;
+            const esc = escapeCSSAttr(pattern);
+            const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+            const clear = (node) => {
+                if (!node) return;
+                node.style.removeProperty('display');
+                node.style.removeProperty('opacity');
+                node.style.removeProperty('visibility');
+                node.style.removeProperty('pointer-events');
+            };
+            document.querySelectorAll(sel).forEach(el => {
+                clear(el);
+                if (el.parentElement) clear(el.parentElement);
+                const wrapper = this.findSingleChildWrapper(el, 4);
+                clear(wrapper);
+            });
+        }
+
         // 获取（惰性创建）当前生效的 CSSStyleSheet：
         // 优先 Constructable Stylesheets（C++ 对象，零解析、防探查），不支持时降级到 <style>.sheet
         static _getSheet() {
@@ -1150,7 +1197,7 @@
          * 解决"刷新就复活"——动态生成的广告无法靠固定CSS规则拦截
          */
         static scanAndBlockDynamic(node, cachedDomainList, cachedPathPatterns, options = {}) {
-            const domainList = cachedDomainList !== undefined ? cachedDomainList : (this._cachedDomainList !== null ? this._cachedDomainList : storage._readKey('domainBlocks', []));
+            const domainList = cachedDomainList !== undefined ? cachedDomainList : (this._cachedDomainList !== null ? this._cachedDomainList : storage.getDomainBlocks().map(r => r.domain));
             const pathPatterns = cachedPathPatterns !== undefined ? cachedPathPatterns : (this._cachedPathPatterns !== null ? this._cachedPathPatterns : storage.getData().pathPattern);
             if (this._cachedDomainList === null) this._cachedDomainList = domainList;
             if (this._cachedPathPatterns === null) this._cachedPathPatterns = pathPatterns;
@@ -1500,7 +1547,7 @@
 
         // 缓存获取域名/路径列表（供 shadow observer 等复用）
         static _getLists() {
-            if (this._cachedDomainList === null) this._cachedDomainList = storage._readKey('domainBlocks', []);
+            if (this._cachedDomainList === null) this._cachedDomainList = storage.getDomainBlocks().map(r => r.domain);
             if (this._cachedPathPatterns === null) this._cachedPathPatterns = storage.getData().pathPattern;
             return { domainList: this._cachedDomainList, pathPatterns: this._cachedPathPatterns };
         }
@@ -1544,7 +1591,7 @@
 
             // 批量获取缓存的域名/路径列表，避免每个 mutation 重复读取存储
             const getLists = () => {
-                if (this._cachedDomainList === null) this._cachedDomainList = storage._readKey('domainBlocks', []);
+                if (this._cachedDomainList === null) this._cachedDomainList = storage.getDomainBlocks().map(r => r.domain);
                 if (this._cachedPathPatterns === null) this._cachedPathPatterns = storage.getData().pathPattern;
                 return { domainList: this._cachedDomainList, pathPatterns: this._cachedPathPatterns };
             };
@@ -2736,9 +2783,10 @@
                 this._actionHosts = new Set(resourceResult.domains);
                 this._actionHostsEl = el;
             } else {
+                // 同一元素：仅移除已不存在的域名（元素资源集合变化兜底），绝不自动补回——
+                // 否则会把用户刚手动取消选中的域名重新加回来（问题1根因：点击 pill 无效果）
                 const current = new Set(resourceResult.domains);
                 Array.from(this._actionHosts).forEach(h => { if (!current.has(h)) this._actionHosts.delete(h); });
-                current.forEach(h => { if (!this._actionHosts.has(h)) this._actionHosts.add(h); });
             }
             if (domainBox) {
                 if (resourceResult.domains.length > 0) {
@@ -2959,16 +3007,27 @@
 
                 // 立即隐藏当前框选的整个广告容器（向上找单子链容器）
                 const container = BlockEngine.findSingleChildWrapper(this.currentSelectedEl, 4);
-                container.style.setProperty('display', 'none', 'important');
-                container.style.setProperty('opacity', '0', 'important');
+                if (container) {
+                    container.style.setProperty('display', 'none', 'important');
+                    container.style.setProperty('opacity', '0', 'important');
+                }
 
-                // 扫描全页删除选中域名的所有资源（含 srcset）
+                // 扫描全页命中选中域名的资源：隐藏元素本身 + 直接父级 + 单子链容器
+                // 口径与 applyCSSRules（[src*=domain] 与 *:has(>...)）+ scanAndBlockDynamic
+                // （findSingleChildWrapper）完全一致，确保 即时效果=预览=刷新后效果
+                const hideNodeInline = (node) => {
+                    if (!node || node === document.body || node === document.documentElement) return;
+                    node.style.setProperty('display', 'none', 'important');
+                    node.style.setProperty('opacity', '0', 'important');
+                };
                 list.forEach(d => {
                     const esc = escapeCSSAttr(d);
-                    document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
-                        const t = BlockEngine.findSingleChildWrapper(el, 4);
-                        t.style.setProperty('display', 'none', 'important');
-                        t.style.setProperty('opacity', '0', 'important');
+                    const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`;
+                    document.querySelectorAll(sel).forEach(target => {
+                        hideNodeInline(target);
+                        if (target.parentElement) hideNodeInline(target.parentElement);
+                        const wrapper = BlockEngine.findSingleChildWrapper(target, 4);
+                        hideNodeInline(wrapper);
                     });
                 });
 
@@ -2977,7 +3036,11 @@
                 alert(`已封杀 ${list.length} 个域名${pathNote}。\n后续刷新与所有页面都将自动拦截。`);
             });
 
-            // 预览效果：预览「选中域名命中的全页元素 + 当前广告容器」，与点击「彻底封杀」后的实际效果一致（解决问题2&6）
+            // 预览效果：必须与「彻底封杀」后的实际效果完全一致——
+            // domainBlock 的 CSS 同时隐藏「资源元素本身 [src*=domain]」与「其直接父级 *:has(>...)」，
+            // pathPattern 的 CSS 同样隐藏元素 + 直接父级，外加手动隐藏广告容器。
+            // 旧预览只隐藏 findSingleChildWrapper（口径不一致）→ 预览看到的与刷新后实际不符，
+            // 正常元素被一并屏蔽却未在预览体现（问题1.1根因）。此处严格按 CSS 口径预览。
             panel.querySelector('#btn-preview').addEventListener('click', (e) => {
                 if (this._actionPreview.active) {
                     this._resetActionPreview(panel);
@@ -2990,28 +3053,55 @@
                     return;
                 }
                 this._actionPreview = { active: true, el: null, elements: [] };
-                // 命中选中域名的全页元素 → 隐藏其单子链容器（与正式封杀同口径）
+                // 隐藏一个节点（元素本身或父级），跳过 body/html 与已隐藏项，避免误杀根节点
+                const hideNode = (node) => {
+                    if (!node || node === document.body || node === document.documentElement) return;
+                    if (node.style.display === 'none') return;
+                    node.style.setProperty('display', 'none', 'important');
+                    node.style.setProperty('opacity', '0', 'important');
+                    this._actionPreview.elements.push(node);
+                };
+                // 严格复刻封杀效果：
+                // 1) CSS [src*=domain] 隐藏资源元素本身
+                // 2) CSS *:has(> :is(...)) 隐藏直接父级
+                // 3) scanAndBlockDynamic 对每个命中资源调用 findSingleChildWrapper(el,4) 隐藏单子链容器
+                //    —— 该容器可能上溯至包含正常内容的高层节点（问题1.1根因：预览缺第3步导致
+                //    「刷新后正常页面被屏蔽」未在预览体现）。此处补齐，使预览=刷新后实际效果。
+                const hideResourceAndParent = (target) => {
+                    hideNode(target);
+                    if (target.parentElement) hideNode(target.parentElement);
+                    const wrapper = BlockEngine.findSingleChildWrapper(target, 4);
+                    hideNode(wrapper);
+                };
                 const hosts = Array.from(this._actionHosts || []);
                 if (hosts.length > 0) {
                     hosts.forEach(d => {
                         const esc = escapeCSSAttr(d);
-                        document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
-                            const t = BlockEngine.findSingleChildWrapper(target, 4);
-                            if (t && t.style.display !== 'none') {
-                                t.style.setProperty('display', 'none', 'important');
-                                t.style.setProperty('opacity', '0', 'important');
-                                this._actionPreview.elements.push(t);
-                            }
-                        });
+                        const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`;
+                        document.querySelectorAll(sel).forEach(hideResourceAndParent);
                     });
                 }
-                // 同时隐藏当前框选的广告容器（正式封杀也会隐藏容器），与实际效果对齐
+                // 路径模式预览：与封杀时自动提取的 pathCandidates 同口径，预览其全页命中（元素 + 父级）
+                const result = BlockEngine.extractResourceDomains(el, { deep: true });
+                const pathCandidates = new Set();
+                result.urls.forEach(u => {
+                    try {
+                        if (u.startsWith('//') || u.startsWith('http')) return;
+                        if (u.startsWith('/') && u.length > 5) {
+                            const pathOnly = u.split('?')[0].split('#')[0];
+                            const segs = pathOnly.split('/').filter(Boolean);
+                            if (segs.length >= 2) pathCandidates.add('/' + segs.slice(0, 3).join('/'));
+                        }
+                    } catch (err) { }
+                });
+                pathCandidates.forEach(p => {
+                    const esc = escapeCSSAttr(p);
+                    const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+                    document.querySelectorAll(sel).forEach(hideResourceAndParent);
+                });
+                // 当前框选的广告容器（正式封杀也会手动隐藏容器）
                 const container = BlockEngine.findSingleChildWrapper(el, 4);
-                if (container && container.style.display !== 'none') {
-                    container.style.setProperty('display', 'none', 'important');
-                    container.style.setProperty('opacity', '0', 'important');
-                    this._actionPreview.elements.push(container);
-                }
+                hideNode(container);
                 e.target.textContent = '👁 恢复显示';
             });
 
@@ -3572,57 +3662,15 @@
             panel.querySelector('#btn-close-regex').addEventListener('click', () => this.clearPanel());
         }
 
+        // 统一规则管理面板：合并「规则与防御管理」与「按网站查看所有规则」为单一透明玻璃面板（问题3）
+        // 全局域名黑名单 + 本站规则 + 其他站点规则统一汇总，按最近过滤时间 _ts 倒序置顶，便于快速删除
         showManager() {
             this.clearPanel();
             const panel = document.createElement('div');
             panel.className = 'panel';
             const data = storage.getData();
-            let rulesHTML = '<ul class="rule-list">';
 
-            const renderItem = (type, content, index, tagClass = '') => `
-                <li class="rule-item">
-                    <div class="rule-content">
-                        <span class="tag ${tagClass}">${type}</span> ${content}
-                    </div>
-                    <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-type="${type}" data-index="${index}">删除</button>
-                </li>
-            `;
-
-            // 按 _ts 倒序展示：最近添加的规则置顶；data-index 仍为原数组下标，确保删除定位正确（解决问题4）
-            const byTsDesc = (a, b) => (b.r._ts || 0) - (a.r._ts || 0);
-            const eachSorted = (arr, fn) => arr.map((r, i) => ({ r, i })).sort(byTsDesc).forEach(fn);
-
-            const totalRules = data.static.length + data.dynamic.length + data.regex.length +
-                data.attribute.length + data.structural.length + data.pathPattern.length +
-                data.complex.length + data.domainBlock.length;
-
-            if (totalRules === 0) {
-                rulesHTML = '<p class="empty-tip">当前暂无屏蔽规则</p>';
-            } else {
-                // 域名黑名单置顶（用户最常过滤的类型），按添加顺序倒序（数组末尾=最近添加）
-                if (data.domainBlock.length > 0) {
-                    rulesHTML += '<li class="rule-section-title">🔥 最近过滤的域名规则（全局生效）</li>';
-                    data.domainBlock.map((d, i) => ({ d, i })).reverse().forEach(({ d, i }) =>
-                        rulesHTML += renderItem('域名', escapeHTML(d), i, 'domain')
-                    );
-                }
-
-                eachSorted(data.static, ({ r, i }) => rulesHTML += renderItem('静态', escapeHTML(r.selector), i));
-                eachSorted(data.dynamic, ({ r, i }) => rulesHTML += renderItem('动态', `类名: ${escapeHTML(r.className)}`, i));
-                eachSorted(data.regex, ({ r, i }) => rulesHTML += renderItem('正则', `匹配: ${escapeHTML(r.regex)} (层级: ${r.level})`, i));
-                eachSorted(data.attribute, ({ r, i }) => rulesHTML += renderItem('属性', `选择器: ${escapeHTML(r.attrSelector)}`, i, 'attr'));
-                eachSorted(data.structural, ({ r, i }) => rulesHTML += renderItem('位置', escapeHTML(r.structSelector), i, 'struct'));
-                eachSorted(data.pathPattern, ({ r, i }) => rulesHTML += renderItem('路径', `模式: ${escapeHTML(r.pattern)}`, i, 'path'));
-                eachSorted(data.complex, ({ r, i }) => {
-                    const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
-                    const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
-                    const condText = r.conditions.map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic)}</span> `);
-                    rulesHTML += renderItem('积木', `${condText} (层级: ${r.level})`, i, 'complex');
-                });
-                rulesHTML += '</ul>';
-            }
-
-            // 防御策略状态：区分"手动开启"与"闪现自动启用"，并展示自愈进度
+            // 防御策略状态
             const isManualPreemptive = data.config.mode === 'preemptive';
             const isFlashMarked = !!storage.flashList[storage.domain];
             const cleanCount = storage.getCleanLoadCount();
@@ -3640,7 +3688,6 @@
             const flashStatus = isFlashMarked
                 ? `<span style="color:red; font-weight:bold;">已记录闪现特征</span>（本次加载如无闪现，将计入自愈 ${cleanCount}/3）`
                 : '<span style="color:#34c759; font-weight:bold;">运行良好</span>';
-            const domainCount = data.domainBlock.length;
             const highlightColor = GM_getValue('config_highlight_color', '#FF3B30');
 
             panel.innerHTML = `
@@ -3650,7 +3697,7 @@
                     <div><strong>防御策略：</strong> ${modeText}</div>
                     <div style="font-size:11px; color:#999; margin:2px 0 6px;">${modeHint}</div>
                     <div><strong>系统评估：</strong> ${flashStatus}</div>
-                    <div><strong>全局域名黑名单：</strong> 共 ${domainCount} 个域名（跨站点生效）</div>
+                    <div><strong>全局域名黑名单：</strong> 共 <span id="mgr-domain-count">${data.domainBlock.length}</span> 个域名（跨站点生效）</div>
                     <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1);">
                         <div>🌐 <strong>网络拦截：</strong><span style="color:#4aa3ff;"> ${BlockEngine.stats.networkBlocks}</span> 次</div>
                         <div>🧩 <strong>DOM 屏蔽：</strong><span style="color:#34c759;"> ${BlockEngine.stats.domBlocks}</span> 个</div>
@@ -3668,8 +3715,29 @@
                     <span style="font-size:10px; color:#888;">输入 Hex 色值（如 #FF3B30）实时预览</span>
                 </div>
 
-                <div style="max-height: 280px; overflow-y: auto; margin-bottom: 15px; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px;">
-                    ${rulesHTML}
+                <div class="gd-toolbar">
+                    <select id="mgr-scope-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
+                        <option value="all">全部范围</option>
+                        <option value="global">域名黑名单</option>
+                        <option value="current">本站规则</option>
+                        <option value="other">其他站点</option>
+                    </select>
+                    <select id="mgr-type-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
+                        <option value="">全部类型</option>
+                        <option value="domainBlock">域名</option>
+                        <option value="static">静态</option>
+                        <option value="dynamic">动态</option>
+                        <option value="regex">正则</option>
+                        <option value="attribute">属性</option>
+                        <option value="structural">位置</option>
+                        <option value="complex">积木</option>
+                        <option value="pathPattern">路径</option>
+                    </select>
+                    <input type="text" id="mgr-filter" placeholder="输入域名或规则内容关键字过滤..." />
+                </div>
+                <div class="gd-stats" id="mgr-stats"></div>
+                <div class="selection-info" style="max-height: 320px; overflow-y: auto; margin-bottom: 12px;">
+                    <ul class="rule-list" id="mgr-list"></ul>
                 </div>
 
                 <div class="btn-group">
@@ -3680,7 +3748,6 @@
                 </div>
                 <div class="btn-group" style="margin-top: 10px;">
                     <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
-                    <button class="btn-info" id="btn-all-sites">🗂 按网站查看规则</button>
                     <button class="btn-info" id="btn-gen">🤖 自动化泛化规则</button>
                     <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
                     <button class="btn-primary" id="btn-close-manager">完成</button>
@@ -3690,15 +3757,157 @@
             this.makeDraggable(panel);
             this.shadowRoot.appendChild(panel);
 
+            // —— 统一记录构建：全局域名黑名单 + 本站 7 类 + 其他站点规则，按 _ts 倒序（最近置顶）——
+            const formatRuleContent = (type, r) => {
+                switch (type) {
+                    case 'static': return escapeHTML(r.selector || '');
+                    case 'dynamic': return `类名: ${escapeHTML(r.className || '')}`;
+                    case 'regex': return `匹配: ${escapeHTML(r.regex || '')} (层级: ${r.level})`;
+                    case 'attribute': return `选择器: ${escapeHTML(r.attrSelector || '')}`;
+                    case 'structural': return escapeHTML(r.structSelector || '');
+                    case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
+                    case 'complex': {
+                        const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
+                        const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
+                        const condText = (r.conditions || []).map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic || 'AND')}</span> `);
+                        return `${condText} (层级: ${r.level})`;
+                    }
+                    default: return '';
+                }
+            };
+            const TYPE_META = {
+                domainBlock: { label: '域名', tag: 'domain' },
+                static: { label: '静态', tag: '' },
+                dynamic: { label: '动态', tag: '' },
+                regex: { label: '正则', tag: '' },
+                attribute: { label: '属性', tag: 'attr' },
+                structural: { label: '位置', tag: 'struct' },
+                complex: { label: '积木', tag: 'complex' },
+                pathPattern: { label: '路径', tag: 'path' }
+            };
+            const buildRecords = () => {
+                const recs = [];
+                const d = storage.getData();
+                // 1. 全局域名黑名单（{domain,_ts}[]）
+                d.domainBlock.forEach((r, i) => recs.push({
+                    scope: 'global', domain: '(全局)', index: i, type: 'domainBlock',
+                    content: escapeHTML(r.domain), ts: r._ts || 0, value: r.domain
+                }));
+                // 2. 本站 7 类规则
+                ['static', 'dynamic', 'regex', 'attribute', 'structural', 'complex', 'pathPattern'].forEach(type => {
+                    (d[type] || []).forEach((r, i) => recs.push({
+                        scope: 'current', domain: storage.domain, index: i, type,
+                        content: formatRuleContent(type, r), ts: r._ts || 0,
+                        value: (type === 'pathPattern') ? (r.pattern || '') : ''
+                    }));
+                });
+                // 3. 其他站点规则（跨站，排除本站以免重复）
+                storage.getAllSiteRules().forEach(rec => {
+                    if (rec.domain === storage.domain) return;
+                    recs.push({
+                        scope: 'other', domain: rec.domain, index: rec.index, type: rec.type,
+                        content: formatRuleContent(rec.type, rec.rule), ts: rec.rule._ts || 0,
+                        value: (rec.type === 'pathPattern') ? (rec.rule.pattern || '') : ''
+                    });
+                });
+                // 按 _ts 倒序：最近过滤的规则置顶（问题3&7）
+                recs.sort((a, b) => b.ts - a.ts);
+                return recs;
+            };
+
+            let filterScope = 'all';
+            let filterType = '';
+            let filterText = '';
+            let records = buildRecords();
+
+            const renderList = () => {
+                const list = panel.querySelector('#mgr-list');
+                const stats = panel.querySelector('#mgr-stats');
+                const countEl = panel.querySelector('#mgr-domain-count');
+                if (countEl) countEl.textContent = records.filter(r => r.scope === 'global').length;
+                if (!list) return;
+                const filtered = records.filter(rec => {
+                    if (filterScope !== 'all' && rec.scope !== filterScope) return false;
+                    if (filterType && rec.type !== filterType) return false;
+                    if (filterText) {
+                        const hay = (rec.domain + ' ' + (TYPE_META[rec.type] ? TYPE_META[rec.type].label : '') + ' ' + rec.content).toLowerCase();
+                        if (!hay.includes(filterText)) return false;
+                    }
+                    return true;
+                });
+                if (stats) stats.textContent = `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（最近过滤置顶，点击删除即时生效）`;
+                if (filtered.length === 0) {
+                    list.innerHTML = '<li class="empty-tip">暂无规则。手动屏蔽元素或封杀域名后将显示在此处。</li>';
+                    return;
+                }
+                list.innerHTML = filtered.map(rec => {
+                    const meta = TYPE_META[rec.type] || { label: rec.type, tag: '' };
+                    const siteBadge = rec.scope === 'current'
+                        ? `<span class="as-site" style="background:rgba(52,199,89,0.3);">本站</span>`
+                        : rec.scope === 'global'
+                            ? `<span class="as-site" style="background:rgba(255,111,0,0.35);">全局</span>`
+                            : `<span class="as-site" title="${escapeHTML(rec.domain)}">${escapeHTML(rec.domain)}</span>`;
+                    return `<li class="rule-item">
+                        <div class="rule-content">
+                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content}
+                        </div>
+                        <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}" data-value="${escapeHTML(rec.value || '')}">删除</button>
+                    </li>`;
+                }).join('');
+            };
+            renderList();
+
+            // 过滤器事件
+            panel.querySelector('#mgr-scope-filter').addEventListener('change', (e) => { filterScope = e.target.value; renderList(); });
+            panel.querySelector('#mgr-type-filter').addEventListener('change', (e) => { filterType = e.target.value; renderList(); });
+            panel.querySelector('#mgr-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderList(); });
+
+            // 删除：事件委托，按归属调用对应删除 API，并还原内联隐藏 + 强制重扫确保即时生效（问题2&5）
+            // 删除后仅重渲染列表（不重建面板），保留过滤态与滚动位置，连续删除无需重开面板（问题3）
+            panel.querySelector('#mgr-list').addEventListener('click', (e) => {
+                const btn = e.target.closest('.btn-delete');
+                if (!btn) return;
+                const scope = btn.getAttribute('data-scope');
+                const domain = btn.getAttribute('data-domain');
+                const type = btn.getAttribute('data-type');
+                const index = parseInt(btn.getAttribute('data-index'), 10);
+                const value = btn.getAttribute('data-value') || '';
+                const scrollBox = panel.querySelector('#mgr-list').parentElement;
+                const savedScroll = scrollBox ? scrollBox.scrollTop : 0;
+
+                if (scope === 'global') {
+                    // 域名黑名单：先还原该域名的内联隐藏，再删除规则，最后强制重扫应用剩余规则
+                    BlockEngine.restoreInlineForDomain(value);
+                    storage.removeRule('domainBlock', index);
+                    BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                } else if (scope === 'current') {
+                    storage.removeRule(type, index);
+                    if (type === 'regex') BlockEngine.applyRegexRules();
+                    if (type === 'complex') BlockEngine.applyComplexRules();
+                    if (type === 'pathPattern') {
+                        BlockEngine.restoreInlineForPath(value);
+                        BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                    }
+                } else {
+                    // 跨站规则：pathPattern 为全局 CSS，删除后需还原内联 + 重扫；regex/complex 仅作用于各自站点
+                    storage.removeRuleForDomain(domain, type, index);
+                    if (type === 'pathPattern') {
+                        BlockEngine.restoreInlineForPath(value);
+                        BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                    }
+                }
+                records = buildRecords();
+                renderList();
+                requestAnimationFrame(() => { if (scrollBox) scrollBox.scrollTop = savedScroll; });
+            });
+
             // 高亮颜色 Hex 输入：实时校验、预览并持久化
-            // 修复：原输入框无任何事件监听器，config_highlight_color 只读不写，颜色配置完全失效
             const colorInput = panel.querySelector('#ui-highlight-color');
             const colorPreview = panel.querySelector('#color-preview');
             if (colorInput) {
                 colorInput.addEventListener('input', (e) => {
                     const val = e.target.value.trim();
                     if (/^#[0-9A-Fa-f]{6}$/.test(val)) {
-                        // 实时更新 CSS 变量：highlight 样式引用 var(--pro-blocker-highlight-color) 即刻生效
                         document.documentElement.style.setProperty('--pro-blocker-highlight-color', val);
                         if (colorPreview) colorPreview.style.background = val;
                         GM_setValue('config_highlight_color', val);
@@ -3706,36 +3915,12 @@
                 });
             }
 
-            panel.querySelectorAll('.btn-delete').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    const typeMap = { '静态': 'static', '动态': 'dynamic', '正则': 'regex', '属性': 'attribute', '位置': 'structural', '积木': 'complex', '路径': 'pathPattern', '域名': 'domainBlock' };
-                    const type = typeMap[e.target.getAttribute('data-type')];
-                    const index = parseInt(e.target.getAttribute('data-index'), 10);
-                    // 删除前保留滚动位置，删除后原地重渲染列表，避免每次删除都被迫重开面板（解决问题3）
-                    const scrollBox = panel.querySelector('.rule-list')?.parentElement;
-                    const savedScroll = scrollBox ? scrollBox.scrollTop : 0;
-                    storage.removeRule(type, index);
-                    // removeRule 不会自动重应用 regex/complex/pathPattern 的 inline 隐藏；
-                    // 此处补齐重应用，使剩余规则即刻生效（被删规则残留的 inline 样式需手动刷新恢复，与"按网站查看所有规则"面板一致）
-                    if (type === 'regex') BlockEngine.applyRegexRules();
-                    if (type === 'complex') BlockEngine.applyComplexRules();
-                    if (type === 'pathPattern') BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
-                    this.showManager();
-                    // 恢复滚动位置，连续删除无需重新向下翻找
-                    requestAnimationFrame(() => {
-                        const newBox = this.shadowRoot.querySelector('.panel .rule-list')?.parentElement;
-                        if (newBox) newBox.scrollTop = savedScroll;
-                    });
-                });
-            });
-
             panel.querySelector('#btn-toggle-mode').addEventListener('click', () => {
                 const newMode = storage.toggleMode();
                 alert(`策略已调整为：${newMode === 'preemptive' ? '极速预判模式（多时序重扫，防首屏闪现）' : '智能自动模式（观察器实时拦截）'}\n页面即将刷新以应用变更配置。`);
                 window.location.reload();
             });
 
-            // 手动重置闪现标记：确认规则已生效后清除，解除 preemptive 强制启用
             const resetBtn = panel.querySelector('#btn-reset-flash');
             if (resetBtn) {
                 resetBtn.addEventListener('click', () => {
@@ -3750,7 +3935,6 @@
             panel.querySelector('#btn-export').addEventListener('click', () => this.showExportPanel());
             panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
             panel.querySelector('#btn-ag-export').addEventListener('click', () => this.showAdGuardExportPanel());
-            panel.querySelector('#btn-all-sites').addEventListener('click', () => this.showAllSitesPanel());
             panel.querySelector('#btn-gen').addEventListener('click', () => this.showGeneralizationPanel());
 
             panel.querySelector('#btn-clear-all').addEventListener('click', () => {
@@ -3832,9 +4016,10 @@
                 ...Object.keys(ruleBuckets.complexBlocks),
                 ...Object.keys(ruleBuckets.pathPatternBlocks)
             ]);
-            // 校验域名：非空、无空白、长度合理
+            // 校验域名：非空、无空白、长度合理；domainBlocks 为 {domain,_ts}[]，抽取 domain 字符串
             const isValidDomain = (d) => typeof d === 'string' && d.length > 0 && d.length < 200 && !/\s/.test(d);
             const globalDomains = (Array.isArray(ruleBuckets.domainBlocks) ? ruleBuckets.domainBlocks : [])
+                .map(r => (r && typeof r === 'object') ? r.domain : r)
                 .filter(isValidDomain);
 
             const lines = [
@@ -4217,127 +4402,6 @@
             panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
         }
 
-        showAllSitesPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            let filterText = '';
-            let filterType = '';
-            let records = storage.getAllSiteRules();
-
-            const formatContent = (rec) => {
-                const r = rec.rule;
-                switch (rec.type) {
-                    case 'static': return escapeHTML(r.selector || '');
-                    case 'dynamic': return `类名: ${escapeHTML(r.className || '')}`;
-                    case 'regex': return `匹配: ${escapeHTML(r.regex || '')} (层级: ${r.level})`;
-                    case 'attribute': return `选择器: ${escapeHTML(r.attrSelector || '')}`;
-                    case 'structural': return escapeHTML(r.structSelector || '');
-                    case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
-                    case 'complex': {
-                        const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
-                        const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
-                        const condText = (r.conditions || []).map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic || 'AND')}</span> `);
-                        return `${condText} (层级: ${r.level})`;
-                    }
-                    default: return '';
-                }
-            };
-
-            // 仅重渲染列表容器（#as-list），不重置整个 panel，避免重复 makeDraggable 导致 document 监听器泄漏（Bug6 规避）
-            const renderList = () => {
-                const list = panel.querySelector('#as-list');
-                const stats = panel.querySelector('#as-stats');
-                if (!list) return;
-                const filtered = records.filter(rec => {
-                    if (filterType && rec.type !== filterType) return false;
-                    if (filterText) {
-                        const hay = (rec.domain + ' ' + formatContent(rec)).toLowerCase();
-                        if (!hay.includes(filterText)) return false;
-                    }
-                    return true;
-                });
-
-                if (stats) stats.textContent = `共 ${records.length} 条网站规则 · 当前显示 ${filtered.length} 条（全局域名黑名单不区分网站，请在"管理规则"中维护）`;
-
-                if (filtered.length === 0) {
-                    list.innerHTML = '<li class="empty-tip">未匹配到规则。若仅存在全局域名黑名单（不区分网站），则此处为空属正常。</li>';
-                    return;
-                }
-
-                list.innerHTML = filtered.map(rec => `
-                    <li class="rule-item">
-                        <div class="rule-content">
-                            <span class="as-site" title="${escapeHTML(rec.domain)}">${escapeHTML(rec.domain)}</span><span class="tag ${rec.tag}">${rec.label}</span> ${formatContent(rec)}
-                        </div>
-                        <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}">删除</button>
-                    </li>
-                `).join('');
-            };
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">🗂 按网站查看所有规则</h3>
-                <p>列出所有针对特定网站的规则（按域名隔离的 7 类：静态/动态/正则/属性/位置/积木/路径），便于跨站查看与删除。全局域名黑名单不区分网站，请在"管理规则"中维护。</p>
-                <div class="gd-toolbar">
-                    <input type="text" id="as-filter" placeholder="输入网站或规则内容关键字过滤..." />
-                    <select id="as-type-filter">
-                        <option value="">全部类型</option>
-                        <option value="static">静态</option>
-                        <option value="dynamic">动态</option>
-                        <option value="regex">正则</option>
-                        <option value="attribute">属性</option>
-                        <option value="structural">位置</option>
-                        <option value="complex">积木</option>
-                        <option value="pathPattern">路径</option>
-                    </select>
-                </div>
-                <div class="gd-stats" id="as-stats"></div>
-                <div class="selection-info" style="max-height: 360px; overflow-y: auto;">
-                    <ul class="rule-list" id="as-list"></ul>
-                </div>
-                <div class="section-divider"></div>
-                <div class="btn-group">
-                    <button class="btn-warning" id="as-refresh">🔄 刷新列表</button>
-                    <button class="btn-outline" id="as-back">返回管理</button>
-                    <button class="btn-outline" id="as-close">关闭</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-            renderList();
-
-            panel.querySelector('#as-filter').addEventListener('input', (e) => {
-                filterText = e.target.value.trim().toLowerCase();
-                renderList();
-            });
-            panel.querySelector('#as-type-filter').addEventListener('change', (e) => {
-                filterType = e.target.value;
-                renderList();
-            });
-            panel.querySelector('#as-refresh').addEventListener('click', () => {
-                records = storage.getAllSiteRules();
-                renderList();
-            });
-            panel.querySelector('#as-back').addEventListener('click', () => this.showManager());
-            panel.querySelector('#as-close').addEventListener('click', () => this.clearPanel());
-
-            // 事件委托：删除按钮（删除后即时刷新 records 与索引，避免索引错位）
-            panel.querySelector('#as-list').addEventListener('click', (e) => {
-                const btn = e.target.closest('.btn-delete');
-                if (!btn) return;
-                const domain = btn.getAttribute('data-domain');
-                const type = btn.getAttribute('data-type');
-                const index = parseInt(btn.getAttribute('data-index'), 10);
-                if (!confirm(`确认删除【${domain}】的 ${type} 规则 #${index}？`)) return;
-                if (storage.removeRuleForDomain(domain, type, index)) {
-                    records = storage.getAllSiteRules();
-                    renderList();
-                }
-            });
-        }
-
         // 自动化泛化规则管理面板：展示双轨（域名/路径）泛化结果与熔断日志，支持删除与重新泛化
         showGeneralizationPanel() {
             this.clearPanel();
@@ -4557,7 +4621,6 @@
         GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => getUI().showOverlayScanPanel());
         GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI().showRegexPanel());
         GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI().showManager());
-        GM_registerMenuCommand('🗂 按网站查看所有规则', () => getUI().showAllSitesPanel());
         GM_registerMenuCommand('🤖 自动化泛化规则', () => getUI().showGeneralizationPanel());
         GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI().showExportPanel());
         GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => getUI().showAdGuardExportPanel());
