@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.6.3
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.3：修复预览还原属性残留(selectedSet索引错误/TDZ/深度扫描双Toast/正则去重缺mode)、attribute预览保护、路径预览3通道对齐、regex保存ReDoS预检、短词单词边界匹配、预览隐藏口径统一为hideElement/showElement。
+// @version      0.6.4
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.4：预览ReDoS防护、ov-select-high与初始化逻辑统一、_performUndo改用reapplyAll、短词正则预编译、runScan首次加载避免双重渲染。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -144,6 +144,13 @@
     const VICE_SHORT_TOKENS = new Set(
         Array.from(VICE_TOKENS_UNIFIED).filter(kw => kw.length <= 3)
     );
+    // 预编译短词边界正则(问题3)：isAdKeywordHost 对每个域名调用一次，大页面 30-50 个域名 ×
+    // 每次循环 ~20 个短词 new RegExp 会创建大量临时对象。模块初始化时预编译一次，运行时复用
+    const VICE_SHORT_RE_MAP = new Map();
+    VICE_SHORT_TOKENS.forEach(kw => {
+        const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        VICE_SHORT_RE_MAP.set(kw, new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i'));
+    });
 
     // 检测 hostname 是否含广告关键词：按非字母数字分词后逐 token 查 Set
     const isAdKeywordHost = (hostname) => {
@@ -164,8 +171,8 @@
             // 长词(≥4)仍用 includes 子串匹配，保留 casino888/bet365 等拼接形式命中
             for (const kw of VICE_TOKENS_UNIFIED) {
                 if (VICE_SHORT_TOKENS.has(kw)) {
-                    // 短词：用非字母数字边界确保完整 token 匹配（ag-bbin 中 ag 算命中）
-                    if (new RegExp(`(^|[^a-z0-9])${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(sld)) return true;
+                    // 短词：复用预编译边界正则(问题3)，避免每次调用 new RegExp
+                    if (VICE_SHORT_RE_MAP.get(kw).test(sld)) return true;
                 } else if (sld.includes(kw)) {
                     return true;
                 }
@@ -3853,11 +3860,9 @@
                         storage.addRule(it.type, it.rule);
                     }
                 });
-                BlockEngine.restoreAllInlineStyles();
-                BlockEngine.applyCSSRules();
-                BlockEngine.applyRegexRules();
-                BlockEngine.applyComplexRules();
-                BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                // 统一调用 reapplyAll(问题2)：与删除规则后重新应用逻辑保持一致，
+                // 将来 reapplyAll 增加步骤（如覆盖层重扫）时撤销逻辑自动跟上
+                BlockEngine.reapplyAll();
                 this.showToast(entry.batch ? `已撤销批量删除（${items.length} 条）` : '已撤销删除', 'success');
             } catch (e) {
                 console.error('[Pro Blocker] 撤销失败:', e);
@@ -5113,6 +5118,12 @@
                     if (!isContains) {
                         try { regex = new RegExp(text, 'i'); }
                         catch (err) { this.showToast('规则校验失败：正则表达式存在语法错误。', 'error'); return; }
+                        // 预览 ReDoS 预检(问题4)：applyRegexRules 会用 isRegexSafe 过滤嵌套量词，
+                        // 预览时不检查会导致 regex.test 在每个文本节点上执行，可能触发灾难性回溯卡死页面
+                        if (!BlockEngine.isRegexSafe(text)) {
+                            this.showToast('规则校验失败：正则含嵌套量词（ReDoS 风险），已拒绝预览。', 'error');
+                            return;
+                        }
                     }
 
                     // 与 applyRegexRules 保持一致：跳过 SCRIPT/STYLE/NOSCRIPT 内的文本，
@@ -6333,11 +6344,12 @@
             // 先渲染加载占位(BUG-S2)，再启动异步扫描；扫描完成后用真实结果重绘
             render();
             // 共享扫描执行器：初始加载 / 重新扫描 / 深度扫描统一调用，避免重复代码
-            const runScan = async () => {
-                // 首次加载时外部已设 scanning=true 并 render()，这里无需重复；
-                // 重新扫描/深度扫描复用此函数，需重置 scanning 并重渲染(冗余-2 注释说明)
-                scanning = true;
-                render();
+            // skipInitialRender=true 时跳过内部 scanning=true+render()，供首次加载复用外部已渲染的占位(问题5)
+            const runScan = async (skipInitialRender = false) => {
+                if (!skipInitialRender) {
+                    scanning = true;
+                    render();
+                }
                 try {
                     // collectAll 内部已调用 OverlayAdScanner.scan()，此处不再冗余预调用(BUG-M6)
                     const collected = await collectAll();
@@ -6360,7 +6372,8 @@
                     return false; // 扫描失败：避免回调再显示矛盾的"深度扫描完成"Toast
                 }
             };
-            runScan();
+            // 首次加载：外部已渲染加载占位，跳过 runScan 内部重复渲染(问题5)
+            runScan(true);
 
             // 预览状态：实例属性，clearPanel 切换/关闭面板时兜底还原，避免预览隐藏的元素永久残留
             // 实时联动模式：预览激活时，选择变化自动更新预览（隐藏新增选中 / 还原取消选中），无需手动重置
@@ -6419,7 +6432,8 @@
 
             panel.querySelector('#ov-only-high').addEventListener('change', (e) => { onlyHigh = e.target.checked; render(); });
             panel.querySelector('#ov-select-high').addEventListener('click', () => {
-                records.forEach((r, i) => { if (r.highRisk) selectedSet.add(i); });
+                // 与 runScan 初始化逻辑一致(问题1)：排除已拦截项，避免重复生成持久化规则
+                records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
                 updatePreview();
                 render();
             });
