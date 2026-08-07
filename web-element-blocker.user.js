@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.4.0
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。新增双算法协同系统：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。
+// @version      0.5.0
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.5.0：选择模式导航冻结防跳转、规则影响度排序排查误杀、扩大博彩/色情域名检测、UI保护统一化、移除无效LR评分与拓扑指纹算法。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -52,7 +52,14 @@
         'metrics', 'ping', 'beacon', 'pixel', 'logger'
     ]);
     // 赌博/色情/可疑跳转常用 TLD：被博彩站广泛滥用
-    const GAMBLING_TLDS = new Set(['cc', 'vip', 'top', 'xyz', 'club', 'icu', 'asia', 'kim', 'win', 'bet', 'loan', 'review', 'trade', 'stream', 'download', 'live', 'shop', 'fun', 'space', 'racing', 'party']);
+    // 扩展高频滥用 TLD：免费域名（tk/ml/ga/cf/gq）与廉价批量注册域（pw/buzz/cyou/monster/rest/cfd/sbs）
+    const GAMBLING_TLDS = new Set([
+        'cc', 'vip', 'top', 'xyz', 'club', 'icu', 'asia', 'kim', 'win', 'bet',
+        'loan', 'review', 'trade', 'stream', 'download', 'live', 'shop', 'fun',
+        'space', 'racing', 'party',
+        'pw', 'tk', 'ml', 'ga', 'cf', 'gq', 'buzz', 'cyou', 'monster',
+        'rest', 'cfd', 'bar', 'sbs', 'cymru', 'wales'
+    ]);
     // 检测 hostname 是否含广告关键词：按非字母数字分词后逐 token 查 Set
     const isAdKeywordHost = (hostname) => {
         if (!hostname || typeof hostname !== 'string') return false;
@@ -67,9 +74,23 @@
             const sld = labels[labels.length - 2] || '';
             // 5955123.cc / 016.com 这种纯数字博彩域
             if (/^\d+$/.test(sld)) return true;
-            // 含赌博词：casino888.cc / bet365.cc 等
-            for (const kw of ['casino', 'bet', 'poker', 'bocai', 'porn', 'sex', 'cam']) {
+            // 含赌博/色情词：casino888.cc / bet365.cc / ag-bbin.vip 等
+            const viceKeywords = [
+                'casino', 'bet', 'poker', 'bocai', 'porn', 'sex', 'cam',
+                'slot', 'lottery', 'jackpot', 'gamble', 'wager', 'lucky',
+                'adult', 'xxx', 'hentai', 'nsfw', 'live', 'hookup',
+                'ag', 'bbin', 'mg', 'pt', 'sb', 'ibc', 'sbo', 'cmd',
+                'sunbet', 'maxbet', 'yazhou', 'caipiao', 'cp'
+            ];
+            for (const kw of viceKeywords) {
                 if (sld.includes(kw)) return true;
+            }
+        }
+        // 纯数字二级域（4 位及以上）+ 可疑 TLD：典型博彩短链域名特征
+        if (labels.length >= 2) {
+            const sld = labels[labels.length - 2] || '';
+            if (/^\d{4,}$/.test(sld) && GAMBLING_TLDS.has(labels[labels.length - 1])) {
+                return true;
             }
         }
         return false;
@@ -653,9 +674,6 @@
         // 已扫描节点弱引用集合：避免对同一节点重复执行资源域/路径扫描（O(1) 判重）
         // WeakSet 不阻止 GC，节点从 DOM 移除后自动释放，杜绝内存泄漏
         static _scannedNodes = new WeakSet();
-        // 拓扑指纹缓存：WeakMap 按 element 引用键控，DOM 不变时重复调用直接 O(1) 命中
-        // DOMContentLoaded + load + SPA 导航会对同一批元素重复计算指纹，缓存命中率 ~95%
-        static _topoFpCache = new WeakMap();
         // CSSOM 增量注入指纹：记录上次注入的选择器集合，内容未变时跳过重建
         static _lastCSSFingerprint = '';
         // Constructable Stylesheets 支持：Chrome 99+/Edge/Firefox 101+ 支持，
@@ -754,21 +772,12 @@
 
         // ReDoS 静态预检：在执行前检测危险模式，拒绝执行可能引发灾难性回溯的正则
         // 替代原"执行后检测耗时"的伪保护（ReDoS 在 test() 内部阻塞，事后检测无法阻止卡顿）
+        // 仅检测嵌套量词（真正的 ReDoS 元凶），移除过于保守的"重叠分支"检测（误杀率高）
         static isRegexSafe(pattern) {
             if (!pattern || typeof pattern !== 'string') return false;
             // 嵌套量词检测：(a+)+, (a*)*, (a{1,3})+, (a+)? 等
             if (/\([^)]*[+*?][^)]*\)[+*?]/.test(pattern)) return false;
             if (/\([^)]*\{\d+(?:,\d*)?\}[^)]*\)[+*?]/.test(pattern)) return false;
-            // 重叠分支 + 量词：(a|ab)+, (a|a)* —— 前缀重叠导致回溯爆炸
-            const m = pattern.match(/\(([^)]+)\)[+*?]/);
-            if (m) {
-                const branches = m[1].split('|');
-                for (let i = 0; i < branches.length; i++) {
-                    for (let j = 0; j < branches.length; j++) {
-                        if (i !== j && branches[j].length > 0 && branches[i].startsWith(branches[j])) return false;
-                    }
-                }
-            }
             return true;
         }
 
@@ -872,12 +881,19 @@
 
             let candidates;
             try {
-                candidates = root.querySelectorAll('a, iframe, div, button, span, img, object, embed');
+                // 扩大选择器范围：ins（广告常用标签）+ 所有带内联事件的元素 + data-* 跳转属性
+                // + 内联 position/z-index 的 div（覆盖层广告常通过内联样式定位）
+                candidates = root.querySelectorAll(
+                    'a, iframe, div, button, span, img, object, embed, ins, ' +
+                    '[onclick], [ontouchstart], [onmousedown], ' +
+                    '[data-href], [data-url], [data-link], ' +
+                    'div[style*="position"], div[style*="z-index"]'
+                );
             } catch (e) { return results; }
 
             candidates.forEach(el => {
-                if (el.id === 'pro-blocker-ui-host') return;
-                if (el.closest && el.closest('#pro-blocker-ui-host')) return;
+                // 统一保护判定：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过，避免误伤面板
+                if (UIManager.isProtectedElement(el)) return;
                 if (el.style.display === 'none') return;
 
                 // 两阶段过滤：先用廉价的 getBoundingClientRect 过滤面积/视口，
@@ -964,8 +980,9 @@
 
             // 穿透 Shadow DOM 边界：querySelectorAll 不进入 shadow root，需递归扫描 shadow 内的覆盖层
             // 广告 SDK 常在 shadow 内注入透明跳转层以规避常规选择器，不递归则完全漏拦
+            // 脚本自身的 closed shadowRoot 不可访问，且 isProtectedElement 已在候选遍历时排除
             candidates.forEach(el => {
-                if (el.shadowRoot) {
+                if (el.shadowRoot && !UIManager.isProtectedElement(el)) {
                     const shadowResults = this.scanInvisibleOverlays({ autoBlock, root: el.shadowRoot, minSize, _depth: _depth + 1 });
                     for (let i = 0; i < shadowResults.length; i++) results.push(shadowResults[i]);
                 }
@@ -1234,6 +1251,8 @@
 
             const _t0 = performance.now();
             elements.forEach(el => {
+                // 全局保护：脚本自身 UI 宿主及其子节点跳过，避免误伤面板
+                if (UIManager.isProtectedElement(el)) return;
                 let blocked = false;
                 let matchedDomain = '';
                 let matchedPattern = '';
@@ -1429,9 +1448,13 @@
         static _hideRegexAncestor(node, level) {
             let element = node.parentElement;
             if (!element) return;
+            // 全局保护：避免正则规则隐藏到脚本自身 UI 宿主
+            if (UIManager.isProtectedElement(element)) return;
             for (let i = 0; i < level; i++) {
                 if (element.parentElement && element.parentElement !== document.body) {
                     element = element.parentElement;
+                    // 上溯过程中再次校验，避免选中受保护祖先
+                    if (UIManager.isProtectedElement(element)) return;
                 } else break;
             }
             if (element && element.style.display !== 'none') {
@@ -1481,6 +1504,8 @@
                         : root.querySelectorAll(baseSelector);
 
                     elements.forEach(el => {
+                        // 全局保护：脚本自身 UI 宿主跳过，避免积木规则误伤面板
+                        if (UIManager.isProtectedElement(el)) return;
                         if (baseSelector === '*' && (el.textContent || '').length > 3000) return;
 
                         const results = rule.conditions.map(c => {
@@ -1544,7 +1569,6 @@
             }
             this.applyRegexRules(root);
             this.applyComplexRules(root);
-            this.applyTopologyRules(root);
             // 观察后续动态注入的节点与属性变更
             const obs = new MutationObserver((mutations) => {
                 const batchNodes = [];
@@ -1564,7 +1588,7 @@
                     if (cur.domainList.length > 0 || cur.pathPatterns.length > 0) {
                         batchNodes.forEach(node => this.scanAndBlockDynamic(node, cur.domainList, cur.pathPatterns, { force: true }));
                     }
-                    // 去抖执行正则/积木/拓扑规则：shadow 边界外的主观察器无法覆盖 shadow 内动态内容
+                    // 去抖执行正则/积木规则：shadow 边界外的主观察器无法覆盖 shadow 内动态内容
                     // 不补充此调用则这些规则类型对 shadow 内动态广告完全失效
                     this._scheduleShadowApply(root);
                 }
@@ -1572,7 +1596,7 @@
             obs.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'data-src', 'data-original', 'data-href', 'data-url', 'data-link', 'data-lazy-src', 'data-srcset', 'poster', 'srcset'] });
         }
 
-        // 去抖对 shadow root 应用正则/积木/拓扑规则 + 覆盖层扫描，避免高频 mutation 重复全量扫描
+        // 去抖对 shadow root 应用正则/积木规则 + 覆盖层扫描，避免高频 mutation 重复全量扫描
         static _scheduleShadowApply(root) {
             const existing = this._shadowApplyTimers.get(root);
             if (existing) clearTimeout(existing);
@@ -1580,7 +1604,6 @@
                 this._shadowApplyTimers.delete(root);
                 this.applyRegexRules(root);
                 this.applyComplexRules(root);
-                this.applyTopologyRules(root);
                 // shadow 内动态注入的透明跳转层同样需拦截，与主观察器行为一致
                 this.scanInvisibleOverlays({ autoBlock: true, root: root });
             }, 150);
@@ -1606,7 +1629,6 @@
                 if (rawNodes.length === 0) {
                     this.applyRegexRules();
                     this.applyComplexRules();
-                    this.applyTopologyRules();
                     // 不可见覆盖层扫描：动态注入的透明 overlay 也需在去抖窗口内拦截
                     this.scanInvisibleOverlays({ autoBlock: true });
                     return;
@@ -1618,13 +1640,11 @@
                 if (nodes.length === 0) {
                     this.applyRegexRules();
                     this.applyComplexRules();
-                    this.applyTopologyRules();
                     this.scanInvisibleOverlays({ autoBlock: true });
                 } else {
                     nodes.forEach(node => {
                         this.applyRegexRules(node);
                         this.applyComplexRules(node);
-                        this.applyTopologyRules(node);
                         // 对新增子树单独扫描，避免每次都全页扫描
                         this.scanInvisibleOverlays({ autoBlock: true, root: node });
                     });
@@ -1766,7 +1786,6 @@
                 if (document.body) {
                     this.applyRegexRules();
                     this.applyComplexRules();
-                    this.applyTopologyRules();
                     this.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                     // 不可见覆盖层在 body 就绪后立即扫描，防止首次进入就被透明 overlay 截获点击
                     this.scanInvisibleOverlays({ autoBlock: true });
@@ -1790,7 +1809,6 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                this.applyTopologyRules();
                 if (document.body) {
                     this.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                     this.scanInvisibleOverlays({ autoBlock: true });
@@ -1802,7 +1820,6 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                this.applyTopologyRules();
                 if (document.body) {
                     this.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                     this.scanInvisibleOverlays({ autoBlock: true });
@@ -1822,7 +1839,6 @@
                 this.applyCSSRules();
                 this.applyRegexRules();
                 this.applyComplexRules();
-                this.applyTopologyRules();
                 if (document.body) {
                     this.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                     this.scanInvisibleOverlays({ autoBlock: true });
@@ -1888,7 +1904,7 @@
 
         /**
          * MurmurHash3 (x86 32-bit) —— 位操作优化的非加密哈希。
-         * 用于模糊拓扑指纹：将 DOM 骨架字符串压缩为定长 hex，避免存储与比对原始结构串。
+         * 用于规则 ID 生成：将规则内容压缩为定长 hex，便于去重与导出引用。
          * 仅用 Math.imul（32-bit 整数乘法）与位运算，无浮点开销。
          */
         static murmur32(str) {
@@ -1909,105 +1925,6 @@
             h = Math.imul(h, 0xc2b2ae35);
             h ^= h >>> 16;
             return (h >>> 0).toString(16);
-        }
-
-        /**
-         * 模糊拓扑指纹（Fuzzy Topology Signature）：
-         * 抛弃脆弱的兄弟节点索引（广告脚本插入空 div 即可破坏），
-         * 仅采集"元素自身及父容器的固定骨架信息"（Tag + className 长度分布 + 结构层级），
-         * 经 MurmurHash3 压缩为 hex。前缀 'mh:' 标记新算法，便于旧规则迁移识别。
-         * 当精准 Selector 因 Tailwind/随机插入层失效时，用指纹兜底定位广告容器。
-         */
-        static generateTopologyFingerprint(element) {
-            if (!element || element.nodeType !== Node.ELEMENT_NODE) return '';
-            let topology = '';
-            let current = element;
-            let depth = 0;
-            // 沿父链上溯至 body（不含），最多 5 层；采集 tag + className 长度（不采 class 名，抗随机化）
-            while (current && current !== document.body && current.nodeType === Node.ELEMENT_NODE && depth < 5) {
-                const tag = current.tagName;
-                const classDist = typeof current.className === 'string' ? current.className.length : 0;
-                topology += `${tag}(${classDist})_`;
-                current = current.parentElement;
-                depth++;
-            }
-            return 'mh:' + this.murmur32(topology);
-        }
-
-        /**
-         * 旧版拓扑规则迁移：v0.2.11 之前的 topoHash 为明文结构串（无 'mh:' 前缀），
-         * 与新算法不兼容。无法离线重算（缺原元素），故剥离 topoHash 让规则退化为
-         * 纯 Selector 匹配（安全默认）。仅执行一次（topoHashMigrated 标记持久化）。
-         */
-        static migrateTopoHashes() {
-            try {
-                if (storage._readKey('topoHashMigrated', false)) return;
-                // 遍历所有域名的 structural 规则（getData() 仅返回当前域名，须直接读 structBlocks 字典）
-                const allStruct = storage._readKey('structBlocks', {});
-                let touched = false;
-                for (const domain in allStruct) {
-                    if (!Object.prototype.hasOwnProperty.call(allStruct, domain)) continue;
-                    const arr = allStruct[domain];
-                    if (!Array.isArray(arr)) continue;
-                    arr.forEach(r => {
-                        if (r && r.topoHash && typeof r.topoHash === 'string' && !r.topoHash.startsWith('mh:')) {
-                            delete r.topoHash; // 旧明文指纹剥离，回退到 Selector 兜底
-                            touched = true;
-                        }
-                    });
-                }
-                if (touched) {
-                    storage._markDirty('structBlocks', allStruct);
-                    storage.invalidateDataCache();
-                    BlockEngine.invalidateCache();
-                }
-                storage._markDirty('topoHashMigrated', true);
-            } catch (e) {
-                console.warn('[Pro Blocker] 拓扑指纹迁移失败：', e);
-            }
-        }
-
-        /**
-         * 拓扑哈希兜底拦截：扫描 DOM 中与已存储拓扑指纹匹配的元素并隐藏。
-         * 仅在精准 CSS Selector 可能失效的站点（Tailwind/随机层）起兜底作用。
-         */
-        static applyTopologyRules(targetNode = document.body) {
-            const data = storage.getData();
-            if (!data.structural || data.structural.length === 0 || !targetNode) return;
-
-            // 仅处理带新算法（'mh:' 前缀）topoHash 的规则；旧明文指纹已由 migrateTopoHashes 剥离
-            const hashSet = new Set();
-            data.structural.forEach(r => {
-                if (r.topoHash && typeof r.topoHash === 'string' && r.topoHash.startsWith('mh:')) hashSet.add(r.topoHash);
-            });
-            if (hashSet.size === 0) return;
-
-            // ShadowRoot(DOCUMENT_FRAGMENT_NODE) 与 Element 均可直接 querySelectorAll；
-            // 其它节点类型（如文本节点）回退到 parentElement
-            const root = (targetNode.nodeType === Node.ELEMENT_NODE || targetNode.nodeType === Node.DOCUMENT_FRAGMENT_NODE)
-                ? targetNode : targetNode.parentElement;
-            if (!root) return;
-
-            // 扫描常见广告容器标签，O(candidates) 匹配
-            let candidates;
-            try {
-                candidates = root.querySelectorAll('div, span, a, p, img, li, ul, iframe, section, article, aside, header, footer, nav');
-            } catch (e) { return; }
-
-            candidates.forEach(el => {
-                if (el.style.display === 'none') return; // 已隐藏跳过
-                // 拓扑指纹缓存：DOM 不变时直接复用，避免重复 5 层父链遍历 + murmur32
-                let fp = this._topoFpCache.get(el);
-                if (fp === undefined) {
-                    fp = this.generateTopologyFingerprint(el);
-                    this._topoFpCache.set(el, fp);
-                }
-                if (hashSet.has(fp)) {
-                    this.stats.domBlocks++;
-                    el.style.setProperty('display', 'none', 'important');
-                    el.style.setProperty('opacity', '0', 'important');
-                }
-            });
         }
 
         /**
@@ -2202,105 +2119,6 @@
     }
 
     /**
-     * 广告域置信度评分引擎（Logistic Regression）
-     * 用 Sigmoid 将线性累加压缩到 (0,1) 概率区间，从数学根源上解决"分数无上限"与基础设施域名被误杀。
-     * 结合香农熵特征识别 DGA（域名生成算法）产生的随机子域，对抗广告 SDK 的域名规避手段。
-     * 零依赖、微秒级推理：当 evaluate(url) ≥ 阈值时由网络层自动加入拦截队列，减少人工指认成本。
-     */
-    class AdScorerLR {
-        // 向量化权重（Float32Array 连续内存布局，近似向量点积加速）
-        // 索引 0-5 对应 6 个正向广告特征；索引 6 为 DGA 高熵惩罚特征
-        static weights = new Float32Array([2.5, 2.8, 1.8, 2.0, 2.2, 1.5, 2.0]);
-        // 词元→权重索引映射（O(1) 查表替代对象属性查找）
-        static keywordMap = new Map([
-            ['ad', 0], ['ads', 1], ['analytics', 2], ['track', 3],
-            ['banner', 4], ['pixel', 5]
-        ]);
-        static ENTROPY_INDEX = 6;
-        // 基础偏置：抑制默认得分，需累计足够正向特征才能突破拦截阈值
-        static bias = -2.5;
-        // 自动拦截阈值（0-100）：仅当得分 ≥ 85 才自动拦截，兼顾检测率与误杀控制
-        static AUTO_BLOCK_THRESHOLD = 85;
-        // 安全 CDN 白名单：与 extractResourceDomains 的 KNOWN_SAFE_CDNS 保持一致，LR 自动拦截豁免
-        static safeCDNs = new Set([
-            'ajax.googleapis.com', 'fonts.googleapis.com', 'fonts.gstatic.com',
-            'cdn.jsdelivr.net', 'unpkg.com', 'cdnjs.cloudflare.com', 'code.jquery.com',
-            'stackpath.bootstrapcdn.com', 'maxcdn.bootstrapcdn.com', 'cdn.bootcss.com',
-            'staticfile.org', 'cdn.staticfile.org', 'www.google.com', 'www.recaptcha.net',
-            'challenges.cloudflare.com', 'hcaptcha.com', 'static.cloudflareinsights.com'
-        ]);
-
-        // Sigmoid 激活：将线性结果 z 压缩到 (0,1)
-        static sigmoid(z) {
-            // 数值稳定：z 过大/过小时 Math.exp 溢出，裁剪到安全区间
-            if (z > 30) return 1;
-            if (z < -30) return 0;
-            return 1 / (1 + Math.exp(-z));
-        }
-
-        // 香农熵：Uint8Array 计数版，识别 DGA 生成的随机子域名（hostname 为 ASCII，charCodeAt ≤255）
-        static getEntropy(str) {
-            const len = str.length;
-            if (len === 0) return 0;
-            const counts = new Uint8Array(256);
-            for (let i = 0; i < len; i++) counts[str.charCodeAt(i)]++;
-            let entropy = 0;
-            for (let i = 0; i < 256; i++) {
-                if (counts[i] > 0) {
-                    const p = counts[i] / len;
-                    entropy -= p * Math.log2(p);
-                }
-            }
-            return entropy;
-        }
-
-        // 主干推理：输出 0-100 标准化得分。无效 URL 放行（返回 0）
-        // 仅取 hostname 分词（路径信号由 DOM 扫描层覆盖，hostname 更稳定不易误杀）
-        static evaluate(urlStr) {
-            let z = this.bias;
-            try {
-                const url = new URL(urlStr, location.href);
-                const tokens = url.hostname.toLowerCase().split(/[^a-z0-9]/);
-                // 1. 词元特征匹配与权重累加（Map 查表 + Float32Array 索引）
-                for (let i = 0; i < tokens.length; i++) {
-                    const idx = this.keywordMap.get(tokens[i]);
-                    if (idx !== undefined) z += this.weights[idx];
-                }
-                // 2. 结构特征：规避型子域名高熵检测（DGA 对抗），取首个子域标签
-                const sub = url.hostname.split('.')[0];
-                if (sub.length >= 8 && this.getEntropy(sub) > 3.6) {
-                    z += this.weights[this.ENTROPY_INDEX];
-                }
-            } catch (e) {
-                return 0;
-            }
-            // 3. 概率映射 → 0-100；z≤0 时直接返回 0（普通域名默认低分，无需 sigmoid 计算）
-            return z > 0 ? Math.round(this.sigmoid(z) * 100) : 0;
-        }
-
-        // 自动拦截判定：同源/安全 CDN 豁免，仅高分广告域自动拦截
-        static shouldAutoBlock(urlStr) {
-            if (!urlStr || typeof urlStr !== 'string') return false;
-            try {
-                const u = new URL(urlStr, location.href);
-                if (!u.hostname) return false;
-                const host = u.hostname.toLowerCase();
-                // 同源豁免
-                if (host === location.hostname || host.endsWith('.' + location.hostname)) return false;
-                // 安全 CDN 豁免（含父域上探）
-                if (this.safeCDNs.has(host)) return false;
-                const parts = host.split('.');
-                for (let i = 1; i < parts.length - 1; i++) {
-                    if (this.safeCDNs.has(parts.slice(i).join('.'))) return false;
-                }
-                return this.evaluate(urlStr) >= this.AUTO_BLOCK_THRESHOLD;
-            } catch (e) {
-                return false;
-            }
-        }
-    }
-
-    /**
      * 网络层拦截器：在 document-start 阶段劫持 fetch / XHR / script.src，
      * 命中全局域名黑名单或路径模式时直接丢弃请求，从源头阻止广告资源加载（而非等 DOM 渲染后再隐藏）。
      * 判定逻辑复用 BlockEngine.isUrlBlocked，与 DOM 层拦截规则完全一致，避免双标。
@@ -2314,12 +2132,8 @@
         }
 
         static isUrlBlocked(url) {
-            // 1. 显式规则拦截：域名黑名单 + 路径模式（与 DOM 层规则一致）
-            if (BlockEngine.isUrlBlocked(url)) return true;
-            // 2. LR 置信度自动拦截：高分广告域自动加入拦截队列，减少人工指认成本
-            //    阈值 85 + 同源/安全 CDN 豁免，确保不误伤基础设施与同站资源
-            if (AdScorerLR.shouldAutoBlock(url)) return true;
-            return false;
+            // 显式规则拦截：域名黑名单 + 路径模式（与 DOM 层规则一致）
+            return BlockEngine.isUrlBlocked(url);
         }
 
         static hookFetch() {
@@ -2792,8 +2606,8 @@
                 const candidates = document.querySelectorAll(QUICK_SEL);
                 for (const el of candidates) {
                     if (seen.has(el)) continue;
-                    // 排除脚本自身 UI 宿主，避免扫描到自己的面板
-                    if (el.id === 'pro-blocker-ui-host' || (el.closest && el.closest('#pro-blocker-ui-host'))) continue;
+                    // 统一保护判定：脚本自身 UI 宿主（含 Shadow DOM 内部节点）跳过
+                    if (UIManager.isProtectedElement(el)) continue;
                     seen.add(el);
                     const f = _analyzeElement(el);
                     if (f.suspicion > 0) results.push(f);
@@ -2805,7 +2619,7 @@
                 const positioned = document.querySelectorAll('div,section,aside,article');
                 for (const el of positioned) {
                     if (seen.has(el)) continue;
-                    if (el.id === 'pro-blocker-ui-host' || (el.closest && el.closest('#pro-blocker-ui-host'))) continue;
+                    if (UIManager.isProtectedElement(el)) continue;
                     const cs = _cs(el);
                     if (!cs) continue;
                     if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
@@ -2820,7 +2634,7 @@
                 const clickableImgs = document.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
                 for (const img of clickableImgs) {
                     if (seen.has(img)) continue;
-                    if (img.closest && img.closest('#pro-blocker-ui-host')) continue;
+                    if (UIManager.isProtectedElement(img)) continue;
                     seen.add(img);
                     const f = _analyzeClickableImage(img);
                     if (f.suspicion > 0) results.push(f);
@@ -2833,7 +2647,7 @@
                 const inlineEventAds = document.querySelectorAll('[onclick], [ontouchstart], [onmousedown], [data-href], [data-url], [data-link]');
                 for (const el of inlineEventAds) {
                     if (seen.has(el)) continue;
-                    if (el.closest && el.closest('#pro-blocker-ui-host')) continue;
+                    if (UIManager.isProtectedElement(el)) continue;
                     seen.add(el);
                     const f = _analyzeInlineEventAd(el);
                     if (f.suspicion > 0) results.push(f);
@@ -2846,6 +2660,8 @@
         }
 
         function _analyzeElement(el) {
+            // 防御性保护：即使从外部直接调用也不会扫描脚本自身 UI
+            if (UIManager.isProtectedElement(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'unknown' };
             const f = { el, suspicion: 0, reasons: [], features: {}, category: 'unknown' };
             const cs = _cs(el);
             if (!cs) return f;
@@ -2936,6 +2752,7 @@
         }
 
         function _analyzeOverlay(el, cs) {
+            if (UIManager.isProtectedElement(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
             const f = { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
             const rect = _rect(el);
             const cls = (el.className || '').toString().toLowerCase();
@@ -2975,6 +2792,7 @@
         }
 
         function _analyzeClickableImage(img) {
+            if (UIManager.isProtectedElement(img)) return { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
             const f = { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
             const rect = _rect(img);
             const parent = img.closest('a, [onclick]');
@@ -3037,6 +2855,7 @@
         // 分析带内联事件的广告元素（移动端劫持核心）
         // 针对 [onclick] / [ontouchstart] / [onmousedown] / [data-href] 等元素
         function _analyzeInlineEventAd(el) {
+            if (UIManager.isProtectedElement(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
             const f = { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
             const tag = el.tagName.toLowerCase();
             const rect = _rect(el);
@@ -3151,6 +2970,8 @@
 
             // ② 拦截 <a> 点击 + onclick 内联跳转（捕获阶段）
             document.addEventListener('click', function (e) {
+                // 统一保护：脚本自身 UI 宿主内的点击不处理，避免误删面板
+                if (UIManager.isProtectedElement(e.target)) return;
                 // 先检查 <a href> 跳转
                 const link = e.target.closest && e.target.closest('a');
                 if (link) {
@@ -3161,7 +2982,8 @@
                         _navBlocked.push({ type: 'link.click', url: href, time: Date.now() });
                         console.warn('[OverlayAdScanner] 拦截链接:', href);
                         const container = link.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || link;
-                        container.remove();
+                        // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
+                        if (!UIManager.isProtectedElement(container)) container.remove();
                         return;
                     }
                 }
@@ -3182,7 +3004,8 @@
                                     _navBlocked.push({ type: 'onclick', url: url[1], time: Date.now() });
                                     console.warn('[OverlayAdScanner] 拦截 onclick 跳转:', url[1]);
                                     const container = target.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || target;
-                                    container.remove();
+                                    // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
+                                    if (!UIManager.isProtectedElement(container)) container.remove();
                                     return;
                                 }
                             }
@@ -3273,6 +3096,20 @@
      * 用户交互界面：基于 Shadow DOM 隔离
      */
     class UIManager {
+        // 全局不可侵犯保护判定：所有扫描/隐藏入口必须调用此函数，
+        // 统一排除脚本自身 UI 宿主（含其子元素、Shadow DOM 内部节点），
+        // 防止任何规则或扫描误伤面板导致整个脚本 UI 全毁
+        static isProtectedElement(el) {
+            if (!el) return true;
+            if (el.id === 'pro-blocker-ui-host') return true;
+            if (el.closest && el.closest('#pro-blocker-ui-host')) return true;
+            // Shadow DOM 内部节点保护：getRootNode 返回 ShadowRoot 时，其 host 即面板宿主
+            let root;
+            try { root = el.getRootNode && el.getRootNode(); } catch (e) { root = null; }
+            if (root && root.host && root.host.id === 'pro-blocker-ui-host') return true;
+            return false;
+        }
+
         constructor() {
             const existingHost = document.getElementById('pro-blocker-ui-host');
             if (existingHost) existingHost.remove();
@@ -3302,6 +3139,8 @@
             this._handleClick = this._handleClick.bind(this);
             this._handlePointerDown = this._handlePointerDown.bind(this);
             this._handleMouseDown = this._handleMouseDown.bind(this);
+            // 中键/右键辅助点击拦截：防止广告通过 auxclick 触发新标签打开跳转
+            this._handleAuxClick = this._handleAuxClick.bind(this);
             // 触屏处理函数同样在构造期绑定一次，保持引用稳定，避免 startSelection 重复 bind 已绑定函数
             this._handleTouchStart = this._handleTouchStart.bind(this);
             this._handleTouchMove = this._handleTouchMove.bind(this);
@@ -3551,6 +3390,9 @@
         startSelection() {
             this.stopSelection();
             this.injectHighlightStyle();
+            // 选择模式下完全冻结页面导航：广告常通过 window.open / location.href / form.submit
+            // 在 touchstart/click 触发瞬间跳转，仅靠事件 capture 无法兜底，必须从 API 层拦截
+            this._freezeNavigation();
             this._contextmenuHandler = (e) => {
                 e.preventDefault();
                 this.stopSelection();
@@ -3562,16 +3404,18 @@
             // 拦截事件必须尽可能早地阻止广告跳转：
             // ① pointerdown：在 mousedown/touchstart 之前触发，是最早可拦截的人机交互事件
             // ② document 级 capture：确保在所有目标阶段处理之前拦截（无论 body 是否被广告脚本清空）
-            // ③ 同时拦截 mouseover/click/touch*：覆盖鼠标 + 触屏 + pointer 三种交互模型
+            // ③ 同时拦截 mouseover/click/touch*/auxclick：覆盖鼠标 + 触屏 + pointer + 中键四种交互模型
             const registerOnDoc = () => {
-                document.addEventListener('pointerdown', this._handlePointerDown, { capture: true });
-                document.addEventListener('mousedown', this._handleMouseDown, { capture: true });
-                document.addEventListener('mouseover', this._handleMouseOver, true);
-                document.addEventListener('click', this._handleClick, true);
-                document.addEventListener('contextmenu', this._contextmenuHandler);
+                document.addEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
+                document.addEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
+                document.addEventListener('mouseover', this._handleMouseOver, { capture: true });
+                document.addEventListener('click', this._handleClick, { capture: true, passive: false });
+                document.addEventListener('contextmenu', this._contextmenuHandler, { capture: true });
                 document.addEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
                 document.addEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
                 document.addEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
+                // 拦截 auxclick（中键点击打开新标签、右键点击）：防止绕过 click 拦截触发跳转
+                document.addEventListener('auxclick', this._handleAuxClick, { capture: true });
             };
             registerOnDoc();
         }
@@ -3583,26 +3427,104 @@
             }
             document.removeEventListener('pointerdown', this._handlePointerDown, { capture: true });
             document.removeEventListener('mousedown', this._handleMouseDown, { capture: true });
-            document.removeEventListener('mouseover', this._handleMouseOver, true);
-            document.removeEventListener('click', this._handleClick, true);
+            document.removeEventListener('mouseover', this._handleMouseOver, { capture: true });
+            document.removeEventListener('click', this._handleClick, { capture: true });
             if (this._contextmenuHandler) {
-                document.removeEventListener('contextmenu', this._contextmenuHandler);
+                document.removeEventListener('contextmenu', this._contextmenuHandler, { capture: true });
                 this._contextmenuHandler = null;
             }
             if (this._handleTouchStart) document.removeEventListener('touchstart', this._handleTouchStart, { capture: true });
             if (this._handleTouchMove) document.removeEventListener('touchmove', this._handleTouchMove, { capture: true });
             if (this._handleTouchEnd) document.removeEventListener('touchend', this._handleTouchEnd, { capture: true });
+            if (this._handleAuxClick) document.removeEventListener('auxclick', this._handleAuxClick, { capture: true });
             if (this.highlightEl) {
                 this.highlightEl.classList.remove('pro-blocker-highlight');
                 this.highlightEl = null;
             }
+            // 恢复导航能力：必须与 _freezeNavigation 配对，否则页面所有跳转永久失效
+            this._unfreezeNavigation();
+        }
+
+        // 选择模式导航冻结：劫持所有可能触发跳转的 API，确保用户点击广告元素时页面不跳走
+        _freezeNavigation() {
+            // 幂等保护：重复调用不覆盖已保存的原始引用，避免恢复时还原成被劫持版本
+            if (this._navFrozen) return;
+            this._navFrozen = true;
+            this._origWindowOpen = window.open;
+            this._origLocationHrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+            this._origAssign = Location.prototype.assign;
+            this._origReplace = Location.prototype.replace;
+            this._origPushState = history.pushState;
+            this._origReplaceState = history.replaceState;
+            this._origFormSubmit = HTMLFormElement.prototype.submit;
+
+            window.open = (...args) => {
+                console.warn('[Pro Blocker] 选择模式：拦截 window.open', args[0]);
+                return null;
+            };
+            try {
+                const desc = this._origLocationHrefDesc;
+                if (desc && desc.set) {
+                    Object.defineProperty(Location.prototype, 'href', {
+                        get: desc.get,
+                        set: (val) => {
+                            console.warn('[Pro Blocker] 选择模式：拦截 location.href =', val);
+                        },
+                        configurable: true
+                    });
+                }
+            } catch (e) { }
+            Location.prototype.assign = function (url) {
+                console.warn('[Pro Blocker] 选择模式：拦截 location.assign', url);
+            };
+            Location.prototype.replace = function (url) {
+                console.warn('[Pro Blocker] 选择模式：拦截 location.replace', url);
+            };
+            history.pushState = function () { /* 静默：阻止 SPA 路由跳转 */ };
+            history.replaceState = function () { /* 静默 */ };
+            HTMLFormElement.prototype.submit = function () {
+                console.warn('[Pro Blocker] 选择模式：拦截 form.submit');
+            };
+        }
+
+        // 解除导航冻结：恢复所有被 _freezeNavigation 劫持的原始函数
+        _unfreezeNavigation() {
+            if (!this._navFrozen) return;
+            this._navFrozen = false;
+            if (this._origWindowOpen) window.open = this._origWindowOpen;
+            if (this._origLocationHrefDesc) {
+                try {
+                    Object.defineProperty(Location.prototype, 'href', this._origLocationHrefDesc);
+                } catch (e) { }
+            }
+            if (this._origAssign) Location.prototype.assign = this._origAssign;
+            if (this._origReplace) Location.prototype.replace = this._origReplace;
+            if (this._origPushState) history.pushState = this._origPushState;
+            if (this._origReplaceState) history.replaceState = this._origReplaceState;
+            if (this._origFormSubmit) HTMLFormElement.prototype.submit = this._origFormSubmit;
         }
 
         _handleMouseOver(e) {
-            if (!e.target || !e.target.closest || e.target.closest('#pro-blocker-ui-host')) return;
+            if (!e.target || !e.target.closest) return;
+            // 统一调用 isProtectedElement：覆盖 shadowRoot 内部子元素，防止选中面板自身
+            if (UIManager.isProtectedElement(e.target)) return;
             // 排除 body/html：透明覆盖层覆盖全页时 mouseover target 可能是 body/html，
             // 高亮整个页面会导致用户无法选择具体广告元素
             if (e.target === document.body || e.target === document.documentElement) return;
+            // 大面积元素智能降级：广告脚本可能清空 body 后重建一个超大容器，
+            // 此时选中整页容器无意义，自动降级到其首个有实际内容的子元素
+            const rect = e.target.getBoundingClientRect();
+            const vw = window.innerWidth, vh = window.innerHeight;
+            if (rect.width > vw * 0.9 && rect.height > vh * 0.9) {
+                const child = e.target.querySelector('div, section, aside, article, iframe, img, a');
+                if (child && !UIManager.isProtectedElement(child)) {
+                    if (this.highlightEl) this.highlightEl.classList.remove('pro-blocker-highlight');
+                    this.highlightEl = child;
+                    this.highlightEl.classList.add('pro-blocker-highlight');
+                    return;
+                }
+                return; // 无法找到更具体的子元素，不高亮
+            }
             if (this.highlightEl) this.highlightEl.classList.remove('pro-blocker-highlight');
             this.highlightEl = e.target;
             this.highlightEl.classList.add('pro-blocker-highlight');
@@ -3613,7 +3535,7 @@
             if (!e.touches || e.touches.length === 0) return;
             const touch = e.touches[0];
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
-            if (!target || !target.closest || target.closest('#pro-blocker-ui-host')) return;
+            if (!target || !target.closest || UIManager.isProtectedElement(target)) return;
             if (target === document.body || target === document.documentElement) return;
             if (this.highlightEl) this.highlightEl.classList.remove('pro-blocker-highlight');
             this.highlightEl = target;
@@ -3627,7 +3549,7 @@
             if (!e.changedTouches || e.changedTouches.length === 0) return;
             const touch = e.changedTouches[0];
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
-            if (!target || !target.closest || target.closest('#pro-blocker-ui-host')) return;
+            if (!target || !target.closest || UIManager.isProtectedElement(target)) return;
             if (target === document.body || target === document.documentElement) return;
             e.preventDefault();
             e.stopPropagation();
@@ -3638,7 +3560,7 @@
 
         // 阻止 touchstart 默认行为，防止广告通过 touch 事件直接触发跳转（移动端）
         _handleTouchStart(e) {
-            if (!e.target || !e.target.closest || e.target.closest('#pro-blocker-ui-host')) return;
+            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
@@ -3647,7 +3569,7 @@
         // pointerdown 是最早的人机交互事件，先于 mousedown/touchstart/click 触发
         // 在 capture 阶段拦截，确保广告 ontouchstart="this.click();" / onclick 无法执行
         _handlePointerDown(e) {
-            if (!e.target || !e.target.closest || e.target.closest('#pro-blocker-ui-host')) return;
+            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
             // 必须先 stop 掉广告可能的 ontouchstart / onclick
             e.preventDefault();
             e.stopPropagation();
@@ -3656,14 +3578,22 @@
 
         // mousedown 作为兜底：有些环境 pointerdown 不触发（如纯鼠标点击）
         _handleMouseDown(e) {
-            if (!e.target || !e.target.closest || e.target.closest('#pro-blocker-ui-host')) return;
+            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation && e.stopImmediatePropagation();
+        }
+
+        // 拦截中键/右键辅助点击：广告 <a target="_blank"> 中键点击会绕过 click 监听直接打开新标签
+        _handleAuxClick(e) {
+            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
         }
 
         _handleClick(e) {
-            if (!e.target || !e.target.closest || e.target.closest('#pro-blocker-ui-host')) return;
+            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
             // body/html 不是有效拦截目标，提示用户选择具体元素
             if (e.target === document.body || e.target === document.documentElement) {
                 e.preventDefault();
@@ -3675,6 +3605,12 @@
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
             this.stopSelection();
+            // 元素有效性校验：广告脚本可能在 stopSelection 触发的导航解冻瞬间移除目标元素
+            // 此时再 showActionPanel 会绑定失效引用，导致后续操作报错
+            if (!this._isElementInDOM(e.target)) {
+                alert('目标元素已失效，请重新选择。');
+                return;
+            }
             this.showActionPanel(e.target);
         }
 
@@ -3731,7 +3667,8 @@
             if (!el || !this._isElementInDOM(el)) return;
             const hideNode = (node) => {
                 if (!node || node === document.body || node === document.documentElement) return;
-                if (node.id === 'pro-blocker-ui-host' || (node.closest && node.closest('#pro-blocker-ui-host'))) return;
+                // 统一保护：脚本自身 UI 宿主跳过，预览时不隐藏面板
+                if (UIManager.isProtectedElement(node)) return;
                 if (node.style.display === 'none') return;
                 node.style.setProperty('display', 'none', 'important');
                 node.style.setProperty('opacity', '0', 'important');
@@ -3976,12 +3913,11 @@
                 this.clearPanel();
             });
 
-            // 物理结构拦截（同时生成拓扑指纹，作为 Selector 失效时的兜底定位）
+            // 物理结构拦截：基于元素位置路径生成选择器，作为 Selector 失效时的兜底定位
             panel.querySelector('#btn-struct').addEventListener('click', () => {
                 const el = this.currentSelectedEl;
                 const sel = BlockEngine.generateStructuralSelector(el);
-                const topoHash = BlockEngine.generateTopologyFingerprint(el);
-                storage.addRule('structural', { structSelector: sel, topoHash, type: 'structural' });
+                storage.addRule('structural', { structSelector: sel, type: 'structural' });
                 this.clearPanel();
             });
 
@@ -4052,7 +3988,8 @@
                 // （findSingleChildWrapper）完全一致，确保 即时效果=预览=刷新后效果
                 const hideNodeInline = (node) => {
                     if (!node || node === document.body || node === document.documentElement) return;
-                    if (node.id === 'pro-blocker-ui-host' || (node.closest && node.closest('#pro-blocker-ui-host'))) return;
+                    // 统一保护：脚本自身 UI 宿主跳过，避免封杀域名时隐藏面板
+                    if (UIManager.isProtectedElement(node)) return;
                     node.style.setProperty('display', 'none', 'important');
                     node.style.setProperty('opacity', '0', 'important');
                 };
@@ -4352,6 +4289,8 @@
                 // 3) scanAndBlockDynamic 隐藏 findSingleChildWrapper 单子链容器
                 const hideNode = (node) => {
                     if (!node || node === document.body || node === document.documentElement) return;
+                    // 统一保护：脚本自身 UI 宿主跳过，避免预览隐藏面板
+                    if (UIManager.isProtectedElement(node)) return;
                     if (node.style.display === 'none') return;
                     node.style.setProperty('display', 'none', 'important');
                     node.style.setProperty('opacity', '0', 'important');
@@ -4388,6 +4327,8 @@
                     const esc = escapeCSSAttr(d);
                     document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(el => {
                         const t = BlockEngine.findSingleChildWrapper(el, 4);
+                        // 统一保护：脚本自身 UI 宿主跳过，避免封杀域名时隐藏面板
+                        if (UIManager.isProtectedElement(t)) return;
                         t.style.setProperty('display', 'none', 'important');
                         t.style.setProperty('opacity', '0', 'important');
                     });
@@ -4548,7 +4489,8 @@
                     let hit = 0;
                     const hideNode = (node) => {
                         if (!node || node === document.body || node === document.documentElement) return false;
-                        if (node.id === 'pro-blocker-ui-host' || (node.closest && node.closest('#pro-blocker-ui-host'))) return false;
+                        // 统一保护：脚本自身 UI 宿主跳过，避免预览隐藏面板
+                        if (UIManager.isProtectedElement(node)) return false;
                         if (node.style.display === 'none') return false;
                         node.style.setProperty('display', 'none', 'important');
                         node.style.setProperty('opacity', '0', 'important');
@@ -4672,8 +4614,17 @@
                     }
 
                     try {
-                        const regex = new RegExp(regexRule);
-                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+                        const regex = new RegExp(regexRule, 'i');
+                        // 与 applyRegexRules 保持一致：跳过 SCRIPT/STYLE/NOSCRIPT 内的文本，
+                        // 否则预览会误隐藏 <script> 父级导致页面功能损坏，且与实际执行结果不一致
+                        const textFilter = {
+                            acceptNode(node) {
+                                const tag = node.parentElement && node.parentElement.tagName;
+                                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+                                return NodeFilter.FILTER_ACCEPT;
+                            }
+                        };
+                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, textFilter, false);
                         let node;
                         while ((node = walker.nextNode())) {
                             if (regex.test(node.textContent)) {
@@ -4775,6 +4726,100 @@
             panel.querySelector('#btn-close-regex').addEventListener('click', () => this.clearPanel());
         }
 
+        // 规则影响度评估：统计每条规则在当前页面命中的元素数，命中越多越疑似误杀
+        // 仅评估本站规则 + 全局域名黑名单（其他站点规则不在当前页生效，评估无意义）
+        // regex 规则用 TreeWalker 采样前 500 个文本节点，避免全页遍历开销过大
+        evaluateRuleImpact() {
+            const data = storage.getData();
+            const impacts = []; // {type, index, score, count}
+
+            // 1. static 规则：直接 querySelectorAll 计数
+            (data.static || []).forEach((r, i) => {
+                if (!r.selector) return;
+                let count = 0;
+                try { count = document.querySelectorAll(r.selector).length; } catch (e) { }
+                impacts.push({ type: 'static', index: i, count, score: this._calcImpactScore(count) });
+            });
+
+            // 2. dynamic 规则：取首个类名 token 转属性选择器计数
+            (data.dynamic || []).forEach((r, i) => {
+                if (!r.className) return;
+                const token = r.className.split(/\s+/).filter(Boolean)[0];
+                if (!token) return;
+                let count = 0;
+                try { count = document.querySelectorAll(`[class*="${token}"]`).length; } catch (e) { }
+                impacts.push({ type: 'dynamic', index: i, count, score: this._calcImpactScore(count) });
+            });
+
+            // 3. attribute 规则：直接使用 attrSelector 计数
+            (data.attribute || []).forEach((r, i) => {
+                if (!r.attrSelector) return;
+                let count = 0;
+                try { count = document.querySelectorAll(r.attrSelector).length; } catch (e) { }
+                impacts.push({ type: 'attribute', index: i, count, score: this._calcImpactScore(count) });
+            });
+
+            // 4. regex 规则：TreeWalker 采样前 500 个文本节点（跳过 SCRIPT/STYLE/NOSCRIPT）
+            (data.regex || []).forEach((r, i) => {
+                if (!r.regex) return;
+                let count = 0;
+                try {
+                    const regex = new RegExp(r.regex, 'i');
+                    const textFilter = {
+                        acceptNode(node) {
+                            const tag = node.parentElement && node.parentElement.tagName;
+                            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+                            return NodeFilter.FILTER_ACCEPT;
+                        }
+                    };
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, textFilter, false);
+                    let node, checked = 0;
+                    while ((node = walker.nextNode()) && checked < 500) {
+                        checked++;
+                        if (regex.test(node.textContent || '')) count++;
+                    }
+                } catch (e) { }
+                impacts.push({ type: 'regex', index: i, count, score: this._calcImpactScore(count) });
+            });
+
+            // 5. domainBlock 规则：按 src/href/data-src 属性匹配计数
+            (data.domainBlock || []).forEach((r, i) => {
+                if (!r.domain) return;
+                const esc = r.domain.replace(/"/g, '\\"');
+                const sel = `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"]`;
+                let count = 0;
+                try { count = document.querySelectorAll(sel).length; } catch (e) { }
+                impacts.push({ type: 'domainBlock', index: i, count, score: this._calcImpactScore(count) });
+            });
+
+            // 6. pathPattern 规则：按 href/src 属性匹配计数
+            (data.pathPattern || []).forEach((r, i) => {
+                if (!r.pattern) return;
+                const esc = r.pattern.replace(/"/g, '\\"');
+                const sel = `[href*="${esc}"], [src*="${esc}"]`;
+                let count = 0;
+                try { count = document.querySelectorAll(sel).length; } catch (e) { }
+                impacts.push({ type: 'pathPattern', index: i, count, score: this._calcImpactScore(count) });
+            });
+
+            // structural / complex 规则不评估：structural 选择器含 :nth-of-type 路径，
+            // complex 无单一选择器，评估成本高且命中数参考价值低
+            impacts.sort((a, b) => b.score - a.score);
+            return impacts;
+        }
+
+        // 影响度评分：命中元素越多 = 影响越大 = 越可能是误杀
+        // 0 命中=未生效（0分），1-2=精准命中（10分），3-5=略多（30分），
+        // 6-15=可能误杀（60分），16-50=高度可疑（80分），>50=几乎确定误杀（100分）
+        _calcImpactScore(count) {
+            if (count === 0) return 0;
+            if (count <= 2) return 10;
+            if (count <= 5) return 30;
+            if (count <= 15) return 60;
+            if (count <= 50) return 80;
+            return 100;
+        }
+
         // 统一规则管理面板：合并「规则与防御管理」与「按网站查看所有规则」为单一透明玻璃面板（问题3）
         // 全局域名黑名单 + 本站规则 + 其他站点规则统一汇总，按最近过滤时间 _ts 倒序置顶，便于快速删除
         showManager() {
@@ -4847,6 +4892,7 @@
                         <option value="pathPattern">路径</option>
                     </select>
                     <input type="text" id="mgr-filter" placeholder="输入域名或规则内容关键字过滤..." />
+                    <button class="btn-warning" id="btn-impact-sort" style="flex:none; padding:6px 10px; font-size:12px;">📊 按影响度排序</button>
                 </div>
                 <div class="gd-stats" id="mgr-stats"></div>
                 <div class="selection-info" style="max-height: 320px; overflow-y: auto; margin-bottom: 12px;">
@@ -4930,6 +4976,8 @@
             let filterScope = 'all';
             let filterType = '';
             let filterText = '';
+            // 影响度排序模式：true 时按 impactScore 降序展示，高分规则红色标记便于排查误杀
+            let impactMode = false;
             let records = buildRecords();
 
             const renderList = () => {
@@ -4938,7 +4986,11 @@
                 const countEl = panel.querySelector('#mgr-domain-count');
                 if (countEl) countEl.textContent = records.filter(r => r.scope === 'global').length;
                 if (!list) return;
-                const filtered = records.filter(rec => {
+                // 影响度模式下按 impactScore 降序，让高风险（疑似误杀）规则置顶
+                const displayRecords = impactMode
+                    ? records.slice().sort((a, b) => (b.impactScore || 0) - (a.impactScore || 0))
+                    : records;
+                const filtered = displayRecords.filter(rec => {
                     if (filterScope !== 'all' && rec.scope !== filterScope) return false;
                     if (filterType && rec.type !== filterType) return false;
                     if (filterText) {
@@ -4947,7 +4999,9 @@
                     }
                     return true;
                 });
-                if (stats) stats.textContent = `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（最近过滤置顶，点击删除即时生效）`;
+                if (stats) stats.textContent = impactMode
+                    ? `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（按影响度排序，⚠️ 标记为疑似误杀）`
+                    : `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（最近过滤置顶，点击删除即时生效）`;
                 if (filtered.length === 0) {
                     list.innerHTML = '<li class="empty-tip">暂无规则。手动屏蔽元素或封杀域名后将显示在此处。</li>';
                     return;
@@ -4959,9 +5013,15 @@
                         : rec.scope === 'global'
                             ? `<span class="as-site" style="background:rgba(255,111,0,0.35);">全局</span>`
                             : `<span class="as-site" title="${escapeHTML(rec.domain)}">${escapeHTML(rec.domain)}</span>`;
+                    // 影响度模式：score≥60 红色警告（高度疑似误杀），30-59 黄色提示
+                    const impactBadge = impactMode && rec.impactScore >= 60
+                        ? `<span class="tag" style="background:rgba(255,0,0,0.7);">⚠️影响${rec.impactScore}</span>`
+                        : impactMode && rec.impactScore >= 30
+                            ? `<span class="tag" style="background:rgba(255,159,10,0.7);">影响${rec.impactScore}</span>`
+                            : '';
                     return `<li class="rule-item">
                         <div class="rule-content">
-                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content}
+                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content} ${impactBadge}
                         </div>
                         <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}" data-value="${escapeHTML(rec.value || '')}">删除</button>
                     </li>`;
@@ -4973,6 +5033,32 @@
             panel.querySelector('#mgr-scope-filter').addEventListener('change', (e) => { filterScope = e.target.value; renderList(); });
             panel.querySelector('#mgr-type-filter').addEventListener('change', (e) => { filterType = e.target.value; renderList(); });
             panel.querySelector('#mgr-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderList(); });
+
+            // 影响度排序：评估每条规则当前页面命中元素数，命中越多越疑似误杀
+            // 切换为 toggle：首次点击进入影响度模式，再次点击恢复 _ts 倒序
+            panel.querySelector('#btn-impact-sort').addEventListener('click', (e) => {
+                if (!impactMode) {
+                    const impacts = this.evaluateRuleImpact();
+                    impactMode = true;
+                    e.target.textContent = '↩ 恢复原排序';
+                    e.target.classList.remove('btn-warning');
+                    e.target.classList.add('btn-success');
+                    // 建立 (type-index) → score 索引，注入到 records 上
+                    const impactMap = new Map();
+                    impacts.forEach(imp => impactMap.set(`${imp.type}-${imp.index}`, imp.score));
+                    records = records.map(rec => ({
+                        ...rec,
+                        impactScore: impactMap.get(`${rec.type}-${rec.index}`) || 0
+                    }));
+                } else {
+                    impactMode = false;
+                    e.target.textContent = '📊 按影响度排序';
+                    e.target.classList.remove('btn-success');
+                    e.target.classList.add('btn-warning');
+                    records = buildRecords(); // 恢复 _ts 倒序
+                }
+                renderList();
+            });
 
             // 删除：事件委托，按归属调用对应删除 API，并还原内联隐藏 + 强制重扫确保即时生效（问题2&5）
             // 删除后仅重渲染列表（不重建面板），保留过滤态与滚动位置，连续删除无需重开面板（问题3）
@@ -5360,20 +5446,38 @@
 
                 // 判定元素是否已被封杀（域名已在黑名单 / 元素已被脚本隐藏 / 元素匹配现有规则）
                 const isAlreadyBlocked = (rec) => {
+                    if (!rec.el) return true;
+                    // 脚本自身 UI 永远视为已处理（不展示在扫描结果中）
+                    if (UIManager.isProtectedElement(rec.el)) return true;
+                    // 元素已从 DOM 移除（被脚本 remove() 或被父级移除）
+                    if (!document.contains(rec.el)) return true;
                     if (rec.triggerUrl) {
                         try {
                             const h = new URL(rec.triggerUrl, location.href).hostname;
                             if (blockedDomains.has(h)) return true;
                         } catch (e) { }
                     }
-                    // 内联隐藏（脚本封杀后打的内联样式）
-                    if (rec.el && rec.el.style && rec.el.style.getPropertyPriority('display') === 'important' && rec.el.style.display === 'none') return true;
+                    // 内联隐藏（脚本封杀后打的内联样式）：扩展 visibility/opacity/pointer-events 的 important 检查
+                    if (rec.el.style) {
+                        const s = rec.el.style;
+                        if (s.display === 'none') return true;
+                        if (s.visibility === 'hidden' && s.getPropertyPriority('visibility') === 'important') return true;
+                        if (s.opacity === '0' && s.getPropertyPriority('opacity') === 'important') return true;
+                        if (s.pointerEvents === 'none' && s.getPropertyPriority('pointer-events') === 'important') return true;
+                    }
                     // CSS 规则隐藏：OAS 独有结果未经过 BlockEngine 的 getComputedStyle 过滤
                     // 通过计算样式检查，避免已封杀的元素再次出现在扫描列表
-                    if (rec.el && document.contains(rec.el)) {
+                    // 新增：父级隐藏检查——自身可见但被父级 display:none / visibility:hidden 隐藏
+                    if (document.contains(rec.el)) {
                         try {
                             const cs = window.getComputedStyle(rec.el);
                             if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return true;
+                            let parent = rec.el.parentElement;
+                            while (parent && parent !== document.body) {
+                                const pcs = window.getComputedStyle(parent);
+                                if (pcs.display === 'none' || pcs.visibility === 'hidden') return true;
+                                parent = parent.parentElement;
+                            }
                         } catch (e) { }
                     }
                     // 检查元素是否匹配现有的静态/属性规则（确保持久化拦截的元素不再展示）
@@ -5571,14 +5675,6 @@
             // 实时更新预览：根据当前 selectedSet 和域名勾选状态，增量隐藏/还原元素
             const updatePreview = () => {
                 if (!this._overlayPreview.active) return;
-                // 安全保护：绝不隐藏 panel 自身或其祖先（shadowHost），否则面板会消失
-                const isProtected = (node) => {
-                    if (!node) return true;
-                    if (node === document.body || node === document.documentElement) return true;
-                    if (node.id === 'pro-blocker-ui-host') return true;
-                    if (node.closest && node.closest('#pro-blocker-ui-host')) return true;
-                    return false;
-                };
                 // ① 先还原所有预览元素
                 this._overlayPreview.elements.forEach(el => {
                     if (el) {
@@ -5595,9 +5691,8 @@
                 Array.from(selectedSet).forEach(idx => {
                     const r = records[idx];
                     if (!r || !r.el || !document.contains(r.el)) return;
-                    if (isProtected(r.el)) return;
-                    // 额外保护：绝不隐藏脚本自身 UI
-                    if (r.el.id === 'pro-blocker-ui-host') return;
+                    // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过
+                    if (UIManager.isProtectedElement(r.el)) return;
                     if (r.el.style.display !== 'none') {
                         r.el.style.setProperty('display', 'none', 'important');
                         r.el.style.setProperty('pointer-events', 'none', 'important');
@@ -5618,8 +5713,9 @@
                         const esc = escapeCSSAttr(d);
                         document.querySelectorAll(`[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`).forEach(target => {
                             const hideNode = (node) => {
-                                if (isProtected(node)) return;
-                                if (node.id === 'pro-blocker-ui-host') return;
+                                if (!node || node === document.body || node === document.documentElement) return;
+                                // 统一保护：脚本自身 UI 宿主跳过
+                                if (UIManager.isProtectedElement(node)) return;
                                 if (node.style.display === 'none') return;
                                 node.style.setProperty('display', 'none', 'important');
                                 node.style.setProperty('opacity', '0', 'important');
@@ -5696,8 +5792,8 @@
                 Array.from(selectedSet).forEach(idx => {
                     const r = records[idx];
                     if (!r || !r.el || !document.contains(r.el)) return;
-                    // 安全保护：绝不拦截脚本自身 UI 宿主，否则所有面板都会消失
-                    if (r.el.id === 'pro-blocker-ui-host' || (r.el.closest && r.el.closest('#pro-blocker-ui-host'))) {
+                    // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）绝不拦截，否则所有面板都会消失
+                    if (UIManager.isProtectedElement(r.el)) {
                         skippedSelfUI++;
                         return;
                     }
@@ -5896,8 +5992,6 @@
     } catch (e) { }
     // Shadow DOM 穿透须在页面脚本调用 attachShadow 前完成代理
     BlockEngine.hookAttachShadow();
-    // 旧版明文拓扑指纹迁移至 MurmurHash3（一次性，幂等）
-    BlockEngine.migrateTopoHashes();
     BlockEngine.fastInject();
     BlockEngine.startObserver();
 
