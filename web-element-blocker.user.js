@@ -137,7 +137,7 @@
             this._pendingWrites = {};
         }
 
-        // 域名黑名单统一为对象结构 {domain, _ts}：兼容历史 string[] 与对象[]，去重并保留时间戳，
+        // 域名黑名单统一为对象结构 {domain, _ts, _disabled}：兼容历史 string[] 与对象[]，去重并保留时间戳与禁用标记，
         // 供管理面板按最近过滤时间倒序展示（"最近过滤规则置顶"）
         _normDomains(arr) {
             if (!Array.isArray(arr)) return [];
@@ -148,7 +148,8 @@
                 if (!domain || typeof domain !== 'string' || domain.length === 0 || domain.length >= 200 || seen.has(domain)) return;
                 seen.add(domain);
                 const ts = (item && typeof item === 'object' && typeof item._ts === 'number') ? item._ts : 0;
-                out.push({ domain, _ts: ts });
+                const disabled = (item && typeof item === 'object' && item._disabled === true) ? true : false;
+                out.push({ domain, _ts: ts, _disabled: disabled });
             });
             return out;
         }
@@ -297,6 +298,8 @@
 
         // 规则启用/禁用切换：标记 _disabled=true 后所有 apply* 方法跳过该规则，
         // 实现临时禁用而无需删除（用户可随时启用恢复）。domainBlock 同样支持。
+        // 切换后必须 restoreAllInlineStyles 清除之前的内联隐藏，再重新应用规则，
+        // 这样禁用时被隐藏的元素立即恢复显示，启用时立即重新隐藏——用户实时看到效果。
         toggleRuleDisabled(type, index, domain) {
             if (type === 'domainBlock') {
                 const list = this.getDomainBlocks();
@@ -305,6 +308,7 @@
                 this._markDirty('domainBlocks', list);
                 this.invalidateDataCache();
                 BlockEngine.invalidateCache();
+                BlockEngine.restoreAllInlineStyles();
                 BlockEngine.applyCSSRules();
                 BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                 return list[index]._disabled;
@@ -324,7 +328,8 @@
             this._markDirty(key, allData);
             this.invalidateDataCache();
             BlockEngine.invalidateCache();
-            // 重新应用受影响的规则类型
+            // 先清除所有内联隐藏样式，再重新应用（跳过 _disabled 规则），确保禁用即时生效
+            BlockEngine.restoreAllInlineStyles();
             BlockEngine.applyCSSRules();
             if (type === 'regex') BlockEngine.applyRegexRules();
             if (type === 'complex') BlockEngine.applyComplexRules();
@@ -5395,8 +5400,9 @@
                         : impactMode && rec.impactScore >= 30
                             ? `<span class="tag" style="background:rgba(255,159,10,0.7);">影响${rec.impactScore}</span>`
                             : '';
-                    // 禁用规则：文字置灰 + 切换按钮显示"启用"，否则显示"禁用"
+                    // 禁用规则：文字置灰 + 删除线 + "已禁用"标记 + 切换按钮显示"启用"
                     const disabledStyle = rec.disabled ? 'opacity:0.45; text-decoration:line-through;' : '';
+                    const disabledBadge = rec.disabled ? '<span class="tag" style="background:rgba(142,142,147,0.6);">已禁用</span>' : '';
                     const toggleLabel = rec.disabled ? '启用' : '禁用';
                     const toggleClass = rec.disabled ? 'btn-success' : 'btn-outline';
                     // 批量选择模式：每条规则前显示复选框，key 唯一标识一条规则用于批量删除
@@ -5407,7 +5413,7 @@
                     return `<li class="rule-item">
                         ${batchBox}
                         <div class="rule-content" style="${disabledStyle}">
-                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content} ${impactBadge}
+                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content} ${impactBadge} ${disabledBadge}
                         </div>
                         <button class="${toggleClass} btn-toggle" style="flex:none; width:54px; padding: 6px; margin-right:6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}">${toggleLabel}</button>
                         <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}" data-value="${escapeHTML(rec.value || '')}">删除</button>
