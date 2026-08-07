@@ -3239,8 +3239,6 @@
             // 选择模式状态横幅与预览模式横幅：实例属性，clearPanel 兜底清理
             this._selectionBanner = null;
             this._previewBanner = null;
-            // 预览虚线框标记：预览激活时在将被隐藏元素原位绘制虚线占位，clearPanel 兜底清理
-            this._previewOutlines = [];
             // 轻量撤销栈：最近 5 次删除规则操作可撤销
             this._undoStack = [];
             this._handleMouseOver = this._handleMouseOver.bind(this);
@@ -3580,7 +3578,7 @@
             this._hidePreviewBanner();
             const banner = document.createElement('div');
             banner.className = 'pro-preview-banner';
-            banner.innerHTML = `<span>👁 预览模式激活中 — 虚线框标记将被隐藏的元素</span><button class="pro-preview-close" title="退出预览">✕</button>`;
+            banner.innerHTML = `<span>👁 预览模式激活中 — 已隐藏元素为预览效果</span><button class="pro-preview-close" title="退出预览">✕</button>`;
             this.shadowRoot.appendChild(banner);
             this._previewBanner = banner;
             banner.querySelector('.pro-preview-close').addEventListener('click', () => {
@@ -3594,26 +3592,6 @@
             }
         }
 
-        // 预览虚线框：在将被隐藏元素的原位绘制虚线占位框，让用户直观看到拦截范围
-        // 必须在元素隐藏前捕获 rect（display:none 后 getBoundingClientRect 全 0）
-        _applyPreviewOutline(el) {
-            if (!el || el === document.body || el === document.documentElement) return;
-            if (UIManager.isProtectedElement(el)) return;
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 && rect.height === 0) return;
-            const outline = document.createElement('div');
-            outline.className = 'pro-blocker-preview-outline';
-            outline.style.cssText = `position: fixed; top: ${rect.top}px; left: ${rect.left}px; width: ${rect.width}px; height: ${rect.height}px; border: 2px dashed rgba(255,59,48,0.6); background: rgba(255,59,48,0.05); border-radius: 4px; pointer-events: none; z-index: 2147483645;`;
-            this.shadowRoot.appendChild(outline);
-            this._previewOutlines.push(outline);
-        }
-        _clearPreviewOutlines() {
-            if (this._previewOutlines && this._previewOutlines.length > 0) {
-                this._previewOutlines.forEach(o => o.remove());
-            }
-            this._previewOutlines = [];
-        }
-
         // ===== 统一预览引擎：抽取各面板重复的 hideNode / 域名资源隐藏逻辑 =====
         // 预览隐藏单个节点（标准口径：display + opacity，与 applyCSSRules 一致）
         // store 为调用方预览状态的 elements 数组，隐藏的节点推入其中便于还原
@@ -3621,7 +3599,6 @@
             if (!node || node === document.body || node === document.documentElement) return false;
             if (UIManager.isProtectedElement(node)) return false;
             if (node.style.display === 'none') return false;
-            this._applyPreviewOutline(node);
             node.style.setProperty('display', 'none', 'important');
             node.style.setProperty('opacity', '0', 'important');
             store.push(node);
@@ -4056,8 +4033,7 @@
                 el.style.removeProperty('display');
             }
             this._actionPreview = { active: false, el: null, elements: [] };
-            // 清理虚线占位框 + 隐藏预览横幅
-            this._clearPreviewOutlines();
+            // 隐藏预览横幅
             this._hidePreviewBanner();
             // 恢复显示后必须重新挂上红框：预览时元素 display:none 不可见无需移除类，
             // 恢复后若不还原 pro-blocker-selected，用户将看不到当前选定元素（红框消失 bug 根因）
@@ -4116,8 +4092,6 @@
                 });
             }
             this._actionPreview.elements = [];
-            // 清理旧虚线框，重新应用时会按新选择重绘
-            this._clearPreviewOutlines();
             // 重新应用隐藏
             this._applyActionPreviewHiding();
         }
@@ -4672,7 +4646,6 @@
                     }
                 });
                 this._globalPreview = { active: false, elements: [] };
-                this._clearPreviewOutlines();
                 this._hidePreviewBanner();
                 previewBtn.textContent = '🔍 预览效果';
             };
@@ -4687,7 +4660,6 @@
                     }
                 });
                 this._globalPreview.elements = [];
-                this._clearPreviewOutlines();
                 // 预览口径与 applyCSSRules 完全一致：
                 // 1) CSS [src*=domain] 隐藏资源元素本身
                 // 2) CSS *:has(> :is(...)) 隐藏直接父级
@@ -4855,7 +4827,6 @@
                         }
                     });
                     this._previewAffectedElements = [];
-                    this._clearPreviewOutlines();
                     this._hidePreviewBanner();
                     isPreviewing = false;
                     const previewBtn = panel.querySelector('#btn-preview-regex');
@@ -4886,7 +4857,6 @@
                         // 统一保护：脚本自身 UI 宿主跳过，避免预览隐藏面板
                         if (UIManager.isProtectedElement(node)) return false;
                         if (node.style.display === 'none') return false;
-                        this._applyPreviewOutline(node);
                         node.style.setProperty('display', 'none', 'important');
                         node.style.setProperty('opacity', '0', 'important');
                         this._previewAffectedElements.push({ el: node });
@@ -4915,7 +4885,6 @@
                     try {
                         document.querySelectorAll(text).forEach(el => {
                             if (el && el.style.display !== 'none') {
-                                this._applyPreviewOutline(el);
                                 this._previewAffectedElements.push({ el });
                                 el.style.setProperty('display', 'none', 'important');
                                 el.style.setProperty('opacity', '0', 'important');
@@ -4991,7 +4960,6 @@
                                 } else break;
                             }
                             if (target.style.display !== 'none') {
-                                this._applyPreviewOutline(target);
                                 this._previewAffectedElements.push({ el: target });
                                 target.style.setProperty('display', 'none', 'important');
                                 target.style.setProperty('opacity', '0', 'important');
@@ -5034,7 +5002,6 @@
                                     } else break;
                                 }
                                 if (target && target.style.display !== 'none') {
-                                    this._applyPreviewOutline(target);
                                     this._previewAffectedElements.push({ el: target });
                                     target.style.setProperty('display', 'none', 'important');
                                     target.style.setProperty('opacity', '0', 'important');
@@ -6252,7 +6219,6 @@
                     }
                 });
                 this._overlayPreview = { active: false, elements: [], hiddenDomains: new Set() };
-                this._clearPreviewOutlines();
                 this._hidePreviewBanner();
                 previewBtn.textContent = '🔍 预览效果';
             };
@@ -6272,8 +6238,6 @@
                 });
                 this._overlayPreview.elements = [];
                 this._overlayPreview.hiddenDomains = new Set();
-                // 清理旧虚线框，下方重新隐藏时会按新选择重绘
-                this._clearPreviewOutlines();
                 const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
                 // ② 重新隐藏当前选中的覆盖层
                 Array.from(selectedSet).forEach(idx => {
@@ -6282,7 +6246,6 @@
                     // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过
                     if (UIManager.isProtectedElement(r.el)) return;
                     if (r.el.style.display !== 'none') {
-                        this._applyPreviewOutline(r.el);
                         r.el.style.setProperty('display', 'none', 'important');
                         r.el.style.setProperty('pointer-events', 'none', 'important');
                         r.el.style.setProperty('visibility', 'hidden', 'important');
@@ -6551,9 +6514,8 @@
             // 切换/关闭面板时停止选择模式，避免 _handleClick 残留导致 panel 内点击被拦截
             this.stopSelection();
             this._clearSelectionHighlight();
-            // 清理预览模式横幅与虚线占位框（若激活）
+            // 清理预览模式横幅（若激活）
             this._hidePreviewBanner();
-            this._clearPreviewOutlines();
 
             const oldPanel = this.shadowRoot.querySelector('.panel');
             if (oldPanel && typeof oldPanel._cleanupDrag === 'function') {
