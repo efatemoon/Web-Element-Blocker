@@ -10,6 +10,8 @@
 // @grant        GM_registerMenuCommand
 // @run-at       document-start
 // @license      MIT
+// @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
+// @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
 // ==/UserScript==
 
 (function () {
@@ -38,7 +40,7 @@
             return this._cache;
         },
         save() {
-            try { GM_setValue('va_config', this._cache); } catch (e) {}
+            try { GM_setValue('va_config', this._cache); } catch (e) { }
         },
         get(k) { return this.load()[k]; },
         set(k, v) { this.load()[k] = v; this.save(); },
@@ -53,13 +55,13 @@
         init(onEvent) {
             this._onEvent = onEvent;
             window.addEventListener('va-evt', (e) => {
-                try { this._onEvent(e.detail || {}); } catch (err) {}
+                try { this._onEvent(e.detail || {}); } catch (err) { }
             });
         },
         send(cmd, payload) {
             try {
                 window.dispatchEvent(new CustomEvent('va-cmd', { detail: { cmd, payload } }));
-            } catch (e) {}
+            } catch (e) { }
         }
     };
 
@@ -262,12 +264,12 @@
         // 消息桥（页面世界侧）
         const Bridge = {
             send(evt, payload) {
-                try { window.dispatchEvent(new CustomEvent('va-evt', { detail: { evt, payload } })); } catch (e) {}
+                try { window.dispatchEvent(new CustomEvent('va-evt', { detail: { evt, payload } })); } catch (e) { }
             },
             on(cmd, handler) {
                 window.addEventListener('va-cmd', (e) => {
                     const d = e.detail || {};
-                    if (d.cmd === cmd) { try { handler(d.payload); } catch (err) {} }
+                    if (d.cmd === cmd) { try { handler(d.payload); } catch (err) { } }
                 });
             }
         };
@@ -315,9 +317,9 @@
                 return inst;
             }
             HookedHls.prototype = Orig.prototype;
-            try { HookedHls.isSupported = Orig.isSupported ? Orig.isSupported.bind(Orig) : Orig.isSupported; } catch (e) {}
+            try { HookedHls.isSupported = Orig.isSupported ? Orig.isSupported.bind(Orig) : Orig.isSupported; } catch (e) { }
             for (const k of Object.getOwnPropertyNames(Orig)) {
-                if (!(k in HookedHls)) { try { HookedHls[k] = Orig[k]; } catch (e) {} }
+                if (!(k in HookedHls)) { try { HookedHls[k] = Orig[k]; } catch (e) { } }
             }
             HookedHls.__vaPatched = true;
             return HookedHls;
@@ -328,7 +330,7 @@
             let tries = 0;
             const tick = () => {
                 if (window.Hls && !window.Hls.__vaPatched) {
-                    try { window.Hls = wrapHls(window.Hls); } catch (e) {}
+                    try { window.Hls = wrapHls(window.Hls); } catch (e) { }
                 }
                 if (window.dashjs && window.dashjs.MediaPlayer && !window.dashjs.__vaPatched) {
                     try {
@@ -338,32 +340,37 @@
                             const origCreate = factory.create;
                             factory.create = function () {
                                 const p = origCreate.apply(this, arguments);
-                                try { p.updateSettings({ streaming: {
-                                    buffer: { stableBufferTime: 30, bufferTimeAtTopQuality: 60, bufferToKeep: 30 },
-                                    abr: { autoSwitchBitrate: { video: true } } } }); } catch (e) {}
+                                try {
+                                    p.updateSettings({
+                                        streaming: {
+                                            buffer: { stableBufferTime: 30, bufferTimeAtTopQuality: 60, bufferToKeep: 30 },
+                                            abr: { autoSwitchBitrate: { video: true } }
+                                        }
+                                    });
+                                } catch (e) { }
                                 return p;
                             };
                             return factory;
                         }
                         WrappedMP.prototype = OrigMP.prototype;
-                        for (const k of Object.getOwnPropertyNames(OrigMP)) { try { WrappedMP[k] = OrigMP[k]; } catch (e) {} }
+                        for (const k of Object.getOwnPropertyNames(OrigMP)) { try { WrappedMP[k] = OrigMP[k]; } catch (e) { } }
                         window.dashjs.MediaPlayer = WrappedMP;
                         window.dashjs.__vaPatched = true;
-                    } catch (e) {}
+                    } catch (e) { }
                 }
                 if (window.shaka && window.shaka.Player && !window.shaka.__vaPatched) {
                     try {
                         const OrigP = window.shaka.Player;
                         function WrappedP(video, dependency) {
                             const p = new OrigP(video, dependency);
-                            try { p.configure({ streaming: { rebufferingGoal: 2, bufferingGoal: 60, bufferBehind: 90 } }); } catch (e) {}
+                            try { p.configure({ streaming: { rebufferingGoal: 2, bufferingGoal: 60, bufferBehind: 90 } }); } catch (e) { }
                             return p;
                         }
                         WrappedP.prototype = OrigP.prototype;
-                        for (const k of Object.getOwnPropertyNames(OrigP)) { try { WrappedP[k] = OrigP[k]; } catch (e) {} }
+                        for (const k of Object.getOwnPropertyNames(OrigP)) { try { WrappedP[k] = OrigP[k]; } catch (e) { } }
                         window.shaka.Player = WrappedP;
                         window.shaka.__vaPatched = true;
-                    } catch (e) {}
+                    } catch (e) { }
                 }
                 tries++;
                 if (tries < 200) setTimeout(tick, 100); // 20s 内持续探测
@@ -380,7 +387,7 @@
                 hls.config.startFragPrefetch = true;
                 hls.config.backBufferLength = VA_HLS_DEFAULTS.backBufferLength;
                 hls.config.lowLatencyMode = false;
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // ============ IO Hook（懒加载解锁前置登记） ============
@@ -389,11 +396,11 @@
             const Orig = window.IntersectionObserver;
             function HookedIO(cb, opts) {
                 const inst = new Orig(cb, opts);
-                try { IORegistry.track(inst, cb); } catch (e) {}
+                try { IORegistry.track(inst, cb); } catch (e) { }
                 return inst;
             }
             HookedIO.prototype = Orig.prototype;
-            for (const k of Object.getOwnPropertyNames(Orig)) { try { HookedIO[k] = Orig[k]; } catch (e) {} }
+            for (const k of Object.getOwnPropertyNames(Orig)) { try { HookedIO[k] = Orig[k]; } catch (e) { } }
             HookedIO.__vaPatched = true;
             window.IntersectionObserver = HookedIO;
         }
@@ -409,7 +416,7 @@
                         init.priority = 'high';
                         if (!init.credentials) init.credentials = 'include';
                     }
-                } catch (e) {}
+                } catch (e) { }
                 return base.apply(this, arguments);
             };
             wrapped.__vaPatched = true;
@@ -457,18 +464,18 @@
             apply(video, type) {
                 try {
                     video.preload = 'auto';
-                    if (CFG.autoPlay && video.paused) video.play().catch(() => {});
+                    if (CFG.autoPlay && video.paused) video.play().catch(() => { });
                     // data-src → src 提前赋值
                     const lazy = video.getAttribute('data-src') || video.getAttribute('data-video') || video.getAttribute('data-lazy-src');
                     if (lazy && !video.src) video.src = lazy;
                     video.removeAttribute('data-src');
                     video.removeAttribute('data-lazy-src');
-                } catch (e) {}
+                } catch (e) { }
 
                 // 网络层预连接
                 const src = video.currentSrc || video.src || '';
                 if (src) {
-                    try { this._preconnect(src); } catch (e) {}
+                    try { this._preconnect(src); } catch (e) { }
                 }
 
                 // 播放器配置热补丁
@@ -477,9 +484,9 @@
                     const hls = info ? info.player : null;
                     if (hls) hotPatchHls(hls);
                 } else if (info && info.type === 'dash' && info.player) {
-                    try { info.player.updateSettings({ streaming: { buffer: { stableBufferTime: 30, bufferTimeAtTopQuality: 60, bufferToKeep: 30 } } }); } catch (e) {}
+                    try { info.player.updateSettings({ streaming: { buffer: { stableBufferTime: 30, bufferTimeAtTopQuality: 60, bufferToKeep: 30 } } }); } catch (e) { }
                 } else if (info && info.type === 'shaka' && info.player) {
-                    try { info.player.configure({ streaming: { rebufferingGoal: 2, bufferingGoal: 60, bufferBehind: 90 } }); } catch (e) {}
+                    try { info.player.configure({ streaming: { rebufferingGoal: 2, bufferingGoal: 60, bufferBehind: 90 } }); } catch (e) { }
                 }
             },
             _preconnect(url) {
@@ -491,7 +498,7 @@
                     const link = document.createElement('link');
                     link.rel = 'preconnect'; link.href = u.origin; link.crossOrigin = 'anonymous';
                     (document.head || document.documentElement).appendChild(link);
-                } catch (e) {}
+                } catch (e) { }
             }
         };
 
@@ -536,7 +543,7 @@
             stop() {
                 if (this._iv) { clearInterval(this._iv); this._iv = null; }
                 if (this._onTimeUpdate) {
-                    try { this.session.video.removeEventListener('timeupdate', this._onTimeUpdate); } catch (e) {}
+                    try { this.session.video.removeEventListener('timeupdate', this._onTimeUpdate); } catch (e) { }
                     this._onTimeUpdate = null;
                 }
             }
@@ -558,7 +565,7 @@
                         // seek 完成后仅在已就绪却未播放时轻推一次；卡死由 SeekGuard 看门狗兜底，
                         // 用户主动暂停时不干预，避免 load() 中断正常缓冲
                         if (v.ended || !v.paused) return;
-                        if (v.readyState >= 3 && CFG.autoPlay) { try { v.play().catch(() => {}); } catch (e) {} }
+                        if (v.readyState >= 3 && CFG.autoPlay) { try { v.play().catch(() => { }); } catch (e) { } }
                     }, 500);
                 };
                 this._onCanPlay = () => this.disarm();
@@ -682,7 +689,7 @@
                         const t = (nodes[i].textContent || '').trim();
                         if (t && /\d+\s*(s|秒)/.test(t) && t.length < 12) return true;
                     }
-                } catch (e) {}
+                } catch (e) { }
                 // 跳过广告按钮：仅识别按钮类元素且文案简短，避免误判"跳转到内容"等无障碍链接
                 try {
                     const btns = container.querySelectorAll('button,[role="button"],[class*="skip"],[class*="ad-"]');
@@ -690,7 +697,7 @@
                         const t = (btns[i].textContent || '').trim();
                         if (t && t.length < 20 && /跳过|skip\s*ad|关闭广告|skip[\s-]?ad/i.test(t)) return true;
                     }
-                } catch (e) {}
+                } catch (e) { }
                 // video 存在但无数据且被 overlay 覆盖
                 if (video.readyState === 0 && video.paused && video.src) return false;
                 return false;
@@ -706,14 +713,14 @@
                     // 自动点击"跳过广告"按钮：限定按钮类元素与短文案，防止误点导航链接
                     const skip = Array.from(container.querySelectorAll('button,[role="button"],[class*="skip"],[class*="ad-"]'))
                         .find(el => { const t = (el.textContent || '').trim(); return t.length < 20 && /跳过|skip\s*ad|关闭广告|skip[\s-]?ad/i.test(t); });
-                    if (skip) { try { skip.click(); } catch (e) {} }
+                    if (skip) { try { skip.click(); } catch (e) { } }
                     // 强制播放正片
                     const video = container.querySelector('video');
-                    if (video) { video.play().catch(() => {}); }
+                    if (video) { video.play().catch(() => { }); }
                     // 广播广告结束事件
                     container.dispatchEvent(new Event('adCompleted', { bubbles: true }));
                     container.dispatchEvent(new Event('ads-ad-ended', { bubbles: true }));
-                } catch (e) {}
+                } catch (e) { }
             }
             stop() { if (this._iv) { clearInterval(this._iv); this._iv = null; } }
         }
@@ -724,13 +731,15 @@
                 try {
                     IORegistry.forEach((inst, cb) => {
                         try {
-                            cb([{ target: container, isIntersecting: true, intersectionRatio: 1,
-                                  boundingClientRect: container.getBoundingClientRect() }], inst);
-                        } catch (e) {}
+                            cb([{
+                                target: container, isIntersecting: true, intersectionRatio: 1,
+                                boundingClientRect: container.getBoundingClientRect()
+                            }], inst);
+                        } catch (e) { }
                     });
-                } catch (e) {}
-                try { window.dispatchEvent(new Event('scroll')); } catch (e) {}
-                try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+                } catch (e) { }
+                try { window.dispatchEvent(new Event('scroll')); } catch (e) { }
+                try { window.dispatchEvent(new Event('resize')); } catch (e) { }
             }
         };
 
@@ -781,17 +790,17 @@
                 try {
                     if (info && info.type === 'hls' && info.player) { info.player.startLoad(); }
                     else { this.video.load(); }
-                } catch (e) {}
+                } catch (e) { }
             }
             boostLoad() {
                 // 提权由 NetworkPriorityOptimizer 负责，这里仅触发一次 load 兜底
                 const info = PlayerRegistry.get(this.video);
-                if (info && info.type === 'hls' && info.player) { try { info.player.startLoad(this.video.currentTime); } catch (e) {} }
+                if (info && info.type === 'hls' && info.player) { try { info.player.startLoad(this.video.currentTime); } catch (e) { } }
             }
             trimBackBuffer(seconds) {
                 const info = PlayerRegistry.get(this.video);
                 if (info && info.type === 'hls' && info.player && info.player.config) {
-                    try { info.player.config.backBufferLength = seconds; } catch (e) {}
+                    try { info.player.config.backBufferLength = seconds; } catch (e) { }
                 }
             }
             softRecover() {
@@ -804,8 +813,8 @@
                     } else {
                         this.video.load();
                     }
-                    if (CFG.autoPlay) this.video.play().catch(() => {});
-                } catch (e) {}
+                    if (CFG.autoPlay) this.video.play().catch(() => { });
+                } catch (e) { }
                 this._report();
             }
             engineRecover() {
@@ -814,14 +823,14 @@
                 try {
                     if (info && info.type === 'hls' && info.player) {
                         try { info.player.recoverMediaError(); }
-                        catch (e) { try { info.player.startLoad(this.video.currentTime); } catch (e2) {} }
+                        catch (e) { try { info.player.startLoad(this.video.currentTime); } catch (e2) { } }
                     } else if (info && info.type === 'dash' && info.player) {
                         info.player.seek(this.video.currentTime); info.player.play();
                     } else {
                         this.video.currentTime = this.video.currentTime; this.video.load();
                     }
-                    if (CFG.autoPlay) this.video.play().catch(() => {});
-                } catch (e) {}
+                    if (CFG.autoPlay) this.video.play().catch(() => { });
+                } catch (e) { }
                 this._report();
             }
             downgradeQuality() {
@@ -835,7 +844,7 @@
                         const cur = info.player.getQualityFor && info.player.getQualityFor('video');
                         if (rep && cur > 0) { info.player.setQualityFor('video', cur - 1); this.notify('自动降一档画质以保持流畅'); }
                     }
-                } catch (e) {}
+                } catch (e) { }
             }
             rebuildVideoElement() {
                 this.recoveries++;
@@ -849,10 +858,10 @@
                     };
                     // 释放旧引擎
                     const info = PlayerRegistry.get(old);
-                    if (info && info.type === 'hls' && info.player) { try { info.player.destroy(); } catch (e) {} }
+                    if (info && info.type === 'hls' && info.player) { try { info.player.destroy(); } catch (e) { } }
 
                     if (old.parentNode) old.parentNode.replaceChild(clone, old);
-                    try { delete old.__vaSession; } catch (e) {}
+                    try { delete old.__vaSession; } catch (e) { }
                     clone.currentTime = ctx.currentTime;
                     clone.volume = ctx.volume; clone.muted = ctx.muted;
                     clone.playbackRate = ctx.playbackRate; clone.loop = ctx.loop;
@@ -864,12 +873,12 @@
                         hls.attachMedia(clone);
                         hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
                             clone.currentTime = ctx.currentTime;
-                            if (CFG.autoPlay) clone.play().catch(() => {});
+                            if (CFG.autoPlay) clone.play().catch(() => { });
                         });
                         PlayerRegistry.set(clone, { type: 'hls', player: hls });
                     } else if (info && info.type === 'native') {
                         clone.load();
-                        if (CFG.autoPlay) clone.play().catch(() => {});
+                        if (CFG.autoPlay) clone.play().catch(() => { });
                     }
 
                     // 旧 session 销毁监听器，绑定到新元素
@@ -893,11 +902,11 @@
             destroy() {
                 this._dead = true;
                 _allSessions.delete(this);
-                try { this.seek.destroy(); } catch (e) {}
-                try { this.stall.destroy(); } catch (e) {}
-                try { this.buffer.stop(); } catch (e) {}
-                try { this.adgate.stop(); } catch (e) {}
-                try { delete this.video.__vaSession; } catch (e) {}
+                try { this.seek.destroy(); } catch (e) { }
+                try { this.stall.destroy(); } catch (e) { }
+                try { this.buffer.stop(); } catch (e) { }
+                try { this.adgate.stop(); } catch (e) { }
+                try { delete this.video.__vaSession; } catch (e) { }
             }
         }
 
@@ -937,7 +946,7 @@
             _scanWithin(root) {
                 try {
                     root.querySelectorAll && root.querySelectorAll('video').forEach(v => this._takeOver(v));
-                } catch (e) {}
+                } catch (e) { }
                 this._scanShadows(root);
             },
             _scanShadows(root) {
@@ -946,7 +955,7 @@
                     for (const el of all) {
                         if (el.shadowRoot) this._scanWithin(el.shadowRoot);
                     }
-                } catch (e) {}
+                } catch (e) { }
             },
             _takeOver(video) {
                 if (this._seen.has(video)) return;
@@ -955,7 +964,7 @@
                 if (video.__vaSession) return;
                 try {
                     new VideoSession(video);
-                } catch (e) {}
+                } catch (e) { }
                 // 属性变化观察：src/data-src 变化时重新检测播放器
                 try {
                     const obs = new MutationObserver(() => {
@@ -963,7 +972,7 @@
                         if (s) s.type = PlayerTypeDetector.detect(video);
                     });
                     obs.observe(video, { attributes: true, attributeFilter: ['src', 'data-src', 'data-video', 'data-lazy-src'] });
-                } catch (e) {}
+                } catch (e) { }
             }
         };
 
@@ -988,7 +997,7 @@
                     if (!document.documentElement.contains(v)) { s.destroy(); return; }
                     // 内存压力检查
                     if (performance.memory && performance.memory.usedJSHeapSize / performance.memory.jsHeapSizeLimit > 0.9) {
-                        try { s.trimBackBuffer(30); } catch (e) {}
+                        try { s.trimBackBuffer(30); } catch (e) { }
                     }
                 });
             }
@@ -999,7 +1008,7 @@
         Bridge.on('reload', () => {
             document.querySelectorAll('video').forEach(v => {
                 const s = v.__vaSession;
-                if (s) { try { v.load(); if (CFG.autoPlay) v.play().catch(() => {}); } catch (e) {} s._report(); }
+                if (s) { try { v.load(); if (CFG.autoPlay) v.play().catch(() => { }); } catch (e) { } s._report(); }
             });
         });
         Bridge.on('recover', () => {
@@ -1035,7 +1044,7 @@
         } catch (e) {
             // 部分极端环境下 documentElement 不可用，延后重试
             setTimeout(() => {
-                try { (document.head || document.documentElement).appendChild(script); } catch (e2) {}
+                try { (document.head || document.documentElement).appendChild(script); } catch (e2) { }
             }, 0);
         }
         script.remove();
@@ -1061,7 +1070,7 @@
             GM_registerMenuCommand('⚡ 强制重载当前视频', () => MessageBridge.send('reload'));
             GM_registerMenuCommand('🔧 手动恢复播放', () => MessageBridge.send('recover'));
             GM_registerMenuCommand('📉 降低画质', () => MessageBridge.send('downgrade'));
-        } catch (e) {}
+        } catch (e) { }
     }
 
     boot();
