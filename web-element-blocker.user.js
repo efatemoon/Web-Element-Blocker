@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.7.0
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.7.0：重构真·深度扫描——覆盖层新增Canvas肤色采样/CSS伪元素穿透/混淆跳转沙箱解码/Icon Font映射检测，全局域名新增ServiceWorker/WebSocket/Blob URL/CSS伪元素/SVG引用溯源；区分"重新扫描"(快速基线)与"深度扫描"(高阶探测)；修复BUG-1~4(影响度排序跳过禁用规则/触摸事件DOM校验/e.currentTarget/双引擎补齐)、不一致-1~3(removeRule统一reapplyAll/去除冗余applyCSSRules/区分基线与深度)、冗余-1~3(移除被覆盖的restoreInlineForDomain/批量拦截applyCSSRules改单次/线性查找改Map/Set O(1))。
+// @version      0.7.1
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.7.1：修复8面板审查报告隐藏BUG——正则合并捕获组错位(内层()转非捕获)/导航拦截快照过期(实时读getDomainSet)/路径自动提取死代码(addUrl放行相对路径)/影响度评估ReDoS(补isRegexSafe预检)/DomainBlockExecutor批量applyCSSRules/AdGuard导出\/二次转义/深度扫描后自动勾选新高分域名/regex-level NaN兜底/startSelection retry回调补齐。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -71,8 +71,10 @@
          */
         execute(domains, options = {}) {
             const { hideMode = 'wrapper' } = options;
-            // 1. 添加持久化规则
-            domains.forEach(d => storage.addRule('domainBlock', { domain: d, type: 'domainBlock' }));
+            // 1. 添加持久化规则（冗余-5：skipApply=true 跳过逐条 applyCSSRules，末尾统一重建一次）
+            domains.forEach(d => storage.addRule('domainBlock', { domain: d, type: 'domainBlock' }, true));
+            // 1.1 统一重建一次样式表（替代循环内 N 次 applyCSSRules）
+            if (domains.length > 0) BlockEngine.applyCSSRules();
             // 2. 即时隐藏（统一口径，保护脚本自身 UI 绝不拦截）
             if (hideMode === 'none') return;
             domains.forEach(d => {
@@ -1548,7 +1550,18 @@
             for (let i = 0; i < regexRules.length; i += REGEX_BATCH_SIZE) {
                 const batch = regexRules.slice(i, i + REGEX_BATCH_SIZE);
                 try {
-                    const source = batch.map(r => `(${r.regex.source})`).join('|');
+                    // 捕获组错位修复(BUG-A1)：规则自带捕获组(如 广告(\d+))会令合并后
+                    // (广告(\d+))|(推广) 的组号右移，match[i]!==undefined 循环取错 level。
+                    // 合并前将内层捕获组转非捕获组 (?:...)，确保第 i 个外层组 = 第 i 条规则。
+                    // 两步转换：① 命名组 (?<name>...) → (?:...)（去掉名称，消除捕获语义）
+                    //          ② 普通捕获组 ( → (?: （不匹配 (?: / (?= / (?! / (?<= / (?<!)）
+                    // 广告正则极少用反向引用，转换安全；断言(?=/?!/?<=/?<!)本身不捕获，正则不改。
+                    const source = batch.map(r => {
+                        let s = r.regex.source;
+                        s = s.replace(/\(\?<[^>]+>/g, '(?:');  // ① 命名组 → 非捕获
+                        s = s.replace(/\((?!\?)/g, '(?:');      // ② 普通捕获组 → 非捕获
+                        return `(${s})`;
+                    }).join('|');
                     mergedBatches.push({ regex: new RegExp(source, 'i'), offset: i, rules: batch });
                 } catch (e) {
                     // 该批合并失败，降级为逐条执行（保留原 rule 对象供降级路径使用）
@@ -2153,8 +2166,9 @@
             const { deep = false, includeScripts = true, includeStyles = true } = options;
             const isFullPage = element === document.documentElement;
             const urls = new Set();
+            const relativePaths = new Set(); // 同源相对路径 /xxx，供路径模式自动提取(BUG-A3)
             const domainMeta = new Map(); // domain -> {score, sources:Set, reasons:Set}
-            if (!element) return { urls: [], domains: [], scoredDomains: [] };
+            if (!element) return { urls: [], domains: [], scoredDomains: [], paths: [] };
 
             const KNOWN_SAFE_CDNS = new Set([
                 'ajax.googleapis.com', 'fonts.googleapis.com', 'fonts.gstatic.com',
@@ -2169,13 +2183,26 @@
                 if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('mailto:')) return;
                 let absUrl = url;
                 if (url.startsWith('//')) absUrl = location.protocol + url;
-                if (!absUrl.startsWith('http')) return;
+                // BUG-A3 修复：相对路径 /xxx 不含 hostname，无法提取域名，但可用于路径模式自动提取。
+                // 旧版直接 return 导致 result.urls 永远不含相对路径，"自动记录路径模式"功能形同死代码。
+                // 此处将相对路径收集到 relativePaths，供 btn-domain 回调提取前 3 段作为 pathPattern。
+                if (!absUrl.startsWith('http')) {
+                    if (url.startsWith('/') && url.length > 5) {
+                        relativePaths.add(url.split('?')[0].split('#')[0]);
+                    }
+                    return;
+                }
                 try {
                     const urlObj = new URL(absUrl);
                     if (!urlObj.hostname) return;
                     urls.add(url);
                     const host = urlObj.hostname.toLowerCase();
-                    if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) return;
+                    if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) {
+                        // 同源绝对 URL 的路径也收集，供路径模式提取(BUG-A3)
+                        const p = urlObj.pathname;
+                        if (p && p.startsWith('/') && p.length > 5) relativePaths.add(p.split('?')[0].split('#')[0]);
+                        return;
+                    }
                     if (!domainMeta.has(host)) domainMeta.set(host, { score: 0, sources: new Set(), reasons: new Set(), count: 0 });
                     const meta = domainMeta.get(host);
                     meta.count++;
@@ -2296,7 +2323,27 @@
                     count: meta.count
                 }));
 
-            return { urls: Array.from(urls), domains: scoredDomains.map(d => d.host), scoredDomains };
+            return { urls: Array.from(urls), domains: scoredDomains.map(d => d.host), scoredDomains, paths: Array.from(relativePaths) };
+        }
+
+        /**
+         * 从 extractResourceDomains 的结果中提取路径模式候选(BUG-A3 + 冗余-7)
+         * 取每个相对路径/同源路径的前 3 段作为 pathPattern，≥2 段才收录
+         * 统一 btn-domain 回调与 _applyActionPreviewHiding 的路径提取口径，消除重复代码
+         * @param {Object} result - extractResourceDomains 返回值
+         * @returns {Set<string>} 路径模式集合，如 {'/ads/banner', '/static/img'}
+         */
+        static extractPathCandidates(result) {
+            const candidates = new Set();
+            if (!result || !result.paths) return candidates;
+            for (const p of result.paths) {
+                try {
+                    if (!p || !p.startsWith('/') || p.length <= 5) continue;
+                    const segs = p.split('/').filter(Boolean);
+                    if (segs.length >= 2) candidates.add('/' + segs.slice(0, 3).join('/'));
+                } catch (e) { }
+            }
+            return candidates;
         }
 
         static isSafeOutermost(element) {
@@ -3413,11 +3460,19 @@
         function enableNavigationInterceptor(blockedDomains) {
             if (_navInterceptorActive) return;
             _navInterceptorActive = true;
-            // 初始快照用于启动期，后续命中通过静态特征匹配
+            // BUG-A2 修复：blockedDomains 是启动期快照，用户后续新封杀的域名不会进入闭包。
+            // 改为实时读取 BlockEngine.getDomainSet()——该集合由 invalidateCache() 在
+            // addRule/removeRule/saveData 时自动失效重建，确保新封域名即时生效。
+            // 启动期快照作为 BlockEngine 尚未就绪时的兜底（document-start 阶段可能时序靠前）。
             const _checkNav = (url) => {
                 if (!url) return false;
-                // 兜底：启动期快照 + 静态特征（IP/短链/博彩色情词元）
-                return _isBlockedNav(url, blockedDomains);
+                let liveDomains = blockedDomains;
+                try {
+                    // getDomainSet() 返回缓存 Set，命中 invalidateCache 自动重建，O(1) 查询
+                    const liveSet = BlockEngine.getDomainSet();
+                    if (liveSet && liveSet.size > 0) liveDomains = liveSet;
+                } catch (e) { /* BlockEngine 未就绪时回退快照 */ }
+                return _isBlockedNav(url, liveDomains);
             };
 
             // ① 拦截 window.open
@@ -3514,8 +3569,20 @@
                 const u = new URL(url, location.href);
                 const h = u.hostname.toLowerCase();
                 if (blockedDomains) {
-                    for (const d of blockedDomains) {
-                        if (h === d || h.endsWith('.' + d)) return true;
+                    // Set 用 has() O(1)，数组用 for...of O(n)；两种形态均支持(BUG-A2 实时读取)
+                    if (blockedDomains.has) {
+                        if (blockedDomains.has(h)) return true;
+                        // 同源子域名匹配：逐级向上剥離子域检查
+                        let dot = h.indexOf('.');
+                        while (dot !== -1) {
+                            const parent = h.slice(dot + 1);
+                            if (blockedDomains.has(parent)) return true;
+                            dot = h.indexOf('.', dot + 1);
+                        }
+                    } else {
+                        for (const d of blockedDomains) {
+                            if (h === d || h.endsWith('.' + d)) return true;
+                        }
                     }
                 }
                 const tokens = h.split(/[^a-z0-9-]/);
@@ -4700,19 +4767,10 @@
             const store = this._actionPreview.elements;
             // 1) 选中域名命中的全页资源（元素 + 父级 + 单子链容器）
             this._previewHideDomainResources(this._actionHosts || [], store);
-            // 2) 路径模式：与封杀时自动提取的 pathCandidates 同口径
+            // 2) 路径模式：与封杀时自动提取的 pathCandidates 同口径(BUG-A3 + 冗余-7)
+            // 统一调用 BlockEngine.extractPathCandidates，消除重复代码
             const result = BlockEngine.extractResourceDomains(el, { deep: true });
-            const pathCandidates = new Set();
-            result.urls.forEach(u => {
-                try {
-                    if (u.startsWith('//') || u.startsWith('http')) return;
-                    if (u.startsWith('/') && u.length > 5) {
-                        const pathOnly = u.split('?')[0].split('#')[0];
-                        const segs = pathOnly.split('/').filter(Boolean);
-                        if (segs.length >= 2) pathCandidates.add('/' + segs.slice(0, 3).join('/'));
-                    }
-                } catch (err) { }
-            });
+            const pathCandidates = BlockEngine.extractPathCandidates(result);
             pathCandidates.forEach(p => {
                 const sel = ResourceSelectorBuilder.buildPathAttr(p);
                 try {
@@ -4971,21 +5029,13 @@
                     // 封杀前先还原预览隐藏的元素，避免预览状态残留与正式封杀叠加
                     this._resetActionPreview(panel);
 
-                    // 自动提取路径模式（从相对路径 href 中提取前 3 段）
-                    const pathCandidates = new Set();
-                    result.urls.forEach(u => {
-                        try {
-                            if (u.startsWith('//') || u.startsWith('http')) return;
-                            if (u.startsWith('/') && u.length > 5) {
-                                const pathOnly = u.split('?')[0].split('#')[0];
-                                const segs = pathOnly.split('/').filter(Boolean);
-                                if (segs.length >= 2) pathCandidates.add('/' + segs.slice(0, 3).join('/'));
-                            }
-                        } catch (e) { }
-                    });
+                    // 自动提取路径模式(BUG-A3 + 冗余-7)：统一调用 BlockEngine.extractPathCandidates
+                    // 冗余-6：循环内 addRule 用 skipApply=true 跳过，循环结束后统一调用一次 applyCSSRules
+                    const pathCandidates = BlockEngine.extractPathCandidates(result);
                     pathCandidates.forEach(p => {
-                        storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' });
+                        storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' }, true);
                     });
+                    if (pathCandidates.size > 0) BlockEngine.applyCSSRules();
 
                     // 立即隐藏当前框选的整个广告容器（向上找单子链容器）
                     const container = BlockEngine.findSingleChildWrapper(this.currentSelectedEl, 4);
@@ -5277,6 +5327,13 @@
                         // 同步 selectedHosts：移除已被过滤掉的域名(BUG-M2)
                         const hostSet = new Set(allDomains.map(d => d.host));
                         Array.from(selectedHosts).forEach(h => { if (!hostSet.has(h)) selectedHosts.delete(h); });
+                        // ⑩ 深度扫描后自动勾选新出现的高分域名，与初始加载逻辑一致
+                        // 初始加载 selectedHosts 纳入 score>=35 || viceToken，深度扫描同口径补齐新增域名
+                        allDomains.forEach(d => {
+                            if ((d.score >= 35 || d.viceToken) && !selectedHosts.has(d.host)) {
+                                selectedHosts.add(d.host);
+                            }
+                        });
                         renderDomains();
                         btn.disabled = false;
                         btn.textContent = origText;
@@ -5482,7 +5539,8 @@
                 if (isPreviewing) { resetPreview(); return; }
 
                 const mode = modeSelect.value;
-                const level = parseInt(panel.querySelector('#regex-level').value, 10);
+                // NaN 兜底：输入框被清空时 parseInt 返回 NaN，_hideRegexAncestor 的 for(i=0;i<NaN;i++) 不执行 → 静默退化为 level 0
+                const level = parseInt(panel.querySelector('#regex-level').value, 10) || 0;
                 this._previewAffectedElements = [];
 
                 if (mode === 'path') {
@@ -5647,7 +5705,8 @@
                     return;
                 }
 
-                const level = parseInt(panel.querySelector('#regex-level').value, 10);
+                // NaN 兜底：输入框被清空时 parseInt 返回 NaN，需兜底为 0
+                const level = parseInt(panel.querySelector('#regex-level').value, 10) || 0;
 
                 if (mode === 'builder') {
                     const logic = panel.querySelector('#builder-logic').value;
@@ -5738,12 +5797,16 @@
 
             // 4. regex 规则：TreeWalker 采样前 500 个文本节点（跳过 SCRIPT/STYLE/NOSCRIPT）
             //    contains 模式规则用 String.includes() 匹配(BUG-M7)，其余用 RegExp
+            //    ReDoS 预检(BUG-A4)：applyRegexRules 会用 isRegexSafe 过滤嵌套量词，此处必须同口径，
+            //    否则导入含 (a+)+ 的规则后点"按影响度排序"会在 500 节点上 test() → ReDoS 卡死页面
             (data.regex || []).forEach((r, i) => {
                 if (r._disabled) return; // 跳过禁用规则(BUG-1)
                 if (!r.regex) return;
                 let count = 0;
                 try {
                     const isContains = r.mode === 'contains';
+                    // 与 applyRegexRules 保持一致：非 contains 模式必须通过 isRegexSafe 预检
+                    if (!isContains && !BlockEngine.isRegexSafe(r.regex)) return;
                     const regex = isContains ? null : new RegExp(r.regex, 'i');
                     const lowerText = isContains ? r.regex.toLowerCase() : null;
                     let checked = 0;
@@ -6390,7 +6453,11 @@
             const escapeCssValue = (v) => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
             const firstClassToken = (cls) => (cls || '').split(/\s+/).filter(Boolean)[0] || cls;
             // 用户已写好的正则 → 仅转义定界符 / 并剔除换行（保留反斜杠的 regex 语义）
-            const escapeAdGuardRegex = (r) => String(r).replace(/[\r\n]+/g, '').replace(/\//g, '\\/');
+            // BUG-A11 修复：旧版 replace(/\//g, '\\/') 会把用户已转义的 \/ 二次转义为 \\/，
+            // 在 AdGuard :has-text(/.../) 中语义被破坏（反斜杠+结束定界符）。
+            // 用 (\\*)\/ 捕获连续反斜杠：奇数=已转义保留，偶数=未转义补 \/
+            // 正确处理 a/b→a\/b、a\/b→a\/b、a\\/b→a\\\/b、a\\\/b→a\\\/b
+            const escapeAdGuardRegex = (r) => String(r).replace(/[\r\n]+/g, '').replace(/(\\*)\//g, (m, bs) => bs.length % 2 === 1 ? m : bs + '\\/');
             // 纯文本 → 转义全部 regex 元字符与定界符，用于嵌入 /.../ 字面量
             const escapeRegexLiteral = (v) => String(v).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&').replace(/[\r\n]+/g, '');
 
@@ -7181,14 +7248,16 @@
             return uiInstance;
         }
 
-        GM_registerMenuCommand('🖱 手动选择屏蔽元素', () => getUI()._safeCall('选择模式', () => getUI().startSelection()));
-        GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => getUI()._safeCall('规则面板', () => getUI().showRegexPanel(), () => getUI().showRegexPanel()));
-        GM_registerMenuCommand('🌐 全局检索域名', () => getUI()._safeCall('域名检索', () => getUI().showGlobalDomainPanel(), () => getUI().showGlobalDomainPanel()));
-        GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => getUI()._safeCall('覆盖层扫描', () => getUI().showOverlayScanPanel(), () => getUI().showOverlayScanPanel()));
-        GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => getUI()._safeCall('管理面板', () => getUI().showManager(), () => getUI().showManager()));
-        GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => getUI()._safeCall('导出面板', () => getUI().showExportPanel(), () => getUI().showExportPanel()));
-        GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => getUI()._safeCall('AdGuard 导出', () => getUI().showAdGuardExportPanel(), () => getUI().showAdGuardExportPanel()));
-        GM_registerMenuCommand('📥 导入规则', () => getUI()._safeCall('导入面板', () => getUI().showImportPanel(), () => getUI().showImportPanel()));
+        // ⑧+⑨ 修复：startSelection 补齐 retry 回调（与其他 7 个菜单一致）；
+        // 合并 getUI() 调用，避免每次菜单回调重复获取实例
+        GM_registerMenuCommand('🖱 手动选择屏蔽元素', () => { const ui = getUI(); ui._safeCall('选择模式', () => ui.startSelection(), () => ui.startSelection()); });
+        GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => { const ui = getUI(); ui._safeCall('规则面板', () => ui.showRegexPanel(), () => ui.showRegexPanel()); });
+        GM_registerMenuCommand('🌐 全局检索域名', () => { const ui = getUI(); ui._safeCall('域名检索', () => ui.showGlobalDomainPanel(), () => ui.showGlobalDomainPanel()); });
+        GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => { const ui = getUI(); ui._safeCall('覆盖层扫描', () => ui.showOverlayScanPanel(), () => ui.showOverlayScanPanel()); });
+        GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => { const ui = getUI(); ui._safeCall('管理面板', () => ui.showManager(), () => ui.showManager()); });
+        GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => { const ui = getUI(); ui._safeCall('导出面板', () => ui.showExportPanel(), () => ui.showExportPanel()); });
+        GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => { const ui = getUI(); ui._safeCall('AdGuard 导出', () => ui.showAdGuardExportPanel(), () => ui.showAdGuardExportPanel()); });
+        GM_registerMenuCommand('📥 导入规则', () => { const ui = getUI(); ui._safeCall('导入面板', () => ui.showImportPanel(), () => ui.showImportPanel()); });
     }
 
 })();
