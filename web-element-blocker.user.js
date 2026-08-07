@@ -3450,13 +3450,15 @@
                 }
                 .pro-confirm-box {
                     background: rgba(25,25,30,0.95); border-radius: 14px;
-                    padding: 24px; width: min(380px, 90vw);
+                    padding: 24px; width: min(440px, 92vw);
+                    max-height: min(80vh, 600px);
                     border: 1px solid rgba(255,255,255,0.15);
                     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+                    display: flex; flex-direction: column;
                 }
-                .pro-confirm-title { font-size: 16px; font-weight: 600; color: #fff; margin-bottom: 12px; }
-                .pro-confirm-body { font-size: 13px; color: #ccc; line-height: 1.6; margin-bottom: 20px; white-space: pre-line; word-break: break-all; }
-                .pro-confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
+                .pro-confirm-title { font-size: 16px; font-weight: 600; color: #fff; margin-bottom: 12px; flex: none; }
+                .pro-confirm-body { font-size: 13px; color: #ccc; line-height: 1.6; margin-bottom: 20px; white-space: pre-line; word-break: break-all; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+                .pro-confirm-actions { display: flex; gap: 10px; justify-content: flex-end; flex: none; }
                 .pro-confirm-actions button { flex: none; padding: 8px 20px; }
 
                 /* 选择模式状态横幅 */
