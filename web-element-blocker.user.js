@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.7.1
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.7.1：修复8面板审查报告隐藏BUG——正则合并捕获组错位(内层()转非捕获)/导航拦截快照过期(实时读getDomainSet)/路径自动提取死代码(addUrl放行相对路径)/影响度评估ReDoS(补isRegexSafe预检)/DomainBlockExecutor批量applyCSSRules/AdGuard导出\/二次转义/深度扫描后自动勾选新高分域名/regex-level NaN兜底/startSelection retry回调补齐。
+// @version      0.7.2
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.7.2：修复v0.7.1验证报告残留缺陷——正则捕获组转换改状态机彻底解决\(转义括号/[(a)]字符类内括号误改/命名组未转换三处边界缺陷；导航拦截去掉size>0条件(用户删光域名后不再回退过期快照)；删除btn-domain冗余applyCSSRules(DomainBlockExecutor统一重建)；删除pathname冗余split(URL.pathname本身不含query/hash)。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -1553,15 +1553,77 @@
                     // 捕获组错位修复(BUG-A1)：规则自带捕获组(如 广告(\d+))会令合并后
                     // (广告(\d+))|(推广) 的组号右移，match[i]!==undefined 循环取错 level。
                     // 合并前将内层捕获组转非捕获组 (?:...)，确保第 i 个外层组 = 第 i 条规则。
-                    // 两步转换：① 命名组 (?<name>...) → (?:...)（去掉名称，消除捕获语义）
-                    //          ② 普通捕获组 ( → (?: （不匹配 (?: / (?= / (?! / (?<= / (?<!)）
-                    // 广告正则极少用反向引用，转换安全；断言(?=/?!/?<=/?<!)本身不捕获，正则不改。
-                    const source = batch.map(r => {
-                        let s = r.regex.source;
-                        s = s.replace(/\(\?<[^>]+>/g, '(?:');  // ① 命名组 → 非捕获
-                        s = s.replace(/\((?!\?)/g, '(?:');      // ② 普通捕获组 → 非捕获
-                        return `(${s})`;
-                    }).join('|');
+                    //
+                    // 状态机转换(v0.7.2 彻底修复)：旧版两步正则替换会误改转义括号 \( 和
+                    // 字符类 [(a)] 内的 (。改用单次遍历状态机，正确区分三种上下文：
+                    //   ① 普通上下文：\( 是字面量(跳过\)，(?<name> 是命名组→(?:，( 是捕获组→(?:，
+                    //                  (?:/(?=/(?!/(?<=/(?<! 是非捕获/断言(保留)，[ 进入字符类
+                    //   ② 转义上下文：\ 后任意字符按字面量处理（跳过该字符）
+                    //   ③ 字符类上下文：[...] 内的 ( 是字面量(保留)，] 退出回到普通上下文
+                    const convertGroups = (src) => {
+                        let out = '';
+                        let i = 0;
+                        let inClass = false; // 是否在字符类 [...] 内
+                        while (i < src.length) {
+                            const ch = src[i];
+                            if (inClass) {
+                                // 字符类内：] 结束字符类（未转义），其他字符（含 ( ) \）原样保留
+                                if (ch === '\\' && i + 1 < src.length) {
+                                    out += ch + src[i + 1];
+                                    i += 2;
+                                    continue;
+                                }
+                                if (ch === ']') inClass = false;
+                                out += ch;
+                                i++;
+                            } else if (ch === '\\') {
+                                // 转义：连同下一个字符原样保留（\( \/ \d 等都是字面量/预定义类）
+                                out += ch + (src[i + 1] || '');
+                                i += 2;
+                            } else if (ch === '[') {
+                                // 进入字符类（注意 [] 内规则与外部不同，括号不作为分组）
+                                inClass = true;
+                                out += ch;
+                                i++;
+                            } else if (ch === '(') {
+                                // 分组：判断后续字符决定类型
+                                const next = src[i + 1];
+                                if (next === '?') {
+                                    const after = src[i + 2];
+                                    if (after === '<') {
+                                        // 命名组 (?<name>...) 或后向断言 (?<= / (?<!)
+                                        const after2 = src[i + 3];
+                                        if (after2 === '=' || after2 === '!') {
+                                            // (?<= / (?<! 后向断言：非捕获，保留原样
+                                            out += src.slice(i, i + 4);
+                                            i += 4;
+                                        } else {
+                                            // (?<name>...) 命名捕获组 → 转为非捕获 (?:
+                                            out += '(?:';
+                                            i += 2;
+                                            // 跳过 <name> 直到 > 结束
+                                            let j = i;
+                                            while (j < src.length && src[j] !== '>') j++;
+                                            i = j + 1; // 跳过 >
+                                        }
+                                    } else {
+                                        // (?: / (?= / (?! 等非捕获/断言：保留原样
+                                        out += ch;
+                                        i++;
+                                    }
+                                } else {
+                                    // 普通捕获组 ( → 非捕获 (?:
+                                    out += '(?:';
+                                    i++;
+                                }
+                            } else {
+                                out += ch;
+                                i++;
+                            }
+                        }
+                        return out;
+                    };
+                    const source = batch.map(r => `(${convertGroups(r.regex.source)})`).join('|');
                     mergedBatches.push({ regex: new RegExp(source, 'i'), offset: i, rules: batch });
                 } catch (e) {
                     // 该批合并失败，降级为逐条执行（保留原 rule 对象供降级路径使用）
@@ -2199,8 +2261,9 @@
                     const host = urlObj.hostname.toLowerCase();
                     if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) {
                         // 同源绝对 URL 的路径也收集，供路径模式提取(BUG-A3)
+                        // pathname 本身不含 query/hash（它们在 .search/.hash），无需 split(冗余-4.2)
                         const p = urlObj.pathname;
-                        if (p && p.startsWith('/') && p.length > 5) relativePaths.add(p.split('?')[0].split('#')[0]);
+                        if (p && p.startsWith('/') && p.length > 5) relativePaths.add(p);
                         return;
                     }
                     if (!domainMeta.has(host)) domainMeta.set(host, { score: 0, sources: new Set(), reasons: new Set(), count: 0 });
@@ -3464,13 +3527,15 @@
             // 改为实时读取 BlockEngine.getDomainSet()——该集合由 invalidateCache() 在
             // addRule/removeRule/saveData 时自动失效重建，确保新封域名即时生效。
             // 启动期快照作为 BlockEngine 尚未就绪时的兜底（document-start 阶段可能时序靠前）。
+            // 注意：不能用 size>0 判断，否则用户删除全部域名后会回退到过期快照（A2残留缺陷）
             const _checkNav = (url) => {
                 if (!url) return false;
                 let liveDomains = blockedDomains;
                 try {
                     // getDomainSet() 返回缓存 Set，命中 invalidateCache 自动重建，O(1) 查询
+                    // 空集合也必须采用，否则删光域名后仍按启动快照拦截（v0.7.2 修复）
                     const liveSet = BlockEngine.getDomainSet();
-                    if (liveSet && liveSet.size > 0) liveDomains = liveSet;
+                    if (liveSet) liveDomains = liveSet;
                 } catch (e) { /* BlockEngine 未就绪时回退快照 */ }
                 return _isBlockedNav(url, liveDomains);
             };
@@ -5030,12 +5095,12 @@
                     this._resetActionPreview(panel);
 
                     // 自动提取路径模式(BUG-A3 + 冗余-7)：统一调用 BlockEngine.extractPathCandidates
-                    // 冗余-6：循环内 addRule 用 skipApply=true 跳过，循环结束后统一调用一次 applyCSSRules
+                    // 冗余-6：循环内 addRule 用 skipApply=true 跳过，由后续 DomainBlockExecutor.execute
+                    //         内部的 applyCSSRules 统一重建（会同时应用 pathPattern + domainBlock），无需此处再调一次
                     const pathCandidates = BlockEngine.extractPathCandidates(result);
                     pathCandidates.forEach(p => {
                         storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' }, true);
                     });
-                    if (pathCandidates.size > 0) BlockEngine.applyCSSRules();
 
                     // 立即隐藏当前框选的整个广告容器（向上找单子链容器）
                     const container = BlockEngine.findSingleChildWrapper(this.currentSelectedEl, 4);
@@ -5043,6 +5108,7 @@
 
                     // 封杀选中域名：添加 domainBlock 规则 + 即时隐藏匹配资源（full 口径）
                     // 口径与 applyCSSRules + scanAndBlockDynamic 一致，确保即时效果=预览=刷新后效果
+                    // 内部 addRule 用 skipApply=true + 末尾单次 applyCSSRules，pathPattern 规则也一并应用
                     DomainBlockExecutor.execute(list, { hideMode: 'full' });
 
                     const pathNote = pathCandidates.size > 0 ? '，并记录 ' + pathCandidates.size + ' 条路径模式' : '';
