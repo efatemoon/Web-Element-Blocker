@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.6.5
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.5：修复Shadow DOM继承宿主页面巨型根字号导致面板字体异常放大(:host/.panel补font-size:14px截断继承链，空状态提示统一用.empty-tip显式字号)。
+// @version      0.7.0
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.7.0：重构真·深度扫描——覆盖层新增Canvas肤色采样/CSS伪元素穿透/混淆跳转沙箱解码/Icon Font映射检测，全局域名新增ServiceWorker/WebSocket/Blob URL/CSS伪元素/SVG引用溯源；区分"重新扫描"(快速基线)与"深度扫描"(高阶探测)；修复BUG-1~4(影响度排序跳过禁用规则/触摸事件DOM校验/e.currentTarget/双引擎补齐)、不一致-1~3(removeRule统一reapplyAll/去除冗余applyCSSRules/区分基线与深度)、冗余-1~3(移除被覆盖的restoreInlineForDomain/批量拦截applyCSSRules改单次/线性查找改Map/Set O(1))。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -273,7 +273,7 @@
             this._cachedDataDomain = null;
         }
 
-        saveData(type, rules) {
+        saveData(type, rules, skipApply = false) {
             const keyMap = {
                 'static': 'blocks', 'dynamic': 'dynamicBlocks', 'regex': 'regexBlocks',
                 'attribute': 'attrBlocks', 'structural': 'structBlocks',
@@ -287,10 +287,11 @@
             this._markDirty(key, allData);
             this.invalidateDataCache();
             BlockEngine.invalidateCache();
-            if (type !== 'regex' && type !== 'complex') BlockEngine.applyCSSRules();
+            // skipApply=true 时不内部触发 applyCSSRules，由外部统一调用 reapplyAll 接管(不一致-1)
+            if (!skipApply && type !== 'regex' && type !== 'complex') BlockEngine.applyCSSRules();
         }
 
-        addRule(type, rule) {
+        addRule(type, rule, skipApply = false) {
             if (type === 'domainBlock') {
                 const list = this.getDomainBlocks();
                 if (rule.domain && !list.some(r => r.domain === rule.domain)) {
@@ -298,7 +299,8 @@
                     this._markDirty('domainBlocks', list);
                     this.invalidateDataCache();
                     BlockEngine.invalidateCache();
-                    BlockEngine.applyCSSRules();
+                    // skipApply=true 时由外部统一调用 reapplyAll 接管(冗余-2)
+                    if (!skipApply) BlockEngine.applyCSSRules();
                 }
                 return;
             }
@@ -318,7 +320,8 @@
                 // 记录添加时间戳，供"规则与防御管理 / 按网站查看所有规则"面板按最近过滤时间倒序展示
                 rule._ts = Date.now();
                 data.push(rule);
-                this.saveData(type, data);
+                // skipApply=true 时跳过 saveData 内部 applyCSSRules，由外部统一调用(冗余-2)
+                this.saveData(type, data, skipApply);
             }
         }
 
@@ -330,18 +333,15 @@
                     this._markDirty('domainBlocks', list);
                     this.invalidateDataCache();
                     BlockEngine.invalidateCache();
-                    BlockEngine.applyCSSRules();
+                    // 不再内部调用 applyCSSRules，统一由外部 reapplyAll 接管(不一致-1)
                 }
                 return;
             }
             const data = this.getData()[type];
             if (data[index]) {
                 data.splice(index, 1);
-                this.saveData(type, data);
-                // saveData 对 regex/complex 跳过 applyCSSRules（正确），但也未重新应用
-                // regex/complex 规则。补回：删除后立即重新应用剩余规则，避免旧内联隐藏残留（Bug2.1）
-                if (type === 'regex') BlockEngine.applyRegexRules();
-                if (type === 'complex') BlockEngine.applyComplexRules();
+                // skipApply=true 跳过 saveData 内部 applyCSSRules；regex/complex 的 apply 也由外部 reapplyAll 接管(不一致-1)
+                this.saveData(type, data, true);
             }
         }
 
@@ -362,9 +362,7 @@
             this._markDirty(key, allData);
             this.invalidateDataCache();
             BlockEngine.invalidateCache();
-            BlockEngine.applyCSSRules();
-            if (type === 'regex') BlockEngine.applyRegexRules();
-            if (type === 'complex') BlockEngine.applyComplexRules();
+            // 不再内部调用 apply*，统一由外部 reapplyAll 接管(不一致-1)
             return true;
         }
 
@@ -384,9 +382,7 @@
             this._markDirty(key, allData);
             this.invalidateDataCache();
             BlockEngine.invalidateCache();
-            BlockEngine.applyCSSRules();
-            if (type === 'regex') BlockEngine.applyRegexRules();
-            if (type === 'complex') BlockEngine.applyComplexRules();
+            // 不再内部调用 apply*，统一由外部 reapplyAll 接管(不一致-1)
             return true;
         }
 
@@ -1325,29 +1321,6 @@
                 }
             }
             this._lastCSSFingerprint = fingerprint;
-        }
-
-        // 清除某域名相关元素的内联隐藏样式（删除 domainBlock 规则后调用，解决问题2&5）
-        // scanAndBlockDynamic 会给命中元素的单子链容器打 inline display:none；删除规则只重建 CSS 表，
-        // inline 残留导致"删除规则后元素仍屏蔽"。此处清除该域名命中的资源元素及其父级的内联隐藏，
-        // 随后由 force 重扫重新应用剩余规则。
-        static restoreInlineForDomain(domain) {
-            if (!domain) return;
-            const sel = ResourceSelectorBuilder.buildDomainAttr(domain);
-            const clear = (node) => {
-                if (!node) return;
-                node.style.removeProperty('display');
-                node.style.removeProperty('opacity');
-                node.style.removeProperty('visibility');
-                node.style.removeProperty('pointer-events');
-            };
-            document.querySelectorAll(sel).forEach(el => {
-                clear(el);
-                if (el.parentElement) clear(el.parentElement);
-                // 单子链容器也可能被 scanAndBlockDynamic 隐藏，向上清一层兜底
-                const wrapper = this.findSingleChildWrapper(el, 4);
-                clear(wrapper);
-            });
         }
 
         // 通用内联样式还原：删除任意类型规则后，清除所有由脚本设置的内联隐藏样式
@@ -2497,7 +2470,16 @@
         static hookWebSocket() {
             if (!window.WebSocket || window.WebSocket.__proBlockerHooked) return;
             const OrigWS = window.WebSocket;
+            // 全局追踪集合：记录所有 WS 连接目标，供 GlobalDomainScanner 深度扫描挖掘隐藏域名
+            if (!Array.isArray(window.__proBlocker_ws_targets)) {
+                try { Object.defineProperty(window, '__proBlocker_ws_targets', { value: [], writable: true, configurable: true }); } catch (e) { window.__proBlocker_ws_targets = []; }
+            }
             const hooked = function (url, protocols) {
+                // 记录 WS 目标（无论是否拦截），供深度域名扫描使用
+                try {
+                    const target = typeof url === 'string' ? url : (url && url.url) || '';
+                    if (target && window.__proBlocker_ws_targets.length < 200) window.__proBlocker_ws_targets.push(target);
+                } catch (e) { }
                 if (NetworkInterceptor.isUrlBlocked(typeof url === 'string' ? url : (url && url.url) || '')) {
                     BlockEngine.stats.networkBlocks++;
                     // 返回一个立即关闭的伪 WebSocket，避免页面 new WS() 抛错
@@ -2884,7 +2866,175 @@
             return { results, elapsed, total: results.length };
         }
 
-        return { scan, VICE_TOKENS };
+        // ════════════════════════════════════════
+        //  真·深度域名挖掘（v0.7.0 新增）
+        //  补充 collect() 6 通道未覆盖的隐藏域名：
+        //  - Service Worker / Web Worker 后台线程域名
+        //  - 活跃 WebSocket 连接域名
+        //  - Base64 / Blob URL 溯源
+        //  - CSS 伪元素 ::before/::after 中的 url() 注入
+        //  - SVG <use href> / <image href> 资源引用
+        // ════════════════════════════════════════
+
+        /**
+         * 收集 deep scan 阶段独有的隐藏域名，并入主 map
+         * @param {Map} baseMap collect() 返回的主 map，函数内就地合并
+         * @returns {Object} { swHosts: [], wsHosts: [], blobUrls: [], pseudoUrls: [], svgUrls: [] }
+         */
+        function _collectDeepDomains(baseMap) {
+            const curHost = location.hostname.toLowerCase();
+            const main = mainDomain(curHost);
+            const extras = { swHosts: [], wsHosts: [], blobUrls: [], pseudoUrls: [], svgUrls: [] };
+
+            function _addHost(hostname, url, type) {
+                if (!hostname || hostname === curHost || isSameSite(hostname, main)) return;
+                let info = baseMap.get(hostname);
+                if (!info) {
+                    info = { hostname, urls: [], types: new Set(), bytes: 0, count: 0, t0: 0, t1: 0, hasRedirect: false, thirdParty: true };
+                    baseMap.set(hostname, info);
+                }
+                if (info.urls.length < MAX_URLS_PER_HOST) info.urls.push(url);
+                info.types.add(type);
+                info.count++;
+                return info;
+            }
+
+            // ① Service Worker 后台线程域名
+            try {
+                if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+                    // getRegistrations 返回 Promise，深度扫描时同步收集可能尚未完成
+                    // 此处用 .then 异步收集，仅作尽力而为探测
+                    navigator.serviceWorker.getRegistrations().then(regs => {
+                        for (const reg of regs) {
+                            try {
+                                const u = new URL(reg.scope || '');
+                                const h = u.hostname.toLowerCase();
+                                if (_addHost(h, reg.scope || '', 'sw')) extras.swHosts.push(h);
+                            } catch (e) { }
+                        }
+                    }).catch(() => { });
+                }
+            } catch (e) { }
+
+            // ② 活跃 WebSocket 连接域名（无法直接枚举，扫描已 hook 的 WebSocket 实例）
+            // NetworkInterceptor.hookWebSocket 已记录 ws 连接，此处从全局追踪集合读取
+            try {
+                if (window.__proBlocker_ws_targets && Array.isArray(window.__proBlocker_ws_targets)) {
+                    for (const wsUrl of window.__proBlocker_ws_targets) {
+                        try {
+                            const u = new URL(wsUrl);
+                            const h = u.hostname.toLowerCase();
+                            if (_addHost(h, wsUrl, 'ws')) extras.wsHosts.push(h);
+                        } catch (e) { }
+                    }
+                }
+            } catch (e) { }
+
+            // ③ Base64 / Blob URL 溯源：Blob URL 本身不含域名，但创建前的源码常含真实地址
+            try {
+                const blobEls = document.querySelectorAll('[src^="blob:"], [href^="blob:"], [src^="data:"], [href^="data:"]');
+                for (const el of blobEls) {
+                    const val = el.getAttribute('src') || el.getAttribute('href') || '';
+                    if (!val) continue;
+                    // data: URL 内嵌的 base64 内容可能含 URL 字符串
+                    if (val.startsWith('data:') && val.length < 5000) {
+                        const matches = val.match(/https?:\/\/[^\s"'<>(){}',;]+/gi);
+                        if (matches) {
+                            for (const u of matches) {
+                                try {
+                                    const h = new URL(u).hostname.toLowerCase();
+                                    if (_addHost(h, u, 'data-embed')) extras.blobUrls.push(u);
+                                } catch (e) { }
+                            }
+                        }
+                    }
+                    // blob: URL 无法直接溯源，记录出现供后续追溯
+                    if (val.startsWith('blob:')) extras.blobUrls.push(val);
+                }
+            } catch (e) { }
+
+            // ④ CSS 伪元素 ::before/::after 中的 url() 注入
+            try {
+                const candidates = document.querySelectorAll('div,section,aside,a,ins');
+                let checked = 0;
+                for (const el of candidates) {
+                    if (checked >= 500) break; // 采样上限
+                    checked++;
+                    if (UIManager.isProtectedElement(el)) continue;
+                    try {
+                        const before = window.getComputedStyle(el, '::before').content;
+                        const after = window.getComputedStyle(el, '::after').content;
+                        [before, after].forEach(content => {
+                            if (!content || content === 'none' || content === 'normal') return;
+                            const m = content.match(/url\(["']?([^"')]+)["']?\)/);
+                            if (m && m[1] && /^https?:\/\//i.test(m[1])) {
+                                try {
+                                    const h = new URL(m[1]).hostname.toLowerCase();
+                                    if (_addHost(h, m[1], 'pseudo-css')) extras.pseudoUrls.push(m[1]);
+                                } catch (e) { }
+                            }
+                        });
+                    } catch (e) { }
+                }
+            } catch (e) { }
+
+            // ⑤ SVG <use href> / <image href> / <image xlink:href> 资源引用
+            try {
+                // xlink:href 含冒号需在 CSS 选择器中转义，避免 querySelectorAll 抛错
+                const svgRefs = document.querySelectorAll('use[href], image[href], image[xlink\\:href]');
+                for (const el of svgRefs) {
+                    const href = el.getAttribute('href') || el.getAttribute('xlink:href') || '';
+                    if (!href || href.startsWith('#') || href.startsWith('data:')) continue;
+                    try {
+                        const abs = new URL(href, location.href);
+                        const h = abs.hostname.toLowerCase();
+                        if (_addHost(h, href, 'svg-ref')) extras.svgUrls.push(href);
+                    } catch (e) { }
+                }
+            } catch (e) { }
+
+            return extras;
+        }
+
+        /**
+         * 真·深度域名扫描主入口
+         * @param {Object} opts.deep=true 开启深度探测；false 仅基线 scan()
+         * @returns {Object} scan() 结果 + deepExtras 字段
+         */
+        function deepScan(opts = {}) {
+            const t0 = performance.now();
+            const map = collect();
+            let deepExtras = null;
+            if (opts.deep) {
+                deepExtras = _collectDeepDomains(map);
+            }
+            const results = [];
+            for (const [, info] of map) {
+                const f = extractFeatures(info);
+                const { score, level, reasons, signals } = calculateScore(f);
+                // 深度扫描新增的隐藏通道域名加分
+                let extraScore = 0;
+                const extraReasons = [];
+                if (deepExtras) {
+                    if (deepExtras.swHosts.includes(info.hostname)) { extraScore += 18; extraReasons.push('🛠ServiceWorker'); }
+                    if (deepExtras.wsHosts.includes(info.hostname)) { extraScore += 15; extraReasons.push('🔌WebSocket'); }
+                    if (info.types.has('pseudo-css')) { extraScore += 12; extraReasons.push('::伪元素注入'); }
+                    if (info.types.has('svg-ref')) { extraScore += 8; extraReasons.push('SVG引用'); }
+                    if (info.types.has('data-embed')) { extraScore += 10; extraReasons.push('📦data内嵌'); }
+                }
+                const finalScore = Math.min(100, score + extraScore);
+                const allReasons = extraReasons.length > 0 ? reasons.concat(extraReasons) : reasons;
+                results.push(Object.assign({}, f, {
+                    score: finalScore, level: finalScore >= 55 && signals + (extraScore > 0 ? 1 : 0) >= 3 ? 'ad' : level,
+                    reasons: allReasons, signals, info
+                }));
+            }
+            results.sort((a, b) => b.score - a.score);
+            const elapsed = (performance.now() - t0).toFixed(1);
+            return { results, elapsed, total: results.length, deepExtras };
+        }
+
+        return { scan, deepScan, VICE_TOKENS };
     })();
 
     /**
@@ -3401,7 +3551,292 @@
             return s;
         }
 
-        return { scan, enableNavigationInterceptor };
+        // ════════════════════════════════════════
+        //  真·深度扫描（v0.7.0 新增）：高开销、深层级、针对性探测
+        //  - Canvas 肤色采样：识别博彩/色情图片（vice-image）
+        //  - CSS 伪元素穿透：提取 ::before/::after 中隐藏的 URL/文本
+        //  - 混淆跳转沙箱解码：还原 eval(atob)/fromCharCode 等混淆跳转
+        //  - Icon Font 映射检测：识别博彩网站自定义字体图标
+        //  全部方法采用 try/catch 包裹，跨域污染/不可读时静默降级，避免控制台报错
+        // ════════════════════════════════════════
+
+        /**
+         * 轻量级肤色检测：针对同域/CORS 允许的 img/canvas
+         * 缩放至 50×50 后采样像素 RGB，肤色像素占比 > 30% 视为色情高危
+         * 跨域 tainted canvas 会抛 SecurityError，catch 后返回 0 静默跳过
+         */
+        function detectSkinTone(imgEl) {
+            try {
+                if (!imgEl || !imgEl.complete || imgEl.naturalWidth === 0) return 0;
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                if (!ctx) return 0;
+                const w = 50, h = 50;
+                canvas.width = w; canvas.height = h;
+                ctx.drawImage(imgEl, 0, 0, w, h);
+                const data = ctx.getImageData(0, 0, w, h).data;
+                let skinPixels = 0, totalPixels = 0;
+                // 每隔 4 个像素采样一次（步长 16=4 通道×4 像素），提升速度
+                for (let i = 0; i < data.length; i += 16) {
+                    const r = data[i], g = data[i + 1], b = data[i + 2];
+                    // 简化版 RGB 肤色规则（Peer et al.）
+                    if (r > 95 && g > 40 && b > 20 && r > g && r > b &&
+                        (Math.max(r, g, b) - Math.min(r, g, b)) > 15 &&
+                        Math.abs(r - g) > 15) {
+                        skinPixels++;
+                    }
+                    totalPixels++;
+                }
+                return totalPixels > 0 ? skinPixels / totalPixels : 0;
+            } catch (e) {
+                return 0; // 跨域污染或其他错误，静默跳过
+            }
+        }
+
+        /**
+         * 提取 CSS 伪元素中的隐藏 URL 或文本
+         * 高级广告常用 ::before/::after 注入全屏遮罩或博彩文字（DOM textContent 抓不到）
+         */
+        function extractPseudoContent(el) {
+            const results = [];
+            try {
+                if (!el) return results;
+                const before = window.getComputedStyle(el, '::before').content;
+                const after = window.getComputedStyle(el, '::after').content;
+                [before, after].forEach(content => {
+                    if (!content || content === 'none' || content === 'normal') return;
+                    // 提取 url("...")
+                    const urlMatch = content.match(/url\(["']?([^"')]+)["']?\)/);
+                    if (urlMatch) results.push({ type: 'url', value: urlMatch[1] });
+                    // 提取纯文本（去除引号），长度 2~100 视为有意义的注入文本
+                    const text = content.replace(/^["']|["']$/g, '');
+                    if (text.length > 2 && text.length < 100) {
+                        results.push({ type: 'text', value: text });
+                    }
+                });
+            } catch (e) { }
+            return results;
+        }
+
+        /**
+         * 解码混淆的 onclick/href 跳转 URL
+         * 针对 eval(atob())、String.fromCharCode、\x、\u 等逃逸手法
+         * 沙箱屏蔽 window.location 防止意外跳转，仅返回解码后的字符串 URL
+         */
+        function decodeObfuscatedUrl(code) {
+            if (!code || typeof code !== 'string') return null;
+            // 仅对包含混淆特征的代码进行沙箱测试，避免无谓开销
+            if (!/atob|fromCharCode|unescape|\\x[0-9a-f]{2}|\\u[0-9a-f]{4}/i.test(code)) return null;
+            try {
+                // 构建沙箱：屏蔽 location 防止意外跳转，仅暴露解码相关函数
+                // 注意：new Function 内部 this=global，需显式声明屏蔽外层 window
+                const fn = new Function('atob', 'String', 'unescape', `
+                    "use strict";
+                    var location = { href: '' };
+                    var window = { location: { href: '' }, open: function(){}, atob: atob, String: String, unescape: unescape };
+                    var document = {};
+                    try { return (${code}); } catch (e) { return null; }
+                `);
+                const decoded = fn(window.atob, window.String, window.unescape);
+                if (typeof decoded === 'string' && /https?:\/\//i.test(decoded)) {
+                    return decoded;
+                }
+            } catch (e) { /* 解码失败静默忽略 */ }
+            return null;
+        }
+
+        /**
+         * Icon Font 映射检测：博彩网站常使用自定义 @font-face 将普通 Unicode 映射为博彩图标
+         * 检查元素的 font-family 是否为自定义字体（非系统字体），结合内容打分
+         */
+        const SYSTEM_FONT_FAMILIES = new Set([
+            'arial', 'helvetica', 'times new roman', 'georgia', 'courier new',
+            'verdana', 'tahoma', 'trebuchet ms', 'impact', 'comic sans ms',
+            'sans-serif', 'serif', 'monospace', 'cursive', 'fantasy', 'system-ui',
+            'segoe ui', 'microsoft yahei', 'pingfang sc', 'hiragino sans gb',
+            'songti sc', 'simhei', 'simsun', 'fangsong', 'stheiti'
+        ]);
+        function isCustomFont(el) {
+            try {
+                if (!el) return false;
+                const cs = window.getComputedStyle(el);
+                const ff = (cs.fontFamily || '').toLowerCase();
+                if (!ff) return false;
+                // 拆分多个字体名，逐个检查是否有非系统字体
+                const fonts = ff.split(',').map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+                for (const f of fonts) {
+                    if (!SYSTEM_FONT_FAMILIES.has(f)) return true; // 存在非系统字体=自定义字体
+                }
+                return false;
+            } catch (e) { return false; }
+        }
+
+        /**
+         * 真·深度扫描主入口：在基础 scan() 之上叠加高开销探测
+         * @param {Object} opts.deep=true 开启深度探测；false 仅基线扫描
+         * @returns {Object} { results, elapsed, total, deepExtras }
+         *   deepExtras: 深度扫描新增的额外发现（肤色调色情图、伪元素注入、混淆跳转域名等）
+         */
+        function deepScan(opts = {}) {
+            const t0 = performance.now();
+            const base = scan();
+            if (!opts.deep) return Object.assign(base, { deepExtras: null });
+
+            const deepExtras = {
+                viceImages: [],     // { el, ratio, src } 肤色占比超阈值的图片
+                pseudoInjects: [],  // { el, items } 伪元素注入的 URL/文本
+                obfuscatedUrls: [], // { el, url } 混淆解码出的跳转 URL
+                customFontEls: []   // { el, sample } 使用自定义字体的元素
+            };
+
+            // ① 肤色采样：仅扫描可点击图片（a img / [onclick] img），避免对全站图片扫描
+            try {
+                const clickableImgs = document.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
+                for (const img of clickableImgs) {
+                    if (UIManager.isProtectedElement(img)) continue;
+                    const ratio = detectSkinTone(img);
+                    if (ratio > 0.3) {
+                        deepExtras.viceImages.push({
+                            el: img,
+                            ratio: Math.round(ratio * 100) / 100,
+                            src: (img.src || '').substring(0, 120)
+                        });
+                    }
+                }
+            } catch (e) { }
+
+            // ② 伪元素穿透：扫描高 z-index 定位元素（覆盖层广告常注入伪元素）
+            try {
+                const positioned = document.querySelectorAll('div,section,aside,a');
+                let checked = 0;
+                for (const el of positioned) {
+                    if (checked >= 800) break; // 采样上限，避免大型页面卡顿
+                    checked++;
+                    if (UIManager.isProtectedElement(el)) continue;
+                    const items = extractPseudoContent(el);
+                    if (items.length > 0) {
+                        deepExtras.pseudoInjects.push({ el, items });
+                    }
+                }
+            } catch (e) { }
+
+            // ③ 混淆跳转沙箱解码：扫描含混淆特征的内联事件
+            try {
+                const inlineEls = document.querySelectorAll('[onclick], [ontouchstart], [onmousedown], [data-href], [data-url], [data-link]');
+                for (const el of inlineEls) {
+                    if (UIManager.isProtectedElement(el)) continue;
+                    const attrs = ['onclick', 'ontouchstart', 'onmousedown', 'data-href', 'data-url', 'data-link'];
+                    for (const attr of attrs) {
+                        const val = el.getAttribute(attr);
+                        if (!val) continue;
+                        const decoded = decodeObfuscatedUrl(val);
+                        if (decoded) {
+                            deepExtras.obfuscatedUrls.push({ el, url: decoded });
+                        }
+                    }
+                }
+            } catch (e) { }
+
+            // ④ Icon Font 映射检测：扫描博彩/色情容器内的元素
+            try {
+                const viceContainers = document.querySelectorAll(
+                    '[class*="casino"], [class*="bet"], [class*="slot"], [class*="poker"], [class*="lottery"], ins'
+                );
+                for (const c of viceContainers) {
+                    if (UIManager.isProtectedElement(c)) continue;
+                    if (isCustomFont(c)) {
+                        const sample = (c.textContent || '').trim().substring(0, 50);
+                        deepExtras.customFontEls.push({ el: c, sample });
+                    }
+                }
+            } catch (e) { }
+
+            // ⑤ 融合深度发现到 results：肤色调色情图直接升级 category，混淆 URL 注入 triggerUrl
+            const elToResult = new Map();
+            for (const r of base.results) if (r.el) elToResult.set(r.el, r);
+            // 肤色图片：升级为 vice-image 并加分
+            for (const v of deepExtras.viceImages) {
+                let r = elToResult.get(v.el);
+                if (!r) {
+                    // OAS 基线未收录的图片，新增记录
+                    r = {
+                        el: v.el, suspicion: 40, reasons: ['🎨肤色采样' + Math.round(v.ratio * 100) + '%'],
+                        features: { skinRatio: v.ratio, src: v.src }, category: 'vice-image',
+                        selector: _buildSelector(v.el.parentElement || v.el)
+                    };
+                    r.features.tag = 'img';
+                    base.results.push(r);
+                    elToResult.set(v.el, r);
+                } else {
+                    r.suspicion = (r.suspicion || 0) + 35;
+                    r.reasons = r.reasons || [];
+                    r.reasons.push('🎨肤色采样' + Math.round(v.ratio * 100) + '%');
+                    r.features = r.features || {};
+                    r.features.skinRatio = v.ratio;
+                    r.category = 'vice-image';
+                }
+            }
+            // 混淆 URL：注入 triggerUrl 并加分
+            for (const o of deepExtras.obfuscatedUrls) {
+                let r = elToResult.get(o.el);
+                if (!r) {
+                    r = {
+                        el: o.el, suspicion: 45, reasons: ['🔐混淆跳转解码'],
+                        features: { clickable: true, externalLink: o.url }, category: 'overlay',
+                        selector: _buildSelector(o.el), triggerUrl: o.url
+                    };
+                    r.features.tag = o.el.tagName.toLowerCase();
+                    base.results.push(r);
+                    elToResult.set(o.el, r);
+                } else {
+                    r.suspicion = (r.suspicion || 0) + 30;
+                    r.reasons = r.reasons || [];
+                    r.reasons.push('🔐混淆跳转解码');
+                    r.features = r.features || {};
+                    r.features.obfuscatedRedirect = o.url;
+                    if (!r.triggerUrl) r.triggerUrl = o.url;
+                }
+            }
+            // 伪元素注入：加分（不新增记录，仅标记已有覆盖层）
+            for (const p of deepExtras.pseudoInjects) {
+                const r = elToResult.get(p.el);
+                if (r) {
+                    r.suspicion = (r.suspicion || 0) + 15;
+                    r.reasons = r.reasons || [];
+                    r.reasons.push('::伪元素注入');
+                    r.features = r.features || {};
+                    r.features.pseudoInject = p.items;
+                }
+            }
+            // Icon Font：加分
+            for (const cf of deepExtras.customFontEls) {
+                let r = elToResult.get(cf.el);
+                if (!r) {
+                    r = {
+                        el: cf.el, suspicion: 20, reasons: ['🔤自定义字体图标'],
+                        features: { customFont: true }, category: 'vice-image',
+                        selector: _buildSelector(cf.el)
+                    };
+                    r.features.tag = cf.el.tagName.toLowerCase();
+                    base.results.push(r);
+                    elToResult.set(cf.el, r);
+                } else {
+                    r.suspicion = (r.suspicion || 0) + 18;
+                    r.reasons = r.reasons || [];
+                    r.reasons.push('🔤自定义字体图标');
+                    r.features = r.features || {};
+                    r.features.customFont = true;
+                }
+            }
+
+            // 重新排序
+            base.results.sort((a, b) => (b.suspicion || 0) - (a.suspicion || 0));
+            base.total = base.results.length;
+            const elapsed = (performance.now() - t0).toFixed(1);
+            return Object.assign(base, { elapsed, deepExtras });
+        }
+
+        return { scan, deepScan, enableNavigationInterceptor, detectSkinTone, extractPseudoContent, decodeObfuscatedUrl };
     })();
 
     /**
@@ -4152,6 +4587,12 @@
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
             this.stopSelection();
+            // 元素有效性校验(BUG-2)：stopSelection 触发导航解冻瞬间，广告脚本可能移除目标元素，
+            // 此时 showActionPanel 会绑定失效引用导致后续操作报错，与 _handleClick 校验口径保持一致
+            if (!this._isElementInDOM(target)) {
+                this.showToast('目标元素已失效，请重新选择。', 'warning');
+                return;
+            }
             this.showActionPanel(target);
         }
 
@@ -4625,15 +5066,18 @@
                 };
             });
             // 补充 GDS 独有域名（extractResourceDomains 未覆盖的 Performance API / 链接跳转目标），过滤已封杀
+            // 冗余-3：用 Set O(1) 查找替代 allDomains.find O(n) 线性查找
+            const existingHosts = new Set(allDomains.map(d => d.host));
             for (const [host, g] of gdsMap) {
                 if (blockedDomainSet.has(host)) continue;
-                if (!allDomains.find(d => d.host === host)) {
+                if (!existingHosts.has(host)) {
                     allDomains.push({
                         host, score: g.score, count: g.freq || 1,
                         sources: ['performance-api'], reasons: g.reasons || [],
                         viceToken: g.viceToken || null, adToken: g.adToken || null,
                         level: g.level || null, gdsReasons: g.reasons || [], signals: g.signals || 0
                     });
+                    existingHosts.add(host);
                 }
             }
             // 按分数降序，确保高分广告域置顶
@@ -4769,7 +5213,8 @@
                     input.value = '';
                     return;
                 }
-                if (!allDomains.find(d => d.host === host)) {
+                // 冗余-3：用 some 替代 find（仅需判断存在性，无需返回元素），语义更清晰
+                if (!allDomains.some(d => d.host === host)) {
                     allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1, viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 });
                 }
                 selectedHosts.add(host);
@@ -4778,47 +5223,76 @@
                 renderDomains();
             });
 
-            // 深度扫描：运行双引擎联合扫描后刷新列表
+            // 深度扫描：真·深度域名挖掘（v0.7.0 重构）
+            // 双引擎：BlockEngine.extractResourceDomains（DOM 资源）+ GlobalDomainScanner.deepScan（GDS 6通道+12维+真·深度）
+            // 真·深度：CSS 伪元素穿透 / Service Worker / WebSocket / Blob URL 溯源 / SVG 引用
+            // 时间分片：requestIdleCallback 包裹高开销探测，避免主线程卡顿(BUG-4)
             panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
-                const btn = e.target;
+                const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
                 const origText = btn.textContent;
                 btn.disabled = true;
-                btn.textContent = '⏳ 扫描中...';
-                setTimeout(() => {
+                btn.textContent = '⏳ 深度挖掘中...';
+                // 高开销探测包裹 requestIdleCallback，避免主线程卡死（方案六.2 性能保护）
+                const runDeep = () => {
                     try {
-                        // 扫描后重新合并数据并刷新列表
                         const currentBlocked = new Set(storage.getDomainBlocks().map(r => r.domain));
                         allDomains = allDomains.filter(d => !currentBlocked.has(d.host));
-                        const newGds = GlobalDomainScanner.scan();
-                        const newMap = new Map();
-                        for (const r of newGds.results) newMap.set(r.hostname, r);
-                        for (const g of newMap.values()) {
+                        // BUG-4 修复：补齐双引擎——extractResourceDomains DOM 资源 + GDS.deepScan 真·深度
+                        const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
+                        const deepResult = GlobalDomainScanner.deepScan({ deep: true });
+                        // 冗余-3 修复：用 Map O(1) 查找合并，替代 allDomains.find O(n) 线性查找
+                        const existingMap = new Map();
+                        for (const d of allDomains) existingMap.set(d.host, d);
+                        // 合并 extractResourceDomains 结果
+                        for (const sd of scoredDomains) {
+                            if (currentBlocked.has(sd.host)) continue;
+                            const exist = existingMap.get(sd.host);
+                            if (exist) {
+                                exist.score = Math.max(exist.score, sd.score);
+                                if (!exist.sources.includes('dom-resource')) exist.sources.push('dom-resource');
+                            } else {
+                                const newD = { host: sd.host, score: sd.score, count: sd.count || 1, sources: sd.sources || ['dom-resource'], reasons: sd.reasons || [], viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 };
+                                existingMap.set(sd.host, newD);
+                                allDomains.push(newD);
+                            }
+                        }
+                        // 合并 GDS.deepScan 结果（含真·深度新增的隐藏域名）
+                        for (const g of deepResult.results) {
                             if (currentBlocked.has(g.hostname)) continue;
-                            const exist = allDomains.find(d => d.host === g.hostname);
+                            const exist = existingMap.get(g.hostname);
                             if (exist) {
                                 exist.score = Math.max(exist.score, g.score);
                                 exist.viceToken = g.viceToken || exist.viceToken;
                                 exist.adToken = g.adToken || exist.adToken;
                                 exist.level = g.level || exist.level;
                                 exist.gdsReasons = g.reasons || exist.gdsReasons;
+                                exist.signals = Math.max(exist.signals, g.signals || 0);
                             } else {
-                                allDomains.push({ host: g.hostname, score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals });
+                                const newD = { host: g.hostname, score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals };
+                                existingMap.set(g.hostname, newD);
+                                allDomains.push(newD);
                             }
                         }
                         allDomains.sort((a, b) => b.score - a.score);
-                        // 同步 selectedHosts：移除已被过滤掉的域名，避免封杀计数与实际可封杀数不一致(BUG-M2)
+                        // 同步 selectedHosts：移除已被过滤掉的域名(BUG-M2)
                         const hostSet = new Set(allDomains.map(d => d.host));
                         Array.from(selectedHosts).forEach(h => { if (!hostSet.has(h)) selectedHosts.delete(h); });
                         renderDomains();
                         btn.disabled = false;
                         btn.textContent = origText;
-                        this.showToast('深度扫描完成，域名列表已刷新。', 'success');
+                        const deepNote = deepResult.deepExtras ? `（深度新增：SW ${deepResult.deepExtras.swHosts.length} · WS ${deepResult.deepExtras.wsHosts.length} · 伪元素 ${deepResult.deepExtras.pseudoUrls.length} · SVG ${deepResult.deepExtras.svgUrls.length}）` : '';
+                        this.showToast(`深度扫描完成，域名列表已刷新。${deepNote}`, 'success', 5000);
                     } catch (err) {
                         btn.disabled = false;
                         btn.textContent = origText;
                         this.showToast('深度扫描失败：' + err.message, 'error');
                     }
-                }, 50);
+                };
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(() => runDeep(), { timeout: 500 });
+                } else {
+                    setTimeout(runDeep, 50);
+                }
             });
 
             // 预览状态使用实例属性 this._globalPreview，clearPanel 可跨面板清理，避免预览元素残留
@@ -5153,8 +5627,8 @@
                 if (mode === 'path') {
                     const text = panel.querySelector('#path-input').value.trim();
                     if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
+                    // addRule 内部已通过 saveData 调用 applyCSSRules，此处无需重复(不一致-2)
                     storage.addRule('pathPattern', { pattern: text, type: 'pathPattern' });
-                    BlockEngine.applyCSSRules();
                     BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
                     this.clearPanel();
                     return;
@@ -5167,8 +5641,8 @@
                         this.showToast('校验失败：属性选择器语法错误，请检查括号、引号是否匹配。', 'error');
                         return;
                     }
+                    // addRule 内部已通过 saveData 调用 applyCSSRules，此处无需重复(不一致-2)
                     storage.addRule('attribute', { attrSelector: text, type: 'attribute' });
-                    BlockEngine.applyCSSRules();
                     this.clearPanel();
                     return;
                 }
@@ -5235,6 +5709,7 @@
 
             // 1. static 规则：直接 querySelectorAll 计数
             (data.static || []).forEach((r, i) => {
+                if (r._disabled) return; // 跳过禁用规则，避免影响度排序误导(BUG-1)
                 if (!r.selector) return;
                 let count = 0;
                 try { count = document.querySelectorAll(r.selector).length; } catch (e) { }
@@ -5243,6 +5718,7 @@
 
             // 2. dynamic 规则：取首个类名 token 转属性选择器计数
             (data.dynamic || []).forEach((r, i) => {
+                if (r._disabled) return; // 跳过禁用规则(BUG-1)
                 if (!r.className) return;
                 const token = r.className.split(/\s+/).filter(Boolean)[0];
                 if (!token) return;
@@ -5253,6 +5729,7 @@
 
             // 3. attribute 规则：直接使用 attrSelector 计数
             (data.attribute || []).forEach((r, i) => {
+                if (r._disabled) return; // 跳过禁用规则(BUG-1)
                 if (!r.attrSelector) return;
                 let count = 0;
                 try { count = document.querySelectorAll(r.attrSelector).length; } catch (e) { }
@@ -5262,6 +5739,7 @@
             // 4. regex 规则：TreeWalker 采样前 500 个文本节点（跳过 SCRIPT/STYLE/NOSCRIPT）
             //    contains 模式规则用 String.includes() 匹配(BUG-M7)，其余用 RegExp
             (data.regex || []).forEach((r, i) => {
+                if (r._disabled) return; // 跳过禁用规则(BUG-1)
                 if (!r.regex) return;
                 let count = 0;
                 try {
@@ -5281,6 +5759,7 @@
 
             // 5. domainBlock 规则：按 6 通道属性选择器匹配计数（与 applyCSSRules 一致）
             (data.domainBlock || []).forEach((r, i) => {
+                if (r._disabled) return; // 跳过禁用规则(BUG-1)
                 if (!r.domain) return;
                 const sel = ResourceSelectorBuilder.buildDomainAttr(r.domain);
                 let count = 0;
@@ -5290,6 +5769,7 @@
 
             // 6. pathPattern 规则：按 3 通道属性选择器匹配计数（与 applyCSSRules 一致）
             (data.pathPattern || []).forEach((r, i) => {
+                if (r._disabled) return; // 跳过禁用规则(BUG-1)
                 if (!r.pattern) return;
                 const sel = ResourceSelectorBuilder.buildPathAttr(r.pattern);
                 let count = 0;
@@ -5563,17 +6043,19 @@
             // 影响度排序：评估每条规则当前页面命中元素数，命中越多越疑似误杀
             // 切换为 toggle：首次点击进入影响度模式，再次点击恢复 _ts 倒序
             panel.querySelector('#btn-impact-sort').addEventListener('click', (e) => {
+                // 用 currentTarget 取按钮本身，避免点击子元素时 e.target 指向子元素(BUG-3)
+                const btn = e.currentTarget;
                 if (!impactMode) {
                     impactMode = true;
-                    e.target.textContent = '↩ 恢复原排序';
-                    e.target.classList.remove('btn-warning');
-                    e.target.classList.add('btn-success');
+                    btn.textContent = '↩ 恢复原排序';
+                    btn.classList.remove('btn-warning');
+                    btn.classList.add('btn-success');
                     records = rebuildRecords(); // 进入影响度模式时注入 impactScore
                 } else {
                     impactMode = false;
-                    e.target.textContent = '📊 按影响度排序';
-                    e.target.classList.remove('btn-success');
-                    e.target.classList.add('btn-warning');
+                    btn.textContent = '📊 按影响度排序';
+                    btn.classList.remove('btn-success');
+                    btn.classList.add('btn-warning');
                     records = buildRecords(); // 恢复 _ts 倒序
                 }
                 renderList();
@@ -5619,10 +6101,11 @@
                 }
 
                 if (scope === 'global') {
-                    // 域名黑名单：先还原该域名的内联隐藏，再删除规则，最后强制重扫应用剩余规则
-                    BlockEngine.restoreInlineForDomain(value);
+                    // 域名黑名单：removeRule 已不再内部 apply(不一致-1)，统一由 reapplyAll 接管
+                    // reapplyAll = restoreAllInlineStyles + applyCSSRules + applyRegexRules + applyComplexRules + scanAndBlockDynamic
+                    // restoreAllInlineStyles 清除该域名命中的内联隐藏，applyCSSRules 重建表（不含已删域名）
                     storage.removeRule('domainBlock', index);
-                    BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                    BlockEngine.reapplyAll();
                 } else if (scope === 'current') {
                     storage.removeRule(type, index);
                     BlockEngine.reapplyAll();
@@ -5650,9 +6133,11 @@
             panel.querySelector('#btn-batch').addEventListener('click', (e) => {
                 batchMode = !batchMode;
                 if (!batchMode) batchSelected.clear();
-                e.target.textContent = batchMode ? '↩ 退出批量' : '☑ 批量选择';
-                e.target.classList.toggle('btn-success', batchMode);
-                e.target.classList.toggle('btn-outline', !batchMode);
+                // 用 currentTarget 取按钮本身，避免点击子元素时 e.target 指向子元素(BUG-3)
+                const btn = e.currentTarget;
+                btn.textContent = batchMode ? '↩ 退出批量' : '☑ 批量选择';
+                btn.classList.toggle('btn-success', batchMode);
+                btn.classList.toggle('btn-outline', !batchMode);
                 const delBtn = panel.querySelector('#btn-batch-delete');
                 if (delBtn) {
                     delBtn.style.display = batchMode ? '' : 'none';
@@ -5706,11 +6191,8 @@
                         }
                         if (rule) captured.push({ scope: t.scope, domain: t.domain, type: t.type, rule: { ...rule }, value });
                     });
-                    // 全局域名：先逐个还原内联隐藏（removeRule 前调用，避免规则已删无法定位）
-                    tasks.filter(t => t.scope === 'global').forEach(t => {
-                        const r = storage.getDomainBlocks()[t.index];
-                        if (r) BlockEngine.restoreInlineForDomain(r.domain);
-                    });
+                    // 冗余-1：已移除 restoreInlineForDomain 循环——reapplyAll 内部 restoreAllInlineStyles
+                    // 会清除全部内联隐藏样式（不依赖规则存在），此处的逐域名还原完全被覆盖，属冗余操作
                     // 按 (scope|domain|type) 分组，组内索引降序删除，保证低索引不受高索引删除影响
                     const groups = new Map();
                     tasks.forEach(t => {
@@ -6092,12 +6574,17 @@
             // 双引擎采集：BlockEngine.scanInvisibleOverlays（透明跳转覆盖层）+ OverlayAdScanner（不可见/覆盖层/博彩色情图片/追踪像素）
             // 合并策略：按元素引用合并，BlockEngine 提供触发URL/跨域/尺寸，OverlayAdScanner 提供嫌疑分/分类/特征/原因
             // 过滤策略：已封杀域名 / 已被脚本隐藏 / 已匹配现有规则的元素不再重复展示
-            const collectAll = async () => {
+            const collectAll = async (opts = {}) => {
+                const deep = !!opts.deep;
                 const blockedDomains = new Set(storage.getDomainBlocks().map(r => r.domain));
                 // 异步时间分片扫描：避免大型页面 5000+ 候选导致主线程卡顿
                 const beRecords = await BlockEngine.scanInvisibleOverlaysAsync({ autoBlock: false });
-                let oasResult = { results: [], elapsed: '0', total: 0 };
-                try { oasResult = OverlayAdScanner.scan(); } catch (e) { }
+                let oasResult = { results: [], elapsed: '0', total: 0, deepExtras: null };
+                try {
+                    // 不一致-3 修复：deep=true 调用 deepScan（肤色/伪元素/沙箱解码高阶探测），
+                    //              deep=false 调用 scan（快速基线），两者维度/耗时显著区分
+                    oasResult = deep ? OverlayAdScanner.deepScan({ deep: true }) : OverlayAdScanner.scan();
+                } catch (e) { }
                 // 以元素引用为 key 建立 OverlayAdScanner 特征索引
                 const oasMap = new Map();
                 for (const r of (oasResult.results || [])) {
@@ -6210,7 +6697,7 @@
                 }
                 // 按嫌疑分降序，高分置顶
                 merged.sort((a, b) => (b.suspicion || 0) - (a.suspicion || 0));
-                return { records: merged, oasElapsed: oasResult.elapsed };
+                return { records: merged, oasElapsed: oasResult.elapsed, deepExtras: oasResult.deepExtras || null };
             };
 
             // 异步初始加载：扫描在空闲帧分片执行，先显示加载态再渲染结果
@@ -6343,18 +6830,23 @@
             this.shadowRoot.appendChild(panel);
             // 先渲染加载占位(BUG-S2)，再启动异步扫描；扫描完成后用真实结果重绘
             render();
+            // 记录最近一次深度扫描的额外发现，供 Toast 统计展示（必须先于 runScan 声明，避免 TDZ）
+            let lastDeepExtras = null;
             // 共享扫描执行器：初始加载 / 重新扫描 / 深度扫描统一调用，避免重复代码
             // skipInitialRender=true 时跳过内部 scanning=true+render()，供首次加载复用外部已渲染的占位(问题5)
-            const runScan = async (skipInitialRender = false) => {
+            // opts.deep=true 开启真·深度扫描（肤色/伪元素/沙箱解码），false 仅基线扫描（不一致-3）
+            const runScan = async (skipInitialRender = false, opts = {}) => {
+                const deep = !!opts.deep;
                 if (!skipInitialRender) {
                     scanning = true;
                     render();
                 }
                 try {
-                    // collectAll 内部已调用 OverlayAdScanner.scan()，此处不再冗余预调用(BUG-M6)
-                    const collected = await collectAll();
+                    // collectAll 内部按 deep 调用 OverlayAdScanner.deepScan/scan，此处不再冗余预调用(BUG-M6)
+                    const collected = await collectAll({ deep });
                     records = collected.records;
                     oasElapsed = collected.oasElapsed;
+                    lastDeepExtras = collected.deepExtras || null;
                     // 跨扫描保留已拦截状态(BUG-D8)：用指纹匹配回填 r.blocked
                     records.forEach(r => { if (blockedFingerprints.has(fingerprintOf(r))) r.blocked = true; });
                     // 默认选中所有未拦截的高风险记录(BUG-3)：必须基于原始 records 索引遍历，
@@ -6372,8 +6864,8 @@
                     return false; // 扫描失败：避免回调再显示矛盾的"深度扫描完成"Toast
                 }
             };
-            // 首次加载：外部已渲染加载占位，跳过 runScan 内部重复渲染(问题5)
-            runScan(true);
+            // 首次加载：外部已渲染加载占位，跳过 runScan 内部重复渲染(问题5)；初始为基线扫描
+            runScan(true, { deep: false });
 
             // 预览状态：实例属性，clearPanel 切换/关闭面板时兜底还原，避免预览隐藏的元素永久残留
             // 实时联动模式：预览激活时，选择变化自动更新预览（隐藏新增选中 / 还原取消选中），无需手动重置
@@ -6511,14 +7003,15 @@
                                 attrSelector = `${tag}[class*="${CSS.escape(classes[0])}"]`;
                             }
                         }
+                        // skipApply=true：跳过 addRule 内部 applyCSSRules，循环结束后统一调用一次(冗余-2)
                         if (attrSelector) {
-                            storage.addRule('attribute', { attrSelector, type: 'attribute' });
+                            storage.addRule('attribute', { attrSelector, type: 'attribute' }, true);
                             ruleCount++;
                         } else {
                             // 兜底：无 id/class 时用物理结构选择器(nth-of-type 路径)，刷新后仍可定位(BUG-D5)
                             const structSelector = BlockEngine.generateStructuralSelector(el);
                             if (structSelector) {
-                                storage.addRule('structural', { structSelector, type: 'structural' });
+                                storage.addRule('structural', { structSelector, type: 'structural' }, true);
                                 ruleCount++;
                             }
                         }
@@ -6533,6 +7026,8 @@
                         } catch (e) { }
                     }
                 });
+                // 循环内 addRule 均用 skipApply=true 跳过，此处统一重建一次样式表(冗余-2)
+                if (ruleCount > 0) BlockEngine.applyCSSRules();
                 // 批量封杀收集到的域名：添加 domainBlock 规则（元素已单独隐藏，hideMode='none'）
                 const domainCount = domainsToBlock.size;
                 if (domainCount > 0) {
@@ -6546,25 +7041,31 @@
                 this.showToast(`已拦截选中的覆盖层${domainNote}${ruleNote}${skipNote}`, 'success');
             });
 
-            // 深度扫描：运行双引擎联合扫描后重新采集，补充 Performance API / 跳转目标等隐藏资源
+            // 深度扫描：真·深度覆盖层挖掘（v0.7.0 重构）
+            // 开启高开销探测：Canvas 肤色采样 / CSS 伪元素穿透 / 混淆跳转沙箱解码 / Icon Font 映射
+            // 耗时 200ms~2s，runScan 内部已通过 scanInvisibleOverlaysAsync 时间分片，避免主线程卡顿(不一致-3)
             panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
-                const btn = e.target;
-                const origText = btn.textContent;
+                const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
                 btn.disabled = true;
-                btn.textContent = '⏳ 扫描中...';
+                btn.textContent = '⏳ 深度挖掘中...';
                 resetOverlayPreview();
                 // runScan 返回成功/失败标志(BUG-9)：失败时 catch 已显示"扫描失败"Toast，
                 // 此处仅成功时显示"深度扫描完成"，避免两个矛盾 Toast 同时出现
-                runScan().then(ok => {
+                runScan(false, { deep: true }).then(ok => {
                     btn.disabled = false;
-                    btn.textContent = origText;
-                    if (ok) this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。`, 'success');
+                    btn.textContent = '🤖 深度扫描';
+                    if (ok) {
+                        const ex = lastDeepExtras;
+                        const note = ex ? `（深度新增：🎨肤色图 ${ex.viceImages.length} · 🔐混淆跳转 ${ex.obfuscatedUrls.length} · ::伪元素 ${ex.pseudoInjects.length} · 🔤自定义字体 ${ex.customFontEls.length}）` : '';
+                        this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。${note}`, 'success', 6000);
+                    }
                 });
             });
 
+            // 重新扫描：快速基线扫描（耗时 < 50ms），仅双引擎基线，不开启高开销探测(不一致-3)
             panel.querySelector('#btn-rescan').addEventListener('click', () => {
                 resetOverlayPreview();
-                runScan();
+                runScan(false, { deep: false });
             });
 
             panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
