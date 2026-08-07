@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.6.2
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.2：DomainBlockExecutor统一域名封杀、积木条件匹配/正则文本遍历抽取共享方法、网络拦截扩展至Image/Link/Media/WebSocket/sendBeacon、ResourceSelectorBuilder统一选择器构建、BlockEngine.hideElement/showElement统一隐藏口径。
+// @version      0.6.3
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.3：修复预览还原属性残留(selectedSet索引错误/TDZ/深度扫描双Toast/正则去重缺mode)、attribute预览保护、路径预览3通道对齐、regex保存ReDoS预检、短词单词边界匹配、预览隐藏口径统一为hideElement/showElement。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -121,6 +121,8 @@
         'tongji', 'stat', 'count', 'report'
     ]);
     // 统一赌博/色情词库：合并 isAdKeywordHost.viceKeywords 与 GlobalDomainScanner.VICE_TOKENS
+    // 短词(长度 ≤ 3)用 sld.includes() 会误判通用域名：delivery.cc 含 'live'、gogo.cc 含 'go'、blink.cc 含 'link'
+    // 因此短词在 isAdKeywordHost 中改用「单词边界」精确匹配，避免子串误命中(BUG-10)
     const VICE_TOKENS_UNIFIED = new Set([
         'casino', 'bet', 'poker', 'bocai', 'porn', 'sex', 'cam',
         'slot', 'lottery', 'jackpot', 'gamble', 'wager', 'lucky',
@@ -137,6 +139,11 @@
         'popup', 'popunder', 'overlay', 'push', 'notification', 'interstitial',
         'splash', 'takeover', 'skyscraper', 'leaderboard', 'native-ad'
     ]);
+    // 短词集合（长度 ≤ 3）：includes 子串匹配误判面大，需用单词边界精确匹配
+    // 如 'go' 会匹配 gogo/linker/ego，'live' 会匹配 delivery/solive，'link' 会匹配 blink/thinking
+    const VICE_SHORT_TOKENS = new Set(
+        Array.from(VICE_TOKENS_UNIFIED).filter(kw => kw.length <= 3)
+    );
 
     // 检测 hostname 是否含广告关键词：按非字母数字分词后逐 token 查 Set
     const isAdKeywordHost = (hostname) => {
@@ -153,8 +160,15 @@
             // 5955123.cc / 016.com 这种纯数字博彩域
             if (/^\d+$/.test(sld)) return true;
             // 含赌博/色情词：casino888.cc / bet365.cc / ag-bbin.vip 等
+            // 短词(≤3)用单词边界匹配，避免 'go' 匹配 gogo.cc、'live' 匹配 delivery.cc(BUG-10)
+            // 长词(≥4)仍用 includes 子串匹配，保留 casino888/bet365 等拼接形式命中
             for (const kw of VICE_TOKENS_UNIFIED) {
-                if (sld.includes(kw)) return true;
+                if (VICE_SHORT_TOKENS.has(kw)) {
+                    // 短词：用非字母数字边界确保完整 token 匹配（ag-bbin 中 ag 算命中）
+                    if (new RegExp(`(^|[^a-z0-9])${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i').test(sld)) return true;
+                } else if (sld.includes(kw)) {
+                    return true;
+                }
             }
         }
         // 纯数字二级域（4 位及以上）+ 可疑 TLD：典型博彩短链域名特征
@@ -282,8 +296,10 @@
                 return;
             }
             const data = this.getData()[type];
+            // regex 规则去重必须比较 mode(BUG-7)：同文本不同模式(regex vs contains)语义不同，
+            // 缺 mode 比较会导致「先加 regex 模式"广告"，再加 contains 模式"广告"」时后者被判定为重复而丢失
             const isDuplicate = data.some(item =>
-                (type === 'regex' && item.regex === rule.regex && item.level === rule.level) ||
+                (type === 'regex' && item.regex === rule.regex && item.level === rule.level && (item.mode || '') === (rule.mode || '')) ||
                 (type === 'static' && item.selector === rule.selector) ||
                 (type === 'dynamic' && item.className === rule.className) ||
                 (type === 'attribute' && item.attrSelector === rule.attrSelector) ||
@@ -3415,7 +3431,7 @@
             this.originalSelectedEl = null;
             this.selectionStack = [];
             this._previewAffectedElements = [];
-            this._actionPreview = { active: false, el: null, elements: [] };
+            this._actionPreview = { active: false, elements: [] };
             // 全局域名面板预览状态：必须为实例属性，clearPanel 才能跨面板切换时清理，避免预览隐藏的元素永久残留
             this._globalPreview = { active: false, elements: [] };
             // 覆盖层扫描面板预览状态：同为实例属性，clearPanel 跨面板切换时还原 visibility/display
@@ -4210,20 +4226,12 @@
         _resetActionPreview(panel) {
             if (!this._actionPreview.active) return;
             // 新版预览隐藏「所选域名命中的全部元素 + 当前广告容器」，需逐个还原
+            // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(display/opacity/visibility/pointer-events)
+            // 否则 visibility/pointer-events 残留会导致元素永久不可见(BUG-1)
             if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length > 0) {
-                this._actionPreview.elements.forEach(el => {
-                    if (el) {
-                        el.style.removeProperty('display');
-                        el.style.removeProperty('opacity');
-                    }
-                });
+                this._actionPreview.elements.forEach(el => BlockEngine.showElement(el));
             }
-            // 兼容旧版单元素字段
-            const el = this._actionPreview.el;
-            if (el) {
-                el.style.removeProperty('display');
-            }
-            this._actionPreview = { active: false, el: null, elements: [] };
+            this._actionPreview = { active: false, elements: [] };
             // 隐藏预览横幅
             this._hidePreviewBanner();
             // 恢复显示后必须重新挂上红框：预览时元素 display:none 不可见无需移除类，
@@ -4273,13 +4281,9 @@
         _updateActionPreview() {
             if (!this._actionPreview.active) return;
             // 还原当前预览隐藏的元素（保留 active=true）
+            // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(BUG-1)
             if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length > 0) {
-                this._actionPreview.elements.forEach(el => {
-                    if (el) {
-                        el.style.removeProperty('display');
-                        el.style.removeProperty('opacity');
-                    }
-                });
+                this._actionPreview.elements.forEach(el => BlockEngine.showElement(el));
             }
             this._actionPreview.elements = [];
             // 重新应用隐藏
@@ -4362,7 +4366,7 @@
             this.originalSelectedEl = element;
             this.currentSelectedEl = element;
             this.selectionStack = [];
-            this._actionPreview = { active: false, el: null, elements: [] };
+            this._actionPreview = { active: false, elements: [] };
             // 域名选择状态：默认全选检测到的域名，用户可在面板内逐个取消（解决问题1：原版只能全量封杀）
             this._actionHosts = null;
             this._actionHostsEl = null;
@@ -4569,7 +4573,7 @@
                     this.clearPanel();
                     return;
                 }
-                this._actionPreview = { active: true, el: null, elements: [] };
+                this._actionPreview = { active: true, elements: [] };
                 this._applyActionPreviewHiding();
                 // 显示预览横幅，关闭时还原
                 this._showPreviewBanner(() => this._resetActionPreview(panel));
@@ -4980,12 +4984,9 @@
 
             const resetPreview = () => {
                 if (isPreviewing) {
-                    this._previewAffectedElements.forEach(item => {
-                        if (item.el) {
-                            item.el.style.removeProperty('display');
-                            item.el.style.removeProperty('opacity');
-                        }
-                    });
+                    // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(BUG-2)
+                    // 否则 path 预览(用 hideElement)隐藏的 visibility/pointer-events 会永久残留
+                    this._previewAffectedElements.forEach(item => BlockEngine.showElement(item.el));
                     this._previewAffectedElements = [];
                     this._hidePreviewBanner();
                     isPreviewing = false;
@@ -5010,7 +5011,9 @@
                     // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
                     const text = panel.querySelector('#path-input').value.trim();
                     if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
-                    const sel = ResourceSelectorBuilder.buildDomainAttrExtended(text);
+                    // 与 applyCSSRules 中 pathPattern 一致：3 通道(href/src/data-src)(BUG-6)
+                    // 旧版误用 buildDomainAttrExtended(9 通道) 导致预览比实际拦截多匹配 6 个属性通道
+                    const sel = ResourceSelectorBuilder.buildPathAttr(text);
                     let hit = 0;
                     const hideNode = (node) => {
                         if (!node || node === document.body || node === document.documentElement) return false;
@@ -5040,13 +5043,13 @@
                     if (!text) { this.showToast('校验失败：请输入属性选择器。', 'warning'); return; }
                     // 预览口径与 applyCSSRules 完全一致：attribute 规则保存后直接注入 CSS 选择器，
                     // 无 level 向上遍历逻辑。预览也仅隐藏选择器命中的元素本身，确保预览=刷新后效果。
+                    // 必须校验 isProtectedElement，否则 [id="pro-blocker-ui-host"] 会隐藏整个脚本 UI(BUG-5)
                     try {
                         document.querySelectorAll(text).forEach(el => {
-                            if (el && el.style.display !== 'none') {
-                                this._previewAffectedElements.push({ el });
-                                el.style.setProperty('display', 'none', 'important');
-                                el.style.setProperty('opacity', '0', 'important');
-                            }
+                            if (!el || el.style.display === 'none') return;
+                            if (UIManager.isProtectedElement(el)) return;
+                            this._previewAffectedElements.push({ el });
+                            BlockEngine.hideElement(el); // 统一 4 属性口径(冗余-5)
                         });
                     } catch (err) {
                         this.showToast('校验失败：属性选择器语法错误。', 'error');
@@ -5091,8 +5094,7 @@
                             const target = BlockEngine.findLevelAncestor(el, level);
                             if (target.style.display !== 'none') {
                                 this._previewAffectedElements.push({ el: target });
-                                target.style.setProperty('display', 'none', 'important');
-                                target.style.setProperty('opacity', '0', 'important');
+                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
                             }
                         }
                     });
@@ -5123,8 +5125,7 @@
                             const target = BlockEngine.findLevelAncestor(node.parentElement, level);
                             if (target && target.style.display !== 'none') {
                                 this._previewAffectedElements.push({ el: target });
-                                target.style.setProperty('display', 'none', 'important');
-                                target.style.setProperty('opacity', '0', 'important');
+                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
                             }
                         }
                     });
@@ -5197,6 +5198,12 @@
                         // 正则模式保存前校验语法，与预览路径一致；非法正则会被 applyRegexRules 静默丢弃
                         try { new RegExp(text); }
                         catch (e) { this.showToast('校验失败：正则表达式语法错误。' + e.message, 'error'); return; }
+                        // ReDoS 预检(BUG-8)：applyRegexRules 用 isRegexSafe 过滤嵌套量词，
+                        // 保存前不检查会导致规则保存了但永不生效，用户无任何提示
+                        if (!BlockEngine.isRegexSafe(text)) {
+                            this.showToast('校验失败：正则含嵌套量词（ReDoS 风险），已拒绝保存。', 'error');
+                            return;
+                        }
                         storage.addRule('regex', { regex: text, level: level, type: 'regex' });
                     }
                     BlockEngine.applyRegexRules();
@@ -5740,10 +5747,14 @@
             if (colorInput) {
                 colorInput.addEventListener('input', (e) => {
                     const val = e.target.value.trim();
+                    // 非法 Hex 值给视觉反馈(BUG-11)：红框提示用户格式错误，合法时还原边框并实时预览
                     if (/^#[0-9A-Fa-f]{6}$/.test(val)) {
+                        colorInput.style.borderColor = '';
                         document.documentElement.style.setProperty('--pro-blocker-highlight-color', val);
                         if (colorPreview) colorPreview.style.background = val;
                         GM_setValue('config_highlight_color', val);
+                    } else {
+                        colorInput.style.borderColor = '#FF3B30';
                     }
                 });
             }
@@ -6157,17 +6168,21 @@
                     };
                 }).filter(r => !isAlreadyBlocked(r));
                 // ② 补充 OAS 独有结果（BlockEngine 未覆盖的不可见元素/博彩色情图片/追踪像素）
+                // 用 Set O(1) 去重替代 beRecords.find O(n)，避免 O(n×m) 嵌套查找(冗余-4)
+                const beElSet = new Set(beRecords.map(r => r.el).filter(Boolean));
                 for (const oas of (oasResult.results || [])) {
-                    if (!oas.el || beRecords.find(r => r.el === oas.el)) continue;
+                    if (!oas.el || beElSet.has(oas.el)) continue;
                     const rect = oas.el.getBoundingClientRect ? oas.el.getBoundingClientRect() : { width: 0, height: 0, top: 0, left: 0 };
+                    // getComputedStyle 缓存一次，避免重复 3 次调用(冗余-3)
+                    const cs = window.getComputedStyle(oas.el);
                     const rec = {
                         el: oas.el,
                         tagName: oas.el.tagName,
                         id: oas.el.id || '',
                         className: typeof oas.el.className === 'string' ? oas.el.className.slice(0, 80) : '',
-                        opacity: parseFloat(window.getComputedStyle(oas.el).opacity) || 1,
-                        visibility: window.getComputedStyle(oas.el).visibility,
-                        position: window.getComputedStyle(oas.el).position,
+                        opacity: parseFloat(cs.opacity) || 1,
+                        visibility: cs.visibility,
+                        position: cs.position,
                         rect: { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top), left: Math.round(rect.left) },
                         triggerUrl: oas.features?.externalLink || '',
                         hasOnClick: !!oas.features?.clickable,
@@ -6319,6 +6334,8 @@
             render();
             // 共享扫描执行器：初始加载 / 重新扫描 / 深度扫描统一调用，避免重复代码
             const runScan = async () => {
+                // 首次加载时外部已设 scanning=true 并 render()，这里无需重复；
+                // 重新扫描/深度扫描复用此函数，需重置 scanning 并重渲染(冗余-2 注释说明)
                 scanning = true;
                 render();
                 try {
@@ -6328,14 +6345,19 @@
                     oasElapsed = collected.oasElapsed;
                     // 跨扫描保留已拦截状态(BUG-D8)：用指纹匹配回填 r.blocked
                     records.forEach(r => { if (blockedFingerprints.has(fingerprintOf(r))) r.blocked = true; });
-                    selectedSet = new Set(records.filter(r => r.highRisk && !r.blocked).map((r, i) => i));
+                    // 默认选中所有未拦截的高风险记录(BUG-3)：必须基于原始 records 索引遍历，
+                    // 旧版 filter().map((r,i)=>i) 的 i 是过滤后数组索引，导致 selectedSet 指向错误元素
+                    selectedSet = new Set();
+                    records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
                     scanning = false;
                     render();
+                    return true; // 扫描成功(BUG-9)：供深度扫描回调判断是否显示完成 Toast
                 } catch (e) {
                     scanning = false;
                     console.error('[Pro Blocker] 覆盖层扫描失败:', e);
                     this.showToast('扫描失败：' + e.message, 'error');
                     render();
+                    return false; // 扫描失败：避免回调再显示矛盾的"深度扫描完成"Toast
                 }
             };
             runScan();
@@ -6343,6 +6365,8 @@
             // 预览状态：实例属性，clearPanel 切换/关闭面板时兜底还原，避免预览隐藏的元素永久残留
             // 实时联动模式：预览激活时，选择变化自动更新预览（隐藏新增选中 / 还原取消选中），无需手动重置
             this._overlayPreview = { active: false, elements: [], hiddenDomains: new Set() };
+            // previewBtn 必须先于 resetOverlayPreview 声明，否则闭包内引用触发 TDZ ReferenceError(BUG-4)
+            const previewBtn = panel.querySelector('#btn-preview-overlay');
             const resetOverlayPreview = () => {
                 if (!this._overlayPreview.active) return;
                 this._overlayPreview.elements.forEach(el => BlockEngine.showElement(el));
@@ -6350,7 +6374,6 @@
                 this._hidePreviewBanner();
                 previewBtn.textContent = '🔍 预览效果';
             };
-            const previewBtn = panel.querySelector('#btn-preview-overlay');
 
             // 实时更新预览：根据当前 selectedSet 和域名勾选状态，增量隐藏/还原元素
             const updatePreview = () => {
@@ -6516,10 +6539,12 @@
                 btn.disabled = true;
                 btn.textContent = '⏳ 扫描中...';
                 resetOverlayPreview();
-                runScan().then(() => {
+                // runScan 返回成功/失败标志(BUG-9)：失败时 catch 已显示"扫描失败"Toast，
+                // 此处仅成功时显示"深度扫描完成"，避免两个矛盾 Toast 同时出现
+                runScan().then(ok => {
                     btn.disabled = false;
                     btn.textContent = origText;
-                    this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。`, 'success');
+                    if (ok) this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。`, 'success');
                 });
             });
 
@@ -6586,8 +6611,7 @@
                 if (Array.isArray(this._actionPreview.elements)) {
                     this._actionPreview.elements.forEach(el => BlockEngine.showElement(el));
                 }
-                BlockEngine.showElement(this._actionPreview.el);
-                this._actionPreview = { active: false, el: null, elements: [] };
+                this._actionPreview = { active: false, elements: [] };
             }
             if (this._previewAffectedElements && this._previewAffectedElements.length > 0) {
                 this._previewAffectedElements.forEach(item => BlockEngine.showElement(item.el));
