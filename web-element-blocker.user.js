@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.6.4
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.4：预览ReDoS防护、ov-select-high与初始化逻辑统一、_performUndo改用reapplyAll、短词正则预编译、runScan首次加载避免双重渲染。
+// @version      0.6.5
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.6.5：修复Shadow DOM继承宿主页面巨型根字号导致面板字体异常放大(:host/.panel补font-size:14px截断继承链，空状态提示统一用.empty-tip显式字号)。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -3467,7 +3467,7 @@
         injectStyles() {
             const style = document.createElement('style');
             style.textContent = `
-                :host { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+                :host { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; }
                 .panel {
                     position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
                     background: rgba(25, 25, 30, 0.72); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
@@ -3476,7 +3476,7 @@
                     width: min(480px, calc(100vw - 48px));
                     max-width: calc(100vw - 48px);
                     max-height: min(720px, 76vh); overflow-y: auto; color: #eee; text-shadow: 0 1px 2px rgba(0,0,0,0.8);
-                    box-sizing: border-box;
+                    box-sizing: border-box; font-size: 14px; /* 切断宿主页面 font-size 继承，避免面板字体异常放大 */
                 }
                 @media (max-width: 600px) {
                     .panel { background: rgba(25, 25, 30, 0.52); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); max-width: calc(100vw - 64px); max-height: 70vh; padding: 16px; }
@@ -4666,7 +4666,7 @@
                 }
 
                 if (filtered.length === 0) {
-                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未匹配到域名，请尝试取消“只看广告相关”或手动添加。</span>';
+                    box.innerHTML = '<div class="empty-tip">未匹配到域名，请尝试取消“只看广告相关”或手动添加。</div>';
                 } else {
                     box.innerHTML = filtered.map(d => {
                         const checked = selectedHosts.has(d.host);
@@ -6264,7 +6264,7 @@
                 }
 
                 if (filtered.length === 0) {
-                    box.innerHTML = '<span class="info-label" style="color:#bbb;">未发现不可见覆盖层广告。可尝试取消"只看高风险"或使用"深度扫描"。</span>';
+                    box.innerHTML = '<div class="empty-tip">未发现不可见覆盖层广告。可尝试取消"只看高风险"或使用"深度扫描"。</div>';
                     const btnBlock = panel.querySelector('#btn-block-overlay');
                     if (btnBlock) btnBlock.disabled = true;
                     return;
