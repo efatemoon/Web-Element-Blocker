@@ -1762,11 +1762,11 @@
                     ElementHider.hideElement(target);
                     if (matchedDomain && !BlockEngine._loggedDomains.has(matchedDomain)) {
                         BlockEngine._loggedDomains.add(matchedDomain);
-                        console.info(`[Pro Blocker] 动态拦截域名: ${matchedDomain}`);
+                        // console.info(`[Pro Blocker] 动态拦截域名: ${matchedDomain}`);
                     }
                     if (matchedPattern && !BlockEngine._loggedPatterns.has(matchedPattern)) {
                         BlockEngine._loggedPatterns.add(matchedPattern);
-                        console.info(`[Pro Blocker] 动态拦截路径: ${matchedPattern}`);
+                        // console.info(`[Pro Blocker] 动态拦截路径: ${matchedPattern}`);
                     }
                 }
             });
@@ -3362,6 +3362,8 @@
         function scan() {
             const t0 = performance.now();
             const map = collect();
+            // 优化方案 §6.1 面板3：扫描同域 iframe 内的资源域名
+            collectIframeDomains(map);
             const results = [];
             for (const [, info] of map) {
                 const f = extractFeatures(info);
@@ -3504,6 +3506,55 @@
         }
 
         /**
+         * 递归收集同域 iframe 内的资源域名（优化方案 §6.1 面板3改进）
+         * @param {Map} baseMap collect() 返回的主 map，就地合并
+         * @param {number} maxDepth 最大递归深度，默认 3
+         * @param {number} currentDepth 当前深度，默认 0
+         */
+        function collectIframeDomains(baseMap, maxDepth = 3, currentDepth = 0) {
+            if (currentDepth >= maxDepth) return;
+            const curHost = location.hostname.toLowerCase();
+            try {
+                const iframes = document.querySelectorAll('iframe');
+                iframes.forEach(iframe => {
+                    try {
+                        const src = iframe.src || '';
+                        if (!src) return;
+                        const iframeHost = new URL(src).hostname.toLowerCase();
+                        // 跳过跨域 iframe
+                        if (iframeHost === curHost || isSameSite(iframeHost, mainDomain(curHost))) return;
+                        const iframeDoc = iframe.contentDocument;
+                        if (!iframeDoc) return;
+                        // 递归收集 iframe 内的资源
+                        iframeDoc.querySelectorAll('img[src], img[data-src], script[src], iframe[src], a[href], link[rel="stylesheet"], video[src], source[src]').forEach(el => {
+                            const attrs = ['src', 'href', 'data-src'];
+                            for (const attr of attrs) {
+                                const val = el.getAttribute(attr);
+                                if (!val || val.startsWith('data:') || val.startsWith('blob:')) continue;
+                                try {
+                                    const absUrl = new URL(val, iframeDoc.baseURI || src);
+                                    const h = absUrl.hostname.toLowerCase();
+                                    if (h !== curHost && !isSameSite(h, mainDomain(curHost))) {
+                                        let info = baseMap.get(h);
+                                        if (!info) {
+                                            info = { hostname: h, urls: [], types: new Set(), bytes: 0, count: 0, t0: 0, t1: 0, hasRedirect: false };
+                                            baseMap.set(h, info);
+                                        }
+                                        if (info.urls.length < MAX_URLS_PER_HOST) info.urls.push(val);
+                                        info.types.add(TYPE_MAP[el.tagName.toLowerCase()] || 'other');
+                                        info.count++;
+                                    }
+                                } catch (e) { }
+                            }
+                        });
+                        // 递归处理嵌套同域 iframe
+                        collectIframeDomains(baseMap, maxDepth, currentDepth + 1);
+                    } catch (e) { }
+                });
+            } catch (e) { }
+        }
+
+        /**
          * 真·深度域名扫描主入口
          * @param {Object} opts.deep=true 开启深度探测；false 仅基线 scan()
          * @returns {Object} scan() 结果 + deepExtras 字段
@@ -3511,6 +3562,8 @@
         function deepScan(opts = {}) {
             const t0 = performance.now();
             const map = collect();
+            // 优化方案 §6.1 面板3：扫描同域 iframe 内的资源域名
+            collectIframeDomains(map);
             let deepExtras = null;
             if (opts.deep) {
                 deepExtras = _collectDeepDomains(map);
@@ -5013,19 +5066,19 @@
             // ① pointerdown：在 mousedown/touchstart 之前触发，是最早可拦截的人机交互事件
             // ② document 级 capture：确保在所有目标阶段处理之前拦截（无论 body 是否被广告脚本清空）
             // ③ 同时拦截 mouseover/click/touch*/auxclick：覆盖鼠标 + 触屏 + pointer + 中键四种交互模型
-            const registerOnDoc = () => {
-                document.addEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
-                document.addEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
-                document.addEventListener('mouseover', this._handleMouseOver, { capture: true });
-                document.addEventListener('click', this._handleClick, { capture: true, passive: false });
-                document.addEventListener('contextmenu', this._contextmenuHandler, { capture: true });
-                document.addEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
-                document.addEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
-                document.addEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
+            const registerOnDoc = (doc) => {
+                doc.addEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
+                doc.addEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
+                doc.addEventListener('mouseover', this._handleMouseOver, { capture: true });
+                doc.addEventListener('click', this._handleClick, { capture: true, passive: false });
+                doc.addEventListener('contextmenu', this._contextmenuHandler, { capture: true });
+                doc.addEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
+                doc.addEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
+                doc.addEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
                 // 拦截 auxclick（中键点击打开新标签、右键点击）：防止绕过 click 拦截触发跳转
-                document.addEventListener('auxclick', this._handleAuxClick, { capture: true });
+                doc.addEventListener('auxclick', this._handleAuxClick, { capture: true });
             };
-            registerOnDoc();
+            registerOnDoc(document);
         }
 
         stopSelection() {
@@ -5052,6 +5105,8 @@
             this._hideSelectionBanner();
             // 恢复导航能力：必须与 _freezeNavigation 配对，否则页面所有跳转永久失效
             this._unfreezeNavigation();
+            // 清除 iframe 上下文
+            this._selectionIframeContext = null;
         }
 
         // 选择模式导航冻结：劫持所有可能触发跳转的 API，确保用户点击广告元素时页面不跳走
@@ -5222,6 +5277,45 @@
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
             this.stopSelection();
+
+            // 优化方案 §6.1 面板1：检测选中元素是否在 iframe 内，若是同域 iframe 则进入选择模式
+            const targetIframe = e.target.closest('iframe');
+            if (targetIframe) {
+                try {
+                    const iframeDoc = targetIframe.contentDocument;
+                    const iframeSrc = targetIframe.src || '';
+                    // 同源检查：iframe 可访问且域名相同
+                    if (iframeDoc && iframeSrc) {
+                        const iframeHost = new URL(iframeSrc).hostname;
+                        if (iframeHost === window.location.hostname ||
+                            iframeHost.endsWith('.' + window.location.hostname) ||
+                            window.location.hostname.endsWith('.' + iframeHost)) {
+                            // 进入 iframe 上下文
+                            this._selectionIframeContext = {
+                                iframe: targetIframe,
+                                doc: iframeDoc,
+                                win: targetIframe.contentWindow
+                            };
+                            this.showToast(`已进入 iframe: ${iframeHost}`, 'info');
+                            // 重新绑定事件到 iframe 文档
+                            const registerOnDoc = (doc) => {
+                                doc.addEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
+                                doc.addEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
+                                doc.addEventListener('mouseover', this._handleMouseOver, { capture: true });
+                                doc.addEventListener('click', this._handleClick, { capture: true, passive: false });
+                                doc.addEventListener('contextmenu', this._contextmenuHandler, { capture: true });
+                                doc.addEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
+                                doc.addEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
+                                doc.addEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
+                                doc.addEventListener('auxclick', this._handleAuxClick, { capture: true });
+                            };
+                            registerOnDoc(iframeDoc);
+                            return;
+                        }
+                    }
+                } catch (ex) { }
+            }
+
             // 元素有效性校验：广告脚本可能在 stopSelection 触发的导航解冻瞬间移除目标元素
             // 此时再 showActionPanel 会绑定失效引用，导致后续操作报错
             if (!this._isElementInDOM(e.target)) {
@@ -5238,6 +5332,10 @@
         }
 
         _isElementInDOM(el) {
+            // 如果在 iframe 上下文中，检查元素是否在该 iframe 的 document 中
+            if (this._selectionIframeContext) {
+                return el && this._selectionIframeContext.doc.contains(el);
+            }
             return el && document.contains(el);
         }
 
