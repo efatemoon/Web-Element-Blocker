@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.8.0
+// @version      0.8.1
 // @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.8.0：新增动态 iframe 广告拦截完整防线——IframeGuard（创建拦截+递归分类扫描）、ContentClassifier（正文分/广告分评分体系，正文保护铁律）、FrameMessenger（postMessage 跨域帧间通信协议）、MessageGuard（可疑消息监控）、WhitelistStore（iframe 白名单保护）、EventBus（模块解耦）；新增 iframeBlock/iframeWhitelist 规则类型；NetworkInterceptor 增加 iframe src 拦截；管理面板新增 iframe 统计看板/白名单管理/规则添加/扫描深度设置；导出/导入/AdGuard 导出支持 iframe 规则桶。
 // @author       EFate
 // @match        *://*/*
@@ -45,11 +45,6 @@
         buildDomainAttr(domain) {
             const esc = escapeCSSAttr(domain);
             return `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [poster*="${esc}"], [srcset*="${esc}"]`;
-        },
-        // 扩展域名资源属性选择器（9 通道）：含 data-href/data-url/data-link，用于覆盖层扫描
-        buildDomainAttrExtended(domain) {
-            const esc = escapeCSSAttr(domain);
-            return `[src*="${esc}"], [href*="${esc}"], [data-src*="${esc}"], [data-original*="${esc}"], [data-href*="${esc}"], [data-url*="${esc}"], [data-link*="${esc}"], [srcset*="${esc}"], [poster*="${esc}"]`;
         },
         // 路径模式属性选择器（3 通道）：匹配 href/src/data-src
         buildPathAttr(pattern) {
@@ -791,9 +786,6 @@
         }
         getIframeConfig() {
             return this._readKey('iframeConfig', { maxDepth: 3 });
-        }
-        setIframeConfig(config) {
-            this._markDirty('iframeConfig', config);
         }
 
         markAsFlashing() {
@@ -5748,7 +5740,7 @@
                     const text = panel.querySelector('#path-input').value.trim();
                     if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
                     // 与 applyCSSRules 中 pathPattern 一致：3 通道(href/src/data-src)(BUG-6)
-                    // 旧版误用 buildDomainAttrExtended(9 通道) 导致预览比实际拦截多匹配 6 个属性通道
+                    // 旧版误用 9 通道扩展选择器导致预览比实际拦截多匹配 6 个属性通道
                     const sel = ResourceSelectorBuilder.buildPathAttr(text);
                     let hit = 0;
                     const hideNode = (node) => {
@@ -7617,10 +7609,6 @@
         emit(event, data) {
             const handlers = this._handlers.get(event);
             if (handlers) handlers.forEach(h => { try { h(data); } catch (e) { } });
-        },
-        off(event, handler) {
-            const set = this._handlers.get(event);
-            if (set) set.delete(handler);
         }
     };
 
@@ -7844,6 +7832,30 @@
             if (contentScore > 60) verdict = 'content';
             else if (adScore > 70 && contentScore < 20) verdict = 'ad';
             return { contentScore, adScore, verdict, reasons: cReasons.concat(aReasons) };
+        },
+
+        // BUG-FIX: 子帧自治评分——用 window.location 替代 iframe.src，跳过外部几何特征
+        // 此前 _reportSelf 传 null 给 computeAdScore 导致恒返回 0，子帧永远无法上报 verdict='ad'
+        computeSelfAdScore(contentScore) {
+            let score = 0;
+            const reasons = [];
+            const selfHref = window.location.href;
+            const selfHost = window.location.hostname;
+            // src 域名命中全局黑名单: +35
+            try {
+                if (selfHost && BlockEngine.hostnameBlocked(selfHost, BlockEngine.getDomainSet())) {
+                    score += 35; reasons.push('self blacklisted');
+                }
+            } catch (e) { }
+            // src 域名含广告关键词: +25
+            if (selfHost && isAdKeywordHost(selfHost)) { score += 25; reasons.push('ad keyword host'); }
+            // 创建时机在用户交互后 300ms 内: +15
+            if (IframeGuard._lastInteraction && Date.now() - IframeGuard._lastInteraction < 300) {
+                score += 15; reasons.push('post-interaction');
+            }
+            // 正文分 > 50: -50（有正文则大幅降低广告判定）
+            if (contentScore > 50) { score -= 50; reasons.push('has content -50'); }
+            return { score, reasons };
         }
     };
 
@@ -7853,7 +7865,6 @@
         _MSG_PREFIX: 'PRO_BLOCKER_',
         _init: false,
         _frameId: null,
-        _initDone: false,
         init() {
             if (this._init) return;
             this._init = true;
@@ -7864,6 +7875,8 @@
             if (!e || !e.data || typeof e.data !== 'object') return;
             const type = e.data.type;
             if (typeof type !== 'string' || !type.startsWith(this._MSG_PREFIX)) return;
+            // BUG-FIX: 安全校验——丢弃空 origin 和无 source 的可疑消息
+            if (!e.origin || !e.source) return;
             // 安全校验：仅处理 PRO_BLOCKER_ 前缀消息（§6.3）
             EventBus.emit('frame:report', { source: e.source, origin: e.origin, data: e.data });
         },
@@ -7871,26 +7884,22 @@
         sendReport(payload) {
             if (window.self === window.top) return; // 顶层无需上报
             try {
+                // BUG-FIX: 优先用父帧 origin 限制消息目标，减少中间帧窃听风险
+                let targetOrigin = '*';
+                try {
+                    // 同域时可获取父帧 origin；跨域时 fallback 到 '*'
+                    if (window.parent.location && window.parent.location.origin) {
+                        targetOrigin = window.parent.location.origin;
+                    }
+                } catch (e) { /* 跨域 SecurityError，保持 '*' */ }
                 window.parent.postMessage({
                     type: this._MSG_PREFIX + 'REPORT',
                     frameId: this._frameId,
                     hostname: window.location.hostname,
                     ...payload
-                }, '*');
+                }, targetOrigin);
             } catch (e) { }
-        },
-        // 父帧 → 子帧：下发指令（§6.3 PRO_BLOCKER_COMMAND）
-        sendToChild(iframe, payload) {
-            try {
-                if (iframe && iframe.contentWindow) {
-                    iframe.contentWindow.postMessage({
-                        type: this._MSG_PREFIX + 'COMMAND',
-                        ...payload
-                    }, '*');
-                }
-            } catch (e) { }
-        },
-        getFrameId() { return this._frameId; }
+        }
     };
 
     // ─── MessageGuard：postMessage 可疑消息监控（§14 消息防御） ───
@@ -7938,9 +7947,7 @@
                     EventBus.emit('message:suspicious', { origin: e.origin, reason });
                 }
             } catch (err) { }
-        },
-        getLog() { return this._log; },
-        clearLog() { this._log = []; }
+        }
     };
 
     // ─── IframeGuard：iframe 防线核心（§4 §5 §7） ───
@@ -7964,6 +7971,9 @@
             this._trackInteractions();
             // 监听规则变更
             EventBus.on('rule:changed', () => { this._iframeBlockRules = null; });
+            // BUG-FIX: 注册 frame:report 处理器——子帧上报分类结果后重新评估对应 iframe
+            // 此前 frame:report 事件无消费者，跨域帧双层决策模型完全断裂
+            EventBus.on('frame:report', (payload) => { this._handleFrameReport(payload); });
             // 首次扫描
             if (document.body) {
                 this.scanAll();
@@ -8021,6 +8031,8 @@
                     }
                 });
                 obs.observe(iframe, { attributes: true, attributeFilter: ['src', 'srcdoc'] });
+                // BUG-FIX: 超时兜底——iframe 创建后 30s 未设 src 则断开 observer，防止 GC 泄漏
+                setTimeout(() => { try { obs.disconnect(); } catch (e) { } }, 30000);
             } catch (e) { }
         },
 
@@ -8076,14 +8088,20 @@
             // 延迟分类：等 iframe 内容加载（srcdoc/about:blank 同步可访问，跨域 load 后才有 src）
             this._classifyAndAct(iframe, 0);
             // 监听 load 事件：跨域 iframe 加载完成后重新评估
-            iframe.addEventListener('load', () => {
-                this._classifyAndAct(iframe, 0);
-            });
+            // BUG-FIX: 防止 rescanAll 后重复绑定 load 监听器导致累积泄漏
+            if (!iframe.__proBlockerLoadBound) {
+                iframe.__proBlockerLoadBound = true;
+                iframe.addEventListener('load', () => {
+                    if (!iframe.isConnected) return; // iframe 已脱离 DOM，跳过
+                    this._classifyAndAct(iframe, 0);
+                });
+            }
         },
 
         // 核心决策：分类 → 执行（§4.2 §5.1）
         _classifyAndAct(iframe, depth) {
             if (depth > this._maxDepth) return;
+            if (!iframe.isConnected) return; // iframe 已脱离 DOM
             if (UIManager.isProtectedElement(iframe)) return;
 
             // 先检查 iframeBlock 规则（用户显式规则优先）
@@ -8094,6 +8112,14 @@
 
             const result = ContentClassifier.classify(iframe);
             EventBus.emit('iframe:classified', { iframe, ...result });
+
+            // BUG-FIX: verdict 从 ad 变为非 ad 时先恢复显示（铁律1：不隐藏含正文的 iframe）
+            // 初始分类时内容未加载可能误判为 ad，load 后重判为 content 须先 showElement
+            const prevVerdict = iframe.__proBlockerVerdict || null;
+            if (prevVerdict === 'ad' && result.verdict !== 'ad') {
+                BlockEngine.showElement(iframe);
+            }
+            iframe.__proBlockerVerdict = result.verdict;
 
             if (result.verdict === 'whitelist') {
                 this._stats.protected++;
@@ -8155,9 +8181,11 @@
                 const opacity = parseFloat(cs.opacity) * 100;
                 const zi = parseInt(cs.zIndex, 10) || 0;
                 const conditions = expr.split(',').map(s => s.trim()).filter(Boolean);
+                // BUG-FIX: 无效条件不再被 continue 跳过导致恒 true，改为要求全部条件有效且匹配
+                let matchedCount = 0;
                 for (const cond of conditions) {
                     const m = cond.match(/^(area|opacity|zIndex)\s*(>=|<=|>|<)\s*(\d+)$/);
-                    if (!m) continue;
+                    if (!m) return false; // 遇到无法解析的条件，规则不匹配
                     const [, key, op, num] = m;
                     const val = key === 'area' ? areaRatio : (key === 'opacity' ? opacity : zi);
                     const n = parseInt(num, 10);
@@ -8165,8 +8193,9 @@
                     if (op === '<' && !(val < n)) return false;
                     if (op === '>=' && !(val >= n)) return false;
                     if (op === '<=' && !(val <= n)) return false;
+                    matchedCount++;
                 }
-                return conditions.length > 0;
+                return matchedCount > 0 && matchedCount === conditions.length;
             } catch (e) { return false; }
         },
 
@@ -8226,7 +8255,38 @@
             this._stats.cleaned++;
         },
 
-        getStats() { return this._stats; }
+        getStats() { return this._stats; },
+
+        // BUG-FIX: 处理子帧 postMessage 上报的分类结果（§6.1 策略A 顶层仲裁）
+        // 根据 e.source 匹配 iframe 元素，按子帧上报的 verdict 重新决策
+        _handleFrameReport(payload) {
+            try {
+                if (!payload || !payload.source || !payload.data) return;
+                const childWindow = payload.source;
+                const data = payload.data;
+                // 遍历所有 iframe 找到 contentWindow 匹配的 iframe
+                const iframes = document.querySelectorAll('iframe');
+                for (let i = 0; i < iframes.length; i++) {
+                    const iframe = iframes[i];
+                    if (iframe.contentWindow !== childWindow) continue;
+                    // 找到匹配的 iframe，按子帧上报结果处理
+                    if (data.verdict === 'content') {
+                        // 子帧报告为内容帧：恢复显示（可能被初始误判为 ad 隐藏），保护不动
+                        if (iframe.__proBlockerVerdict === 'ad') {
+                            BlockEngine.showElement(iframe);
+                        }
+                        iframe.__proBlockerVerdict = 'content';
+                        this._stats.protected++;
+                        EventBus.emit('iframe:protected', { iframe, reason: 'frame-report:content' });
+                    } else if (data.verdict === 'ad') {
+                        // 子帧报告为纯广告帧：整体隐藏
+                        this._blockIframe(iframe, 'frame-report:ad (adScore=' + data.adScore + ')');
+                    }
+                    // unknown：不干预，继续监听
+                    return;
+                }
+            } catch (e) { }
+        }
     };
 
     // ================= 初始化与执行流 =================
@@ -8255,9 +8315,9 @@
     if (window.self !== window.top) {
         const _reportSelf = () => {
             try {
-                // 子帧用自身 document 计算正文分/广告分，向父帧上报分类结果
+                // BUG-FIX: 子帧用 computeSelfAdScore 自评估（非 computeAdScore(null,...) 恒 0）
                 const cScore = ContentClassifier.computeContentScore(document, null);
-                const aScore = ContentClassifier.computeAdScore(null, document, cScore.score);
+                const aScore = ContentClassifier.computeSelfAdScore(cScore.score);
                 let verdict = 'unknown';
                 if (cScore.score > 60) verdict = 'content';
                 else if (aScore.score > 70 && cScore.score < 20) verdict = 'ad';

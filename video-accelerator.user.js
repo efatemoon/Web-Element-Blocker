@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (微内核事件驱动版)
 // @namespace    http://tampermonkey.net/
-// @version      18.0.0
-// @description  v18.0：微内核 + EventBus 架构；原型嗅探、pointerdown 预启动、RVFC 帧级监控、DNS/preconnect 预热、批量 DOM 扫描、iframe 穿透、HLS 优化、Seek 保护、卡死恢复、日志流、网络健康评分与卡顿时间轴。
+// @version      18.1.0
+// @description  v18.1：微内核 + EventBus 架构；原型嗅探、pointerdown 预启动、RVFC 帧级监控、DNS/preconnect 预热、批量 DOM 扫描、iframe 穿透、HLS 优化、Seek 保护、卡死恢复、日志流、网络健康评分与卡顿时间轴。修复配置持久化（GM 存储 + localStorage 兜底 + pagehide 刷新前保存）。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
 // @match        https://*/*
@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '18.0.0';
+    const VERSION = '18.1.0';
     const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const DOC = PW.document || document;
     const LOC = PW.location || location;
@@ -161,6 +161,40 @@
     const Bus = new EventBus();
 
     /* ═══════════════════════════════════════════════════════════
+       Storage 持久化存储（GM 优先，localStorage 兜底）
+    ═══════════════════════════════════════════════════════════ */
+
+    const Storage = {
+        _gmGet: (typeof GM_getValue === 'function') ? GM_getValue : null,
+        _gmSet: (typeof GM_setValue === 'function') ? GM_setValue : null,
+        _ls: (function () {
+            try { return (typeof localStorage !== 'undefined') ? localStorage : null; } catch (e) { return null; }
+        })(),
+
+        get(key, def) {
+            if (this._gmGet) {
+                try { return this._gmGet(key, def); } catch (e) { }
+            }
+            if (this._ls) {
+                try {
+                    const v = this._ls.getItem(key);
+                    return v === null ? def : v;
+                } catch (e) { }
+            }
+            return def;
+        },
+
+        set(key, value) {
+            if (this._gmSet) {
+                try { this._gmSet(key, value); return; } catch (e) { }
+            }
+            if (this._ls) {
+                try { this._ls.setItem(key, value); } catch (e) { }
+            }
+        }
+    };
+
+    /* ═══════════════════════════════════════════════════════════
        ConfigManager 配置中心
     ═══════════════════════════════════════════════════════════ */
 
@@ -208,7 +242,7 @@
         load() {
             if (this._cache) return this._cache;
             let raw = null;
-            try { raw = GM_getValue(STORAGE_KEY, null); } catch (e) { }
+            try { raw = Storage.get(STORAGE_KEY, null); } catch (e) { }
 
             let obj = null;
             if (typeof raw === 'string') {
@@ -229,7 +263,9 @@
             c.bufferTarget = clamp(parseInt(c.bufferTarget, 10) || 60, 10, 300);
             c.minPreBuffer = clamp(parseInt(c.minPreBuffer, 10) || 2, 1, 30);
             c.seekTimeout = clamp(parseInt(c.seekTimeout, 10) || 5000, 2000, 15000);
-            c.minVideoArea = Math.max(0, parseInt(c.minVideoArea, 10) || 8000);
+
+            const mva = parseInt(c.minVideoArea, 10);
+            c.minVideoArea = isNaN(mva) ? 8000 : Math.max(0, mva);
 
             const levels = ['debug', 'info', 'warn', 'error'];
             if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
@@ -244,7 +280,7 @@
         }
 
         save() {
-            try { GM_setValue(STORAGE_KEY, JSON.stringify(this.load())); } catch (e) { }
+            try { Storage.set(STORAGE_KEY, JSON.stringify(this.load())); } catch (e) { }
         }
 
         get(k) {
@@ -266,6 +302,14 @@
             this._normalize();
             this.save();
             this.bus.emit('CONFIG_CHANGE', { batch: true, config: this.load(), local: true });
+        }
+
+        silentUpdate(patch) {
+            if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return;
+            const c = this.load();
+            Object.assign(c, patch);
+            this._normalize();
+            this.save();
         }
 
         exportJSON() {
@@ -2426,6 +2470,12 @@
             this.bus.on('CONFIG_CHANGE', () => {
                 this._syncSettings();
             });
+
+            const flushHandler = () => {
+                try { this._flushSettings(); } catch (e) { }
+            };
+            PW.addEventListener('pagehide', flushHandler);
+            PW.addEventListener('beforeunload', flushHandler);
         }
 
         _bindSettings() {
@@ -2435,10 +2485,18 @@
                 const el = this._panel.querySelector('#' + id);
                 if (!el) return;
 
-                el.addEventListener('change', () => {
+                const handler = () => {
                     const value = transform ? transform(el) : el.checked;
                     bus.emit('CONFIG_SET', { key: key, value: value });
-                });
+                };
+
+                const isNumeric = el.tagName === 'INPUT' && (el.type === 'number' || el.type === 'text');
+
+                if (isNumeric) {
+                    el.addEventListener('change', handler);
+                } else {
+                    el.addEventListener('input', handler);
+                }
             };
 
             // 注入与嗅探
@@ -2469,6 +2527,42 @@
             bind('va-toast', 'showToast');
             bind('va-detect', 'showDetect');
             bind('va-loglevel', 'logLevel', function (el) { return el.value; });
+        }
+
+        _flushSettings() {
+            const patch = {};
+            const read = (id, key, transform) => {
+                const el = this._panel.querySelector('#' + id);
+                if (!el) return;
+                patch[key] = transform ? transform(el) : el.checked;
+            };
+
+            read('va-proto', 'protoHook');
+            read('va-pointer', 'earlyPointer');
+            read('va-fast', 'fastDetect');
+            read('va-visible', 'visibleOnly');
+            read('va-area', 'minVideoArea', function (el) { return parseInt(el.value, 10) || 0; });
+
+            read('va-fetch', 'fetchPriority');
+            read('va-preconnect', 'preconnect');
+            read('va-instant', 'instantPlay');
+            read('va-big', 'bigBuffer');
+            read('va-btgt', 'bufferTarget', function (el) { return parseInt(el.value, 10) || 60; });
+            read('va-prebuf', 'minPreBuffer', function (el) { return parseInt(el.value, 10) || 2; });
+            read('va-quality', 'qualityManage');
+            read('va-autodown', 'autoDowngrade');
+
+            read('va-auto', 'autoPlay');
+            read('va-seek', 'seekGuard');
+            read('va-seekto', 'seekTimeout', function (el) { return parseInt(el.value, 10) || 5000; });
+            read('va-watchdog', 'watchdog');
+            read('va-rvfc', 'rvfcMonitor');
+
+            read('va-toast', 'showToast');
+            read('va-detect', 'showDetect');
+            read('va-loglevel', 'logLevel', function (el) { return el.value; });
+
+            ConfigManager.silentUpdate(patch);
         }
 
         _syncSettings() {
