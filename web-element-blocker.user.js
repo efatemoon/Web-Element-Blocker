@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.7.2
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.7.2：修复v0.7.1验证报告残留缺陷——正则捕获组转换改状态机彻底解决\(转义括号/[(a)]字符类内括号误改/命名组未转换三处边界缺陷；导航拦截去掉size>0条件(用户删光域名后不再回退过期快照)；删除btn-domain冗余applyCSSRules(DomainBlockExecutor统一重建)；删除pathname冗余split(URL.pathname本身不含query/hash)。
+// @version      0.8.0
+// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.8.0：新增动态 iframe 广告拦截完整防线——IframeGuard（创建拦截+递归分类扫描）、ContentClassifier（正文分/广告分评分体系，正文保护铁律）、FrameMessenger（postMessage 跨域帧间通信协议）、MessageGuard（可疑消息监控）、WhitelistStore（iframe 白名单保护）、EventBus（模块解耦）；新增 iframeBlock/iframeWhitelist 规则类型；NetworkInterceptor 增加 iframe src 拦截；管理面板新增 iframe 统计看板/白名单管理/规则添加/扫描深度设置；导出/导入/AdGuard 导出支持 iframe 规则桶。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -539,6 +539,17 @@
             const flashDict = this._readKey('pro_blocker_flash_domains', {});
             const flashDomains = Object.keys(flashDict).filter(d => flashDict[d]);
 
+            // iframe 规则与白名单（§8.7 导出新增桶）
+            const iframeRules = this.getIframeBlocks().map(r => {
+                const { _ts, ...rest } = r;
+                return rest;
+            });
+            const iframeWhitelist = (WhitelistStore.getAll() || []).map(e => {
+                const { _ts, ...rest } = e;
+                return rest;
+            });
+            const iframeConfig = this.getIframeConfig();
+
             const exportData = {
                 meta: {
                     version: '2.0',
@@ -548,12 +559,17 @@
                         domains: domains.length,
                         siteRules: totalRules,
                         sites: Object.keys(sites).length,
+                        iframeRules: iframeRules.length,
+                        iframeWhitelist: iframeWhitelist.length,
                     }
                 },
                 domains,
                 sites,
                 config,
                 flashDomains,
+                iframeRules,
+                iframeWhitelist,
+                iframeConfig,
             };
             return JSON.stringify(exportData, null, 2);
         }
@@ -669,12 +685,115 @@
             } else if (!merge) {
                 this._markDirty('domainBlocks', []); // 覆盖模式缺失则清空全局域名黑名单
             }
+            // iframe 规则导入（§8.9 导入新增桶）
+            if (Array.isArray(importData.iframeRules)) {
+                const incoming = importData.iframeRules.filter(r => r && r.matchType && r.value !== undefined);
+                if (merge) {
+                    const existing = this.getIframeBlocks();
+                    const fp = (x) => x.matchType + '|' + x.value;
+                    const existingSet = new Set(existing.map(fp));
+                    incoming.forEach(r => {
+                        if (!existingSet.has(fp(r))) {
+                            existingSet.add(fp(r));
+                            existing.push({ ...r, _ts: Date.now() });
+                        }
+                    });
+                    this._markDirty('iframeBlocks', existing);
+                } else {
+                    this._markDirty('iframeBlocks', incoming.map(r => ({ ...r, _ts: Date.now() })));
+                }
+                if (typeof IframeGuard !== 'undefined' && IframeGuard._iframeBlockRules !== null) {
+                    IframeGuard._iframeBlockRules = null;
+                }
+            } else if (!merge) {
+                this._markDirty('iframeBlocks', []);
+            }
+            // iframe 白名单导入
+            if (Array.isArray(importData.iframeWhitelist)) {
+                const incoming = importData.iframeWhitelist.filter(e => e && (e.selector || e.domain));
+                if (merge) {
+                    const existing = WhitelistStore.getAll();
+                    const fp = (x) => (x.selector || '') + '|' + (x.domain || '');
+                    const existingSet = new Set(existing.map(fp));
+                    incoming.forEach(e => {
+                        if (!existingSet.has(fp(e))) {
+                            existingSet.add(fp(e));
+                            existing.push({ selector: e.selector || '', domain: e.domain || '', reason: e.reason || '', _ts: Date.now() });
+                        }
+                    });
+                    GM_setValue('iframeWhitelist', existing);
+                } else {
+                    GM_setValue('iframeWhitelist', incoming.map(e => ({ selector: e.selector || '', domain: e.domain || '', reason: e.reason || '', _ts: Date.now() })));
+                }
+                WhitelistStore.invalidate();
+            } else if (!merge) {
+                GM_setValue('iframeWhitelist', []);
+                WhitelistStore.invalidate();
+            }
+            // iframe 配置导入（合并模式仅写入不存在的键）
+            if (importData.iframeConfig && typeof importData.iframeConfig === 'object') {
+                const cur = this.getIframeConfig();
+                const merged = merge ? { ...importData.iframeConfig, ...cur } : importData.iframeConfig;
+                this._markDirty('iframeConfig', merged);
+            }
             BlockEngine.invalidateCache();
             this.invalidateDataCache();
             BlockEngine.applyCSSRules();
             BlockEngine.applyRegexRules();
             BlockEngine.applyComplexRules();
+            // iframe 规则/配置导入后重新加载配置并重扫
+            try {
+                IframeGuard._loadConfig();
+                IframeGuard.rescanAll();
+            } catch (e) { }
             return true;
+        }
+
+        // ─── iframe 规则存储（§13 新增规则类型） ───
+        // iframeBlock：全局生效，数组结构 [{matchType, value, _ts, _disabled}]
+        //   matchType: 'srcDomain' | 'srcdocKeyword' | 'geometry'
+        // iframeWhitelist 由 WhitelistStore 模块管理（GM_getValue('iframeWhitelist')），此处提供桥接
+        getIframeBlocks() {
+            const raw = this._readKey('iframeBlocks', []);
+            if (!Array.isArray(raw)) return [];
+            return raw.filter(r => r && r.matchType && r.value !== undefined);
+        }
+        addIframeRule(rule, skipApply = false) {
+            const list = this.getIframeBlocks();
+            // 去重：matchType + value 完全相同
+            const exists = list.some(r => r.matchType === rule.matchType && r.value === rule.value);
+            if (exists) return false;
+            list.push({ matchType: rule.matchType, value: rule.value, _ts: Date.now() });
+            this._markDirty('iframeBlocks', list);
+            if (!skipApply) {
+                IframeGuard._iframeBlockRules = null; // 清缓存
+                EventBus.emit('rule:changed', { type: 'iframeBlock' });
+            }
+            return true;
+        }
+        removeIframeRule(index) {
+            const list = this.getIframeBlocks();
+            if (index < 0 || index >= list.length) return false;
+            list.splice(index, 1);
+            this._markDirty('iframeBlocks', list);
+            IframeGuard._iframeBlockRules = null;
+            EventBus.emit('rule:changed', { type: 'iframeBlock' });
+            return true;
+        }
+        toggleIframeRuleDisabled(index) {
+            const list = this.getIframeBlocks();
+            if (index < 0 || index >= list.length) return false;
+            list[index]._disabled = !list[index]._disabled;
+            this._markDirty('iframeBlocks', list);
+            IframeGuard._iframeBlockRules = null;
+            EventBus.emit('rule:changed', { type: 'iframeBlock' });
+            return list[index]._disabled;
+        }
+        getIframeConfig() {
+            return this._readKey('iframeConfig', { maxDepth: 3 });
+        }
+        setIframeConfig(config) {
+            this._markDirty('iframeConfig', config);
         }
 
         markAsFlashing() {
@@ -2491,6 +2610,7 @@
             this.hookMediaSrc();
             this.hookWebSocket();
             this.hookSendBeacon();
+            this.hookIframeSrc();
         }
 
         static isUrlBlocked(url) {
@@ -2574,6 +2694,12 @@
             } catch (e) {
                 // 某些环境描述符不可重定义，静默跳过（DOM 层仍会拦截）
             }
+        }
+
+        // 拦截 iframe src 加载（§7.1 创建时拦截）：黑名单域名的 iframe 永不发起请求
+        // 复用 _hookSrcProperty 通用机制，命中黑名单时静默丢弃 src 设置
+        static hookIframeSrc() {
+            this._hookSrcProperty(HTMLIFrameElement, 'src');
         }
 
         // 拦截 WebSocket 广告追踪：广告 SDK 常通过 WebSocket 实时上报
@@ -4419,7 +4545,10 @@
                 // 批量删除撤销：entry.batch=true 时 rules 为删除规则数组，逐条恢复
                 const items = entry.batch ? entry.rules : [entry];
                 items.forEach(it => {
-                    if (it.scope === 'global' || it.type === 'domainBlock') {
+                    if (it.type === 'iframeBlock') {
+                        // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
+                        storage.addIframeRule(it.rule, true);
+                    } else if (it.scope === 'global' || it.type === 'domainBlock') {
                         storage.addRule('domainBlock', { domain: it.rule.domain, type: 'domainBlock' });
                     } else if (it.scope === 'other') {
                         storage.addRuleForDomain(it.domain, it.type, it.rule);
@@ -4427,6 +4556,10 @@
                         storage.addRule(it.type, it.rule);
                     }
                 });
+                // iframe 规则变更后重新扫描（reapplyAll 不覆盖 iframe 扫描）
+                if (items.some(it => it.type === 'iframeBlock')) {
+                    try { IframeGuard.rescanAll(); } catch (e) { }
+                }
                 // 统一调用 reapplyAll(问题2)：与删除规则后重新应用逻辑保持一致，
                 // 将来 reapplyAll 增加步骤（如覆盖层重扫）时撤销逻辑自动跟上
                 BlockEngine.reapplyAll();
@@ -5965,6 +6098,12 @@
                         <div>🧩 <strong>DOM 屏蔽：</strong><span style="color:#34c759;"> ${BlockEngine.stats.domBlocks}</span> 个</div>
                         <div>⚡ <strong>匹配耗时：</strong><span style="color:#ffb74d;"> ${BlockEngine.stats.matchTimeMs.toFixed(2)}</span> ms</div>
                     </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px; margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.05);">
+                        <div>🖼️ <strong>iframe 拦截：</strong><span style="color:#ff6f00;"> ${IframeGuard.getStats().blocked}</span> 个</div>
+                        <div>🛡️ <strong>iframe 保护：</strong><span style="color:#34c759;"> ${IframeGuard.getStats().protected}</span> 个</div>
+                        <div>🔍 <strong>iframe 扫描：</strong><span style="color:#4aa3ff;"> ${IframeGuard.getStats().scanned}</span> 个</div>
+                        <div>🧹 <strong>内部清理：</strong><span style="color:#9c27b0;"> ${IframeGuard.getStats().cleaned}</span> 个</div>
+                    </div>
                     <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
                 </div>
 
@@ -5987,6 +6126,7 @@
                     <select id="mgr-type-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
                         <option value="">全部类型</option>
                         <option value="domainBlock">域名</option>
+                        <option value="iframeBlock">iframe</option>
                         <option value="static">静态</option>
                         <option value="dynamic">动态</option>
                         <option value="regex">正则</option>
@@ -6011,6 +6151,34 @@
                     <button class="btn-success" id="btn-export">📤 导出规则</button>
                     <button class="btn-warning" id="btn-import">📥 导入规则</button>
                 </div>
+                <details style="margin-top:10px; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px; border:1px solid rgba(255,255,255,0.1);">
+                    <summary style="cursor:pointer; font-size:13px; color:#4aa3ff; font-weight:bold;">🖼️ iframe 防线管理（白名单 / 扫描深度 / 规则添加）</summary>
+                    <div style="margin-top:10px;">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                            <label style="font-size:12px; color:#ddd; white-space:nowrap;">嵌套扫描深度：</label>
+                            <input type="number" id="iframe-max-depth" min="1" max="5" value="${storage.getIframeConfig().maxDepth || 3}"
+                                   style="width:60px; padding:4px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
+                            <span style="font-size:10px; color:#888;">1-5 层（默认 3）</span>
+                        </div>
+                        <div style="font-size:12px; color:#ddd; margin-bottom:6px;">📝 添加 iframe 拦截规则：</div>
+                        <div style="display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap;">
+                            <select id="iframe-add-type" style="flex:none; padding:5px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
+                                <option value="srcDomain">src 域名</option>
+                                <option value="srcdocKeyword">srcdoc 关键词</option>
+                                <option value="geometry">几何条件</option>
+                            </select>
+                            <input type="text" id="iframe-add-value" placeholder='域名/关键词/如 "area>60,opacity<0.1"' style="flex:1; min-width:180px; padding:5px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
+                            <button class="btn-success" id="btn-iframe-add" style="flex:none; padding:5px 12px; font-size:12px;">添加</button>
+                        </div>
+                        <div style="font-size:12px; color:#ddd; margin-bottom:6px;">🛡️ iframe 白名单（永不拦截的内容帧）：</div>
+                        <div style="display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap;">
+                            <input type="text" id="wl-add-selector" placeholder="CSS 选择器（如 #content-frame）" style="flex:1; min-width:140px; padding:5px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
+                            <input type="text" id="wl-add-domain" placeholder="域名（可选）" style="flex:1; min-width:120px; padding:5px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
+                            <button class="btn-success" id="btn-wl-add" style="flex:none; padding:5px 12px; font-size:12px;">加白名单</button>
+                        </div>
+                        <ul id="iframe-wl-list" style="list-style:none; padding:0; margin:0; max-height:120px; overflow-y:auto;"></ul>
+                    </div>
+                </details>
                 <div class="btn-group" style="margin-top: 10px;">
                     <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
                     <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
@@ -6030,6 +6198,10 @@
                     case 'attribute': return `选择器: ${escapeHTML(r.attrSelector || '')}`;
                     case 'structural': return escapeHTML(r.structSelector || '');
                     case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
+                    case 'iframeBlock': {
+                        const mt = r.matchType === 'srcDomain' ? 'src域名' : (r.matchType === 'srcdocKeyword' ? 'srcdoc关键词' : (r.matchType === 'geometry' ? '几何条件' : r.matchType));
+                        return `iframe[${mt}]: ${escapeHTML(r.value || '')}`;
+                    }
                     case 'complex': {
                         const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
                         const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
@@ -6041,6 +6213,7 @@
             };
             const TYPE_META = {
                 domainBlock: { label: '域名', tag: 'domain' },
+                iframeBlock: { label: 'iframe', tag: 'iframe' },
                 static: { label: '静态', tag: '' },
                 dynamic: { label: '动态', tag: '' },
                 regex: { label: '正则', tag: '' },
@@ -6056,6 +6229,12 @@
                 d.domainBlock.forEach((r, i) => recs.push({
                     scope: 'global', domain: '(全局)', index: i, type: 'domainBlock',
                     content: escapeHTML(r.domain), ts: r._ts || 0, value: r.domain,
+                    disabled: !!r._disabled
+                }));
+                // 1.1 iframe 规则（全局生效，{matchType,value,_ts,_disabled}[]）
+                storage.getIframeBlocks().forEach((r, i) => recs.push({
+                    scope: 'global', domain: '(全局)', index: i, type: 'iframeBlock',
+                    content: formatRuleContent('iframeBlock', r), ts: r._ts || 0, value: r.value || '',
                     disabled: !!r._disabled
                 }));
                 // 2. 本站 7 类规则
@@ -6200,6 +6379,15 @@
                     const domain = toggleBtn.getAttribute('data-domain');
                     const type = toggleBtn.getAttribute('data-type');
                     const index = parseInt(toggleBtn.getAttribute('data-index'), 10);
+                    // iframe 规则走独立 API
+                    if (type === 'iframeBlock') {
+                        const nowDisabled = storage.toggleIframeRuleDisabled(index);
+                        this.showToast(nowDisabled ? '规则已禁用' : '规则已启用', nowDisabled ? 'warning' : 'success');
+                        try { IframeGuard.rescanAll(); } catch (e) { }
+                        records = rebuildRecords();
+                        renderList();
+                        return;
+                    }
                     // 跨站规则需传 domain，本站/全局用默认
                     const targetDomain = scope === 'other' ? domain : null;
                     const nowDisabled = storage.toggleRuleDisabled(type, index, targetDomain);
@@ -6220,7 +6408,9 @@
 
                 // 删除前捕获完整规则对象，供撤销恢复使用
                 let capturedRule = null;
-                if (scope === 'global') {
+                if (type === 'iframeBlock') {
+                    capturedRule = storage.getIframeBlocks()[index];
+                } else if (scope === 'global') {
                     capturedRule = storage.getDomainBlocks()[index];
                 } else if (scope === 'current') {
                     capturedRule = storage.getData()[type][index];
@@ -6229,7 +6419,10 @@
                     capturedRule = siteRec ? siteRec.rule : null;
                 }
 
-                if (scope === 'global') {
+                if (type === 'iframeBlock') {
+                    storage.removeIframeRule(index);
+                    IframeGuard.rescanAll(); // 重新评估所有 iframe（含已处理的）让规则变更即时生效
+                } else if (scope === 'global') {
                     // 域名黑名单：removeRule 已不再内部 apply(不一致-1)，统一由 reapplyAll 接管
                     // reapplyAll = restoreAllInlineStyles + applyCSSRules + applyRegexRules + applyComplexRules + scanAndBlockDynamic
                     // restoreAllInlineStyles 清除该域名命中的内联隐藏，applyCSSRules 重建表（不含已删域名）
@@ -6309,7 +6502,11 @@
                     tasks.forEach(t => {
                         let rule = null;
                         let value = '';
-                        if (t.scope === 'global') {
+                        if (t.type === 'iframeBlock') {
+                            // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
+                            rule = storage.getIframeBlocks()[t.index];
+                            value = rule ? (rule.value || '') : '';
+                        } else if (t.scope === 'global') {
                             rule = storage.getDomainBlocks()[t.index];
                             value = rule ? rule.domain : '';
                         } else if (t.scope === 'current') {
@@ -6332,13 +6529,18 @@
                     groups.forEach(groupTasks => {
                         groupTasks.sort((a, b) => b.index - a.index);
                         groupTasks.forEach(t => {
-                            if (t.scope === 'global') storage.removeRule('domainBlock', t.index);
+                            if (t.type === 'iframeBlock') storage.removeIframeRule(t.index);
+                            else if (t.scope === 'global') storage.removeRule('domainBlock', t.index);
                             else if (t.scope === 'current') storage.removeRule(t.type, t.index);
                             else storage.removeRuleForDomain(t.domain, t.type, t.index);
                         });
                     });
                     // 删除后统一重新应用所有拦截规则
                     BlockEngine.reapplyAll();
+                    // iframeBlock 规则变更需重新扫描（reapplyAll 不覆盖 iframe 扫描）
+                    if (tasks.some(t => t.type === 'iframeBlock')) {
+                        try { IframeGuard.rescanAll(); } catch (e) { }
+                    }
                     // 推入批量撤销条目（一次撤销恢复全部）
                     if (captured.length > 0) {
                         this._pushUndo({ batch: true, rules: captured });
@@ -6410,6 +6612,77 @@
             });
 
             panel.querySelector('#btn-close-manager').addEventListener('click', () => this.clearPanel());
+
+            // ─── iframe 防线管理事件绑定（§8.6） ───
+            // 白名单列表渲染
+            const renderWlList = () => {
+                const ul = panel.querySelector('#iframe-wl-list');
+                if (!ul) return;
+                const list = WhitelistStore.getAll();
+                if (list.length === 0) {
+                    ul.innerHTML = '<li style="font-size:11px; color:#888; padding:4px 0;">暂无白名单条目</li>';
+                    return;
+                }
+                ul.innerHTML = list.map((e, i) => {
+                    const parts = [];
+                    if (e.selector) parts.push(`选择器: <code>${escapeHTML(e.selector)}</code>`);
+                    if (e.domain) parts.push(`域名: <code>${escapeHTML(e.domain)}</code>`);
+                    return `<li style="display:flex; justify-content:space-between; align-items:center; padding:4px 6px; margin:2px 0; background:rgba(0,0,0,0.2); border-radius:4px;">
+                        <span style="font-size:11px; color:#ddd;">${parts.join(' · ') || '(空)'}</span>
+                        <button class="btn-danger" style="padding:2px 8px; font-size:11px;" data-wl-index="${i}">删</button>
+                    </li>`;
+                }).join('');
+            };
+            renderWlList();
+            // 白名单删除
+            panel.querySelector('#iframe-wl-list').addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-wl-index]');
+                if (!btn) return;
+                const idx = parseInt(btn.getAttribute('data-wl-index'), 10);
+                WhitelistStore.remove(idx);
+                this.showToast('已从白名单移除', 'success');
+                try { IframeGuard.rescanAll(); } catch (e) { }
+                renderWlList();
+            });
+            // 白名单添加
+            panel.querySelector('#btn-wl-add').addEventListener('click', () => {
+                const sel = panel.querySelector('#wl-add-selector').value.trim();
+                const dom = panel.querySelector('#wl-add-domain').value.trim();
+                if (!sel && !dom) { this.showToast('请输入选择器或域名', 'warning'); return; }
+                const ok = WhitelistStore.add({ selector: sel, domain: dom, reason: 'manual' });
+                this.showToast(ok ? '已加入白名单' : '该条目已存在', ok ? 'success' : 'warning');
+                if (ok) {
+                    panel.querySelector('#wl-add-selector').value = '';
+                    panel.querySelector('#wl-add-domain').value = '';
+                    try { IframeGuard.rescanAll(); } catch (e) { }
+                    renderWlList();
+                }
+            });
+            // iframe 规则添加
+            panel.querySelector('#btn-iframe-add').addEventListener('click', () => {
+                const matchType = panel.querySelector('#iframe-add-type').value;
+                const value = panel.querySelector('#iframe-add-value').value.trim();
+                if (!value) { this.showToast('请输入规则值', 'warning'); return; }
+                const ok = storage.addIframeRule({ matchType, value });
+                this.showToast(ok ? 'iframe 规则已添加' : '该规则已存在', ok ? 'success' : 'warning');
+                if (ok) {
+                    panel.querySelector('#iframe-add-value').value = '';
+                    try { IframeGuard.rescanAll(); } catch (e) { }
+                    records = rebuildRecords();
+                    renderList();
+                }
+            });
+            // 扫描深度设置
+            panel.querySelector('#iframe-max-depth').addEventListener('change', (e) => {
+                const d = parseInt(e.target.value, 10);
+                if (d >= 1 && d <= 5) {
+                    IframeGuard.setMaxDepth(d);
+                    this.showToast(`扫描深度已设为 ${d} 层`, 'success');
+                } else {
+                    this.showToast('深度须在 1-5 之间', 'warning');
+                    e.target.value = storage.getIframeConfig().maxDepth || 3;
+                }
+            });
         }
 
         showExportPanel() {
@@ -6420,7 +6693,7 @@
 
             panel.innerHTML = `
                 <h3 title="按住可拖动窗口">📤 导出规则</h3>
-                <p>下方文本框包含全部拦截规则与全局域名黑名单。复制后保存到任意位置，或在新设备的脚本中通过"导入规则"粘贴即可。</p>
+                <p>下方文本框包含全部拦截规则、全局域名黑名单、iframe 拦截规则与白名单。复制后保存到任意位置，或在新设备的脚本中通过"导入规则"粘贴即可。</p>
                 <textarea id="export-text" readonly></textarea>
                 <div class="btn-group" style="margin-top: 10px;">
                     <button class="btn-primary" id="btn-copy">📋 复制到剪贴板</button>
@@ -6643,6 +6916,39 @@
                 lines.push('');
             }
 
+            // ─── iframe 规则转换（§8.8 映射表） ───
+            const iframeRules = Array.isArray(raw.iframeRules) ? raw.iframeRules : [];
+            const iframeWhitelist = Array.isArray(raw.iframeWhitelist) ? raw.iframeWhitelist : [];
+            if (iframeRules.length > 0 || iframeWhitelist.length > 0) {
+                lines.push('! iframe 拦截规则');
+                iframeRules.forEach(r => {
+                    if (!r || !r.matchType) return;
+                    if (r.matchType === 'srcDomain' && r.value) {
+                        // ||domain^$subdocument,third-party
+                        lines.push(`||${r.value}^$subdocument,third-party`);
+                    } else if (r.matchType === 'geometry' && r.value) {
+                        // 几何条件无法直接转 AdGuard，导出为注释说明
+                        lines.push(`! [iframe geometry] ${r.value}（AdGuard 不支持几何规则，需手动添加元素隐藏规则）`);
+                    } else if (r.matchType === 'srcdocKeyword' && r.value) {
+                        // AdGuard 不支持 srcdoc 匹配，导出为注释
+                        lines.push(`! [iframe srcdoc keyword] "${r.value}"（AdGuard 不支持 srcdoc 匹配）`);
+                    }
+                });
+                lines.push('');
+            }
+            if (iframeWhitelist.length > 0) {
+                lines.push('! iframe 白名单（内容帧保护）');
+                iframeWhitelist.forEach(e => {
+                    if (!e) return;
+                    if (e.domain) {
+                        // @@||domain^$subdocument（白名单语法）
+                        lines.push(`@@||${e.domain}^$subdocument`);
+                    } else if (e.selector) {
+                        lines.push(`! [iframe whitelist selector] ${e.selector}（AdGuard 不支持选择器白名单，需手动添加 @@ 规则）`);
+                    }
+                });
+                lines.push('');
+            }
 
             return lines.join('\n');
         }
@@ -7293,6 +7599,636 @@
         }
     }
 
+    // ================= iframe 防线模块（v2.0 动态 iframe 广告拦截） =================
+    // 依据《动态 iframe 广告拦截完整重构方案 v2.0》实现：
+    //   EventBus · WhitelistStore · ContentClassifier · FrameMessenger · MessageGuard · IframeGuard
+    // 设计原则：正文保护铁律（§2.1）+ 帧内自治 + 顶层仲裁双层决策（§1.2③）
+    // 所有新模块以独立对象挂载，不拆分已有 BlockEngine/UIManager，降低回归风险
+
+    // ─── EventBus：模块解耦核心（§11.2 事件清单） ───
+    // 同层模块通过事件通信，下层不引用上层，避免循环依赖
+    const EventBus = {
+        _handlers: new Map(),
+        on(event, handler) {
+            if (!this._handlers.has(event)) this._handlers.set(event, new Set());
+            this._handlers.get(event).add(handler);
+            return () => { this._handlers.get(event) && this._handlers.get(event).delete(handler); };
+        },
+        emit(event, data) {
+            const handlers = this._handlers.get(event);
+            if (handlers) handlers.forEach(h => { try { h(data); } catch (e) { } });
+        },
+        off(event, handler) {
+            const set = this._handlers.get(event);
+            if (set) set.delete(handler);
+        }
+    };
+
+    // ─── WhitelistStore：iframe 白名单（§2.1 铁律5 · §13 iframeWhitelist） ───
+    // 用户手动标记的「内容 iframe 白名单」优先级高于一切自动判定
+    // 存储格式：[{selector, domain, reason, _ts}]，全局生效（不按域名隔离）
+    const WhitelistStore = {
+        _cache: null,
+        _getAll() {
+            if (this._cache) return this._cache;
+            const raw = GM_getValue('iframeWhitelist', []);
+            this._cache = Array.isArray(raw) ? raw.filter(e => e && (e.selector || e.domain)) : [];
+            return this._cache;
+        },
+        // 铁律5：白名单命中 → 无条件保护（覆盖一切判定）
+        isWhitelisted(iframe) {
+            if (!iframe || iframe.nodeType !== 1) return false;
+            const list = this._getAll();
+            for (let i = 0; i < list.length; i++) {
+                const entry = list[i];
+                // 选择器匹配
+                if (entry.selector && iframe.matches) {
+                    try { if (iframe.matches(entry.selector)) return true; } catch (e) { }
+                }
+                // 域名精确匹配（含子域）
+                if (entry.domain && iframe.src) {
+                    try {
+                        const host = new URL(iframe.src).hostname;
+                        if (host === entry.domain || host.endsWith('.' + entry.domain)) return true;
+                    } catch (e) { }
+                }
+            }
+            return false;
+        },
+        add(entry) {
+            const list = this._getAll().slice();
+            // 去重：selector+domain 完全相同视为已存在
+            const exists = list.some(e =>
+                (e.selector || '') === (entry.selector || '') &&
+                (e.domain || '') === (entry.domain || ''));
+            if (exists) return false;
+            list.push({ selector: entry.selector || '', domain: entry.domain || '', reason: entry.reason || '', _ts: Date.now() });
+            this._cache = list;
+            GM_setValue('iframeWhitelist', list);
+            EventBus.emit('whitelist:changed', { action: 'add' });
+            return true;
+        },
+        remove(index) {
+            const list = this._getAll().slice();
+            if (index < 0 || index >= list.length) return false;
+            list.splice(index, 1);
+            this._cache = list;
+            GM_setValue('iframeWhitelist', list);
+            EventBus.emit('whitelist:changed', { action: 'remove' });
+            return true;
+        },
+        getAll() { return this._getAll(); },
+        invalidate() { this._cache = null; }
+    };
+
+    // ─── ContentClassifier：内容/广告分类评分（§2.3 评分体系） ───
+    // 纯函数模块，不持有状态，供 IframeGuard 与子帧自治上报复用
+    // 判定公式：正文分>60 → 内容帧；广告分>70 且 正文分<20 → 纯广告帧；其余 → 未知
+    const ContentClassifier = {
+        // 计算正文分：越高越像正文
+        computeContentScore(doc, iframe) {
+            let score = 0;
+            const reasons = [];
+            if (!doc) return { score, reasons };
+            // iframe 内文本节点总长 > 200 字符: +40
+            try {
+                const text = doc.body ? (doc.body.innerText || '') : '';
+                if (text.length > 200) { score += 40; reasons.push('text>200'); }
+            } catch (e) { }
+            // 含语义标签 article/p/h1~h6/main: +25
+            try {
+                if (doc.querySelector && doc.querySelector('article,p,h1,h2,h3,h4,h5,h6,main')) {
+                    score += 25; reasons.push('semantic');
+                }
+            } catch (e) { }
+            // iframe src 与当前页同主域: +15
+            if (iframe && iframe.src) {
+                try {
+                    const iframeHost = new URL(iframe.src).hostname;
+                    const topHost = window.location.hostname;
+                    if (iframeHost === topHost ||
+                        iframeHost.endsWith('.' + topHost) ||
+                        topHost.endsWith('.' + iframeHost)) {
+                        score += 15; reasons.push('same-origin-domain');
+                    }
+                } catch (e) { }
+            }
+            // iframe 面积占视口 30%~90%: +10
+            if (iframe) {
+                try {
+                    const rect = iframe.getBoundingClientRect();
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    if (vw > 0 && vh > 0) {
+                        const ratio = (rect.width * rect.height) / (vw * vh);
+                        if (ratio >= 0.3 && ratio <= 0.9) { score += 10; reasons.push('area 30-90%'); }
+                    }
+                } catch (e) { }
+            }
+            // iframe 有 id 或 name 含 content/main/article/body: +10
+            if (iframe) {
+                const idName = ((iframe.id || '') + ' ' + (iframe.name || '')).toLowerCase();
+                if (/content|main|article|body/.test(idName)) { score += 10; reasons.push('content-id'); }
+            }
+            // iframe 完全透明 (opacity < 0.05): -20
+            if (iframe) {
+                try {
+                    const cs = window.getComputedStyle(iframe);
+                    if (parseFloat(cs.opacity) < 0.05) { score -= 20; reasons.push('transparent'); }
+                } catch (e) { }
+            }
+            // position:fixed 且覆盖 > 70% 视口: -30
+            if (iframe) {
+                try {
+                    const cs = window.getComputedStyle(iframe);
+                    if (cs.position === 'fixed') {
+                        const rect = iframe.getBoundingClientRect();
+                        const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                        if (vw > 0 && vh > 0) {
+                            const ratio = (rect.width * rect.height) / (vw * vh);
+                            if (ratio > 0.7) { score -= 30; reasons.push('fixed overlay'); }
+                        }
+                    }
+                } catch (e) { }
+            }
+            // iframe src 域名在广告黑名单: -25
+            if (iframe && iframe.src) {
+                try {
+                    const host = new URL(iframe.src).hostname;
+                    if (host !== window.location.hostname && BlockEngine.hostnameBlocked(host, BlockEngine.getDomainSet())) {
+                        score -= 25; reasons.push('src in blacklist');
+                    }
+                } catch (e) { }
+            }
+            return { score, reasons };
+        },
+        // 计算广告分：越高越像广告
+        computeAdScore(iframe, doc, contentScore) {
+            let score = 0;
+            const reasons = [];
+            if (!iframe) return { score, reasons };
+            // src 域名命中全局黑名单: +35
+            if (iframe.src) {
+                try {
+                    const host = new URL(iframe.src).hostname;
+                    if (host !== window.location.hostname && BlockEngine.hostnameBlocked(host, BlockEngine.getDomainSet())) {
+                        score += 35; reasons.push('src blacklisted');
+                    }
+                } catch (e) { }
+            }
+            // src 域名含广告关键词: +25
+            if (iframe.src) {
+                try {
+                    const host = new URL(iframe.src).hostname;
+                    if (isAdKeywordHost(host)) { score += 25; reasons.push('ad keyword host'); }
+                } catch (e) { }
+            }
+            // 透明/隐藏但仍可点击: +25
+            try {
+                const cs = window.getComputedStyle(iframe);
+                const opacity = parseFloat(cs.opacity);
+                const visibility = cs.visibility;
+                const pointerEvents = cs.pointerEvents;
+                if ((opacity < 0.1 || visibility === 'hidden') && pointerEvents !== 'none') {
+                    score += 25; reasons.push('hidden but clickable');
+                }
+            } catch (e) { }
+            // position:fixed/absolute + z-index > 999: +20
+            try {
+                const cs = window.getComputedStyle(iframe);
+                const zi = parseInt(cs.zIndex, 10);
+                if ((cs.position === 'fixed' || cs.position === 'absolute') && zi > 999) {
+                    score += 20; reasons.push('fixed/abs z>999');
+                }
+            } catch (e) { }
+            // 面积 > 视口 60% 且无实质文本: +15
+            try {
+                const rect = iframe.getBoundingClientRect();
+                const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                if (vw > 0 && vh > 0) {
+                    const ratio = (rect.width * rect.height) / (vw * vh);
+                    const textLen = doc && doc.body ? (doc.body.innerText || '').length : 0;
+                    if (ratio > 0.6 && textLen < 50) { score += 15; reasons.push('large area no text'); }
+                }
+            } catch (e) { }
+            // 创建时机在用户交互后 300ms 内: +15（IframeGuard 记录 _lastInteraction）
+            if (IframeGuard._lastInteraction && Date.now() - IframeGuard._lastInteraction < 300) {
+                score += 15; reasons.push('post-interaction');
+            }
+            // srcdoc 内含广告关键词: +10
+            if (iframe.srcdoc) {
+                const lower = iframe.srcdoc.toLowerCase();
+                for (const kw of AD_TOKENS_UNIFIED) {
+                    if (lower.includes(kw)) { score += 10; reasons.push('srcdoc ad kw'); break; }
+                }
+            }
+            // 正文分 > 50: -50（有正文则大幅降低广告判定）
+            if (contentScore > 50) { score -= 50; reasons.push('has content -50'); }
+            return { score, reasons };
+        },
+        // 综合分类：返回 {contentScore, adScore, verdict, reasons}
+        // verdict: 'whitelist' | 'content' | 'ad' | 'unknown'
+        classify(iframe) {
+            // 铁律5：白名单最高优先级
+            if (WhitelistStore.isWhitelisted(iframe)) {
+                return { contentScore: 100, adScore: 0, verdict: 'whitelist', reasons: ['whitelist'] };
+            }
+            let doc = null;
+            try { doc = iframe.contentDocument; } catch (e) { doc = null; }
+            const { score: contentScore, reasons: cReasons } = this.computeContentScore(doc, iframe);
+            const { score: adScore, reasons: aReasons } = this.computeAdScore(iframe, doc, contentScore);
+            let verdict = 'unknown';
+            // 判定公式（§2.3）
+            if (contentScore > 60) verdict = 'content';
+            else if (adScore > 70 && contentScore < 20) verdict = 'ad';
+            return { contentScore, adScore, verdict, reasons: cReasons.concat(aReasons) };
+        }
+    };
+
+    // ─── FrameMessenger：跨域帧间通信（§6.3 postMessage 通信协议） ───
+    // 消息类型前缀 PRO_BLOCKER_ 防伪造；子帧上报分类结果，父帧仲裁
+    const FrameMessenger = {
+        _MSG_PREFIX: 'PRO_BLOCKER_',
+        _init: false,
+        _frameId: null,
+        _initDone: false,
+        init() {
+            if (this._init) return;
+            this._init = true;
+            this._frameId = 'f_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now().toString(36);
+            window.addEventListener('message', e => this._onMessage(e));
+        },
+        _onMessage(e) {
+            if (!e || !e.data || typeof e.data !== 'object') return;
+            const type = e.data.type;
+            if (typeof type !== 'string' || !type.startsWith(this._MSG_PREFIX)) return;
+            // 安全校验：仅处理 PRO_BLOCKER_ 前缀消息（§6.3）
+            EventBus.emit('frame:report', { source: e.source, origin: e.origin, data: e.data });
+        },
+        // 子帧 → 父帧：上报自身分类结果（§6.1 策略A）
+        sendReport(payload) {
+            if (window.self === window.top) return; // 顶层无需上报
+            try {
+                window.parent.postMessage({
+                    type: this._MSG_PREFIX + 'REPORT',
+                    frameId: this._frameId,
+                    hostname: window.location.hostname,
+                    ...payload
+                }, '*');
+            } catch (e) { }
+        },
+        // 父帧 → 子帧：下发指令（§6.3 PRO_BLOCKER_COMMAND）
+        sendToChild(iframe, payload) {
+            try {
+                if (iframe && iframe.contentWindow) {
+                    iframe.contentWindow.postMessage({
+                        type: this._MSG_PREFIX + 'COMMAND',
+                        ...payload
+                    }, '*');
+                }
+            } catch (e) { }
+        },
+        getFrameId() { return this._frameId; }
+    };
+
+    // ─── MessageGuard：postMessage 可疑消息监控（§14 消息防御） ───
+    // 不拦截正常通信，仅检测广告/追踪相关 postMessage 并记录日志
+    const MessageGuard = {
+        _log: [],
+        _maxLog: 50,
+        _init: false,
+        init() {
+            if (this._init) return;
+            this._init = true;
+            window.addEventListener('message', e => this._analyze(e), true);
+        },
+        _analyze(e) {
+            try {
+                const d = e.data;
+                if (!d) return;
+                // 跳过自身协议消息（FrameMessenger 处理）
+                if (typeof d === 'object' && typeof d.type === 'string' && d.type.startsWith('PRO_BLOCKER_')) return;
+                // 检测可疑模式：data 中含广告 URL / 跳转指令
+                const json = (typeof d === 'string') ? d : JSON.stringify(d);
+                if (json.length > 50000) return; // 超大消息跳过分析
+                const lower = json.toLowerCase();
+                let suspicious = false;
+                let reason = '';
+                // 检测广告域名
+                for (const kw of AD_TOKENS_UNIFIED) {
+                    if (lower.includes(kw)) { suspicious = true; reason = 'ad keyword: ' + kw; break; }
+                }
+                // 检测跳转 URL
+                if (!suspicious && /https?:\/\/[^"'\\\s]+/.test(json)) {
+                    const urls = json.match(/https?:\/\/[^"'\\\s]+/g) || [];
+                    for (const u of urls) {
+                        try {
+                            const host = new URL(u).hostname;
+                            if (host !== window.location.hostname && BlockEngine.hostnameBlocked(host, BlockEngine.getDomainSet())) {
+                                suspicious = true; reason = 'blacklisted url in msg'; break;
+                            }
+                        } catch (err) { }
+                    }
+                }
+                if (suspicious) {
+                    this._log.unshift({ ts: Date.now(), origin: e.origin, reason, snippet: json.slice(0, 200) });
+                    if (this._log.length > this._maxLog) this._log.length = this._maxLog;
+                    EventBus.emit('message:suspicious', { origin: e.origin, reason });
+                }
+            } catch (err) { }
+        },
+        getLog() { return this._log; },
+        clearLog() { this._log = []; }
+    };
+
+    // ─── IframeGuard：iframe 防线核心（§4 §5 §7） ───
+    // 职责：发现 iframe → 分类 → 拦截纯广告 / 清理内容帧内部广告 / 保护白名单
+    // 正文保护铁律（§2.1）在 _handleAdNode 中强制执行
+    const IframeGuard = {
+        _observer: null,
+        _processedIframes: new WeakSet(),
+        _stats: { blocked: 0, protected: 0, scanned: 0, cleaned: 0 },
+        _maxDepth: 3,
+        _lastInteraction: 0,
+        _init: false,
+        _iframeBlockRules: null, // iframeBlock 规则缓存
+
+        init() {
+            if (this._init) return;
+            this._init = true;
+            this._loadConfig();
+            this._hookCreateElement();
+            this._startObserver();
+            this._trackInteractions();
+            // 监听规则变更
+            EventBus.on('rule:changed', () => { this._iframeBlockRules = null; });
+            // 首次扫描
+            if (document.body) {
+                this.scanAll();
+            } else {
+                // body 未就绪，等 DOMContentLoaded
+                document.addEventListener('DOMContentLoaded', () => this.scanAll());
+            }
+        },
+
+        _loadConfig() {
+            const config = GM_getValue('iframeConfig', {});
+            const depth = parseInt(config.maxDepth, 10);
+            this._maxDepth = (depth >= 1 && depth <= 5) ? depth : 3;
+        },
+
+        setMaxDepth(depth) {
+            const d = parseInt(depth, 10);
+            if (d >= 1 && d <= 5) {
+                this._maxDepth = d;
+                const config = GM_getValue('iframeConfig', {});
+                config.maxDepth = d;
+                GM_setValue('iframeConfig', config);
+            }
+        },
+
+        // §7.1 创建时拦截：Hook document.createElement
+        _hookCreateElement() {
+            const orig = document.createElement;
+            const self = this;
+            const hooked = function (tagName) {
+                const el = orig.apply(this, arguments);
+                if (typeof tagName === 'string' && tagName.toLowerCase() === 'iframe') {
+                    // 延迟检测：src 可能在此之后才设置
+                    self._observeIframeSrc(el);
+                }
+                return el;
+            };
+            if (!document.createElement.__proBlockerHooked) {
+                document.createElement = hooked;
+                document.createElement.__proBlockerHooked = true;
+            }
+        },
+
+        // 监听 iframe src/srcdoc 设置：属性变更后触发分类
+        _observeIframeSrc(iframe) {
+            if (iframe.__proBlockerIframeObserved) return;
+            iframe.__proBlockerIframeObserved = true;
+            const self = this;
+            // 使用 attribute observer 监听 src/srcdoc 变更
+            try {
+                const obs = new MutationObserver(() => {
+                    if (iframe.src || iframe.srcdoc) {
+                        self._handleNewIframe(iframe);
+                        obs.disconnect();
+                    }
+                });
+                obs.observe(iframe, { attributes: true, attributeFilter: ['src', 'srcdoc'] });
+            } catch (e) { }
+        },
+
+        _startObserver() {
+            this._observer = new MutationObserver(mutations => {
+                for (let i = 0; i < mutations.length; i++) {
+                    const added = mutations[i].addedNodes;
+                    for (let j = 0; j < added.length; j++) {
+                        const node = added[j];
+                        if (node.nodeType !== 1) continue;
+                        if (node.tagName === 'IFRAME') {
+                            this._handleNewIframe(node);
+                        } else if (node.querySelectorAll) {
+                            try {
+                                node.querySelectorAll('iframe').forEach(f => this._handleNewIframe(f));
+                            } catch (e) { }
+                        }
+                    }
+                }
+            });
+            this._observer.observe(document.documentElement, { childList: true, subtree: true });
+        },
+
+        _trackInteractions() {
+            // 记录用户交互时间，用于「创建时机在用户交互后 300ms 内」评分
+            const record = () => { this._lastInteraction = Date.now(); };
+            ['click', 'mousedown', 'touchstart', 'keydown'].forEach(evt => {
+                document.addEventListener(evt, record, { capture: true, passive: true });
+            });
+        },
+
+        scanAll() {
+            try {
+                document.querySelectorAll('iframe').forEach(f => this._handleNewIframe(f));
+            } catch (e) { }
+        },
+
+        // 规则变更后重新评估所有 iframe（包括已处理的）：清除 WeakSet 后全量重扫
+        rescanAll() {
+            try {
+                this._processedIframes = new WeakSet();
+                this.scanAll();
+            } catch (e) { }
+        },
+
+        _handleNewIframe(iframe) {
+            if (!iframe || iframe.nodeType !== 1) return;
+            if (this._processedIframes.has(iframe)) return;
+            // 保护脚本自身 UI
+            if (UIManager.isProtectedElement(iframe)) return;
+            this._processedIframes.add(iframe);
+            this._stats.scanned++;
+            // 延迟分类：等 iframe 内容加载（srcdoc/about:blank 同步可访问，跨域 load 后才有 src）
+            this._classifyAndAct(iframe, 0);
+            // 监听 load 事件：跨域 iframe 加载完成后重新评估
+            iframe.addEventListener('load', () => {
+                this._classifyAndAct(iframe, 0);
+            });
+        },
+
+        // 核心决策：分类 → 执行（§4.2 §5.1）
+        _classifyAndAct(iframe, depth) {
+            if (depth > this._maxDepth) return;
+            if (UIManager.isProtectedElement(iframe)) return;
+
+            // 先检查 iframeBlock 规则（用户显式规则优先）
+            if (this._matchesIframeBlockRules(iframe)) {
+                this._blockIframe(iframe, 'iframeBlock rule');
+                return;
+            }
+
+            const result = ContentClassifier.classify(iframe);
+            EventBus.emit('iframe:classified', { iframe, ...result });
+
+            if (result.verdict === 'whitelist') {
+                this._stats.protected++;
+                EventBus.emit('iframe:protected', { iframe, reason: 'whitelist' });
+                return;
+            }
+            if (result.verdict === 'ad') {
+                this._blockIframe(iframe, result.reasons.join(','));
+                return;
+            }
+            if (result.verdict === 'content') {
+                // 内容 iframe：仅清理内部广告，保留 iframe 容器（铁律1 §2.1）
+                this._scanContentIframe(iframe, depth);
+                this._stats.protected++;
+                EventBus.emit('iframe:protected', { iframe, reason: 'content' });
+                return;
+            }
+            // unknown：标记监听，不自动拦截（铁律4 §2.1）
+            // 跨域帧等待子帧 postMessage 上报
+        },
+
+        // 检查 iframeBlock 规则匹配
+        _matchesIframeBlockRules(iframe) {
+            const rules = this._getIframeBlockRules();
+            for (let i = 0; i < rules.length; i++) {
+                const r = rules[i];
+                if (r._disabled) continue;
+                if (r.matchType === 'srcDomain' && r.value && iframe.src) {
+                    try {
+                        const host = new URL(iframe.src).hostname;
+                        if (host === r.value || host.endsWith('.' + r.value)) return true;
+                    } catch (e) { }
+                }
+                if (r.matchType === 'srcdocKeyword' && r.value && iframe.srcdoc) {
+                    if (iframe.srcdoc.toLowerCase().includes(r.value.toLowerCase())) return true;
+                }
+                if (r.matchType === 'geometry') {
+                    // 几何规则：value 形如 "area>60,opacity<0.1,zIndex>999"
+                    if (this._matchGeometry(iframe, r.value)) return true;
+                }
+            }
+            return false;
+        },
+
+        _getIframeBlockRules() {
+            if (this._iframeBlockRules !== null) return this._iframeBlockRules;
+            this._iframeBlockRules = storage.getIframeBlocks();
+            return this._iframeBlockRules;
+        },
+
+        _matchGeometry(iframe, expr) {
+            if (!expr) return false;
+            try {
+                const cs = window.getComputedStyle(iframe);
+                const rect = iframe.getBoundingClientRect();
+                const vw = window.innerWidth || document.documentElement.clientWidth || 1;
+                const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+                const areaRatio = (rect.width * rect.height) / (vw * vh) * 100;
+                const opacity = parseFloat(cs.opacity) * 100;
+                const zi = parseInt(cs.zIndex, 10) || 0;
+                const conditions = expr.split(',').map(s => s.trim()).filter(Boolean);
+                for (const cond of conditions) {
+                    const m = cond.match(/^(area|opacity|zIndex)\s*(>=|<=|>|<)\s*(\d+)$/);
+                    if (!m) continue;
+                    const [, key, op, num] = m;
+                    const val = key === 'area' ? areaRatio : (key === 'opacity' ? opacity : zi);
+                    const n = parseInt(num, 10);
+                    if (op === '>' && !(val > n)) return false;
+                    if (op === '<' && !(val < n)) return false;
+                    if (op === '>=' && !(val >= n)) return false;
+                    if (op === '<=' && !(val <= n)) return false;
+                }
+                return conditions.length > 0;
+            } catch (e) { return false; }
+        },
+
+        // 整体拦截纯广告 iframe（铁律3 §2.1）
+        _blockIframe(iframe, reason) {
+            BlockEngine.hideElement(iframe);
+            this._stats.blocked++;
+            EventBus.emit('iframe:blocked', { iframe, reason });
+        },
+
+        // 内容 iframe 内部广告清理（铁律1 §2.1：绝不删 iframe 容器）
+        _scanContentIframe(iframe, depth) {
+            let doc = null;
+            try { doc = iframe.contentDocument; } catch (e) { return; }
+            if (!doc || !doc.documentElement) return;
+            try {
+                // 应用域名封杀规则到 iframe 内部
+                const domainSet = BlockEngine.getDomainSet();
+                if (domainSet.size > 0) {
+                    domainSet.forEach(d => {
+                        const sel = ResourceSelectorBuilder.buildDomainAttr(d);
+                        try {
+                            doc.querySelectorAll(sel).forEach(el => {
+                                this._handleAdNode(el, doc);
+                            });
+                        } catch (e) { }
+                    });
+                }
+                // 递归处理嵌套 iframe（§7.2 深度控制）
+                try {
+                    doc.querySelectorAll('iframe').forEach(inner => {
+                        this._classifyAndAct(inner, depth + 1);
+                    });
+                } catch (e) { }
+            } catch (e) { }
+        },
+
+        // 正文保护判定（§5.2）：有正文 → 仅删广告节点，不动容器
+        _handleAdNode(node, doc) {
+            if (!node || UIManager.isProtectedElement(node)) return;
+            // 找最近的包裹容器
+            const container = BlockEngine.findSingleChildWrapper(node, 4);
+            let containerText = '';
+            let hasSemantic = false;
+            try {
+                containerText = (container.innerText || container.textContent || '');
+                hasSemantic = !!(container.querySelector && container.querySelector('article,main,p,h1,h2,h3,h4,h5,h6'));
+            } catch (e) { }
+            // 铁律2：有正文 → 只删广告节点，不动容器
+            if (containerText.length > 200 || hasSemantic) {
+                BlockEngine.hideElement(node);
+                this._stats.cleaned++;
+                return;
+            }
+            // 铁律3：无正文的纯广告容器 → 可安全删除
+            BlockEngine.hideElement(container);
+            this._stats.cleaned++;
+        },
+
+        getStats() { return this._stats; }
+    };
+
     // ================= 初始化与执行流 =================
 
     // 网络层拦截须最先执行：在页面任何 fetch/XHR/script 加载前完成 hook，确保广告请求被源头丢弃
@@ -7306,6 +8242,40 @@
     BlockEngine.hookAttachShadow();
     BlockEngine.fastInject();
     BlockEngine.startObserver();
+
+    // ─── iframe 防线初始化（§9 启动流程） ───
+    // 帧间通信与消息监控：所有帧（顶层 + 子帧）均需初始化
+    FrameMessenger.init();
+    MessageGuard.init();
+    // iframe 检测与分类：所有帧均需初始化（每帧可能含嵌套 iframe）
+    IframeGuard.init();
+
+    // 子帧自治上报（§6.1 策略A）：子帧向父帧 postMessage 上报自身分类结果
+    // 顶层窗口无需上报；延迟到 DOMContentLoaded 后计算评分（确保正文已渲染）
+    if (window.self !== window.top) {
+        const _reportSelf = () => {
+            try {
+                // 子帧用自身 document 计算正文分/广告分，向父帧上报分类结果
+                const cScore = ContentClassifier.computeContentScore(document, null);
+                const aScore = ContentClassifier.computeAdScore(null, document, cScore.score);
+                let verdict = 'unknown';
+                if (cScore.score > 60) verdict = 'content';
+                else if (aScore.score > 70 && cScore.score < 20) verdict = 'ad';
+                FrameMessenger.sendReport({
+                    contentScore: cScore.score,
+                    adScore: aScore.score,
+                    hasContent: cScore.score > 60,
+                    verdict,
+                    url: window.location.href
+                });
+            } catch (e) { }
+        };
+        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+            setTimeout(_reportSelf, 100);
+        } else {
+            document.addEventListener('DOMContentLoaded', () => setTimeout(_reportSelf, 100));
+        }
+    }
 
     if (window.self === window.top) {
         let uiInstance = null;

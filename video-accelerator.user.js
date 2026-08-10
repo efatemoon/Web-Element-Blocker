@@ -1,1541 +1,2860 @@
 // ==UserScript==
-// @name         视频加载加速与稳定播放 + 自定义播放器
+// @name         视频快速检测与稳定播放 (微内核事件驱动版)
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
-// @description  视频秒开·大缓冲·Seek防卡死·自动恢复·自定义播放器（倍速/横竖屏旋转/全屏快进快退/画中画/截图/手势/快捷键，全部可配）。配套"网页元素屏蔽器"：广告它来清，加速我来搞，播放器我来换。双上下文架构：沙箱世界管理配置与UI，页面世界注入引擎拦截HLS/Dash/Shaka构造器、链式fetch提速、缓冲水位管理、Seek三级自愈、卡死看门狗、广告门禁联动跳过，并叠加毛玻璃自定义控制栏。
-// @author       EFate
-// @match        *://*/*
+// @version      18.0.0
+// @description  v18.0：微内核 + EventBus 架构；原型嗅探、pointerdown 预启动、RVFC 帧级监控、DNS/preconnect 预热、批量 DOM 扫描、iframe 穿透、HLS 优化、Seek 保护、卡死恢复、日志流、网络健康评分与卡顿时间轴。
+// @author       EFate (Refactored by AI)
+// @match        http://*/*
+// @match        https://*/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-start
 // @license      MIT
-// @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
-// @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    // ============================================================
-    // 【沙箱世界】配置持久化 / 消息桥 / 全局控制台 + 设置面板
-    // ============================================================
+    const VERSION = '18.0.0';
+    const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const DOC = PW.document || document;
+    const LOC = PW.location || location;
+    const NOW = function () { return Date.now(); };
 
-    const ConfigStore = {
-        defaults: {
-            // 加载加速
-            autoPlay: true,
-            bigBuffer: true,
-            adGateBypass: true,
-            seekGuard: true,
-            bufferTarget: 60,
-            seekTimeout: 8000,
-            // 接管
-            takeoverMode: 'overlay',        // overlay | extract | accel-only
-            autoHideSec: 3,
-            // 倍速
-            speedEnabled: true,
-            rates: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4],
-            defaultRate: 1,
-            speedMemory: true,
-            // 快进快退
-            seekBtnsEnabled: true,
-            seekStep: 10,
-            smallStep: 5,
-            bigStep: 10,
-            hugeStep: 30,
-            gestureEnabled: true,
-            longPressEnabled: true,
-            longPressRate: 3,
-            keyboardEnabled: true,
-            // 其他
-            rotation: true,
-            pip: true,
-            screenshot: true,
-            lock: true,
-            volumeMemory: true,
-            siteProfiles: {}
-        },
-        _cache: null,
+    let IS_TOP = true;
+    try { if (PW.self !== PW.top) IS_TOP = false; } catch (e) { IS_TOP = false; }
+
+    let SKIP_LOCAL = false;
+    if (!IS_TOP) {
+        try {
+            if (PW.parent && PW.parent.__VA__) SKIP_LOCAL = true;
+        } catch (e) { }
+    }
+    if (SKIP_LOCAL) return;
+
+    try { PW.__VA__ = { version: VERSION, IS_TOP: IS_TOP }; } catch (e) { }
+
+    const IFRAME_ID = 'if_' + Math.random().toString(36).slice(2, 11);
+    const HOOKED_DOCS = new Set([DOC]);
+
+    /* ═══════════════════════════════════════════════════════════
+       基础工具
+    ═══════════════════════════════════════════════════════════ */
+
+    const clamp = function (n, lo, hi) { return Math.max(lo, Math.min(hi, n)); };
+
+    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv|mp3|aac)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
+    const isVideoResource = function (url) { return VIDEO_RE.test(url || ''); };
+
+    const isLive = function (v) {
+        try { return v && v.duration === Infinity; } catch (e) { return false; }
+    };
+
+    const isVisible = function (el) {
+        try {
+            if (!el || !el.isConnected) return false;
+            const view = (el.ownerDocument && el.ownerDocument.defaultView) || PW;
+            const cs = view.getComputedStyle(el);
+            return cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity) > 0;
+        } catch (e) { return false; }
+    };
+
+    const videoArea = function (v) {
+        try {
+            const r = v.getBoundingClientRect();
+            return Math.max(0, r.width) * Math.max(0, r.height);
+        } catch (e) { return 0; }
+    };
+
+    const getHost = function (url) {
+        try {
+            const U = PW.URL || URL;
+            return new U(url, LOC.href).host;
+        } catch (e) { return ''; }
+    };
+
+    function estimateBandwidth() {
+        try {
+            const perf = PW.performance || performance;
+            if (!perf || !perf.getEntriesByType) return 0;
+            const entries = perf.getEntriesByType('resource')
+                .filter(function (e) {
+                    return isVideoResource(e.name) && (e.transferSize || 0) > 0 && (e.duration || 0) > 0;
+                })
+                .sort(function (a, b) { return b.startTime - a.startTime; })
+                .slice(0, 5);
+            if (!entries.length) return 0;
+            const bytes = entries.reduce(function (s, e) { return s + e.transferSize; }, 0);
+            const ms = entries.reduce(function (s, e) { return s + e.duration; }, 0);
+            return Math.round((bytes * 8) / (ms / 1000));
+        } catch (e) { return 0; }
+    }
+
+    function getNetworkType() {
+        try {
+            const c = PW.navigator.connection || PW.navigator.mozConnection || PW.navigator.webkitConnection;
+            return c ? (c.effectiveType || '-') : '-';
+        } catch (e) { return '-'; }
+    }
+
+    const tryPlay = function (v) {
+        try {
+            if (!v || typeof v.play !== 'function') return;
+            const p = v.play();
+            if (p && typeof p.catch === 'function') p.catch(function () { });
+        } catch (e) { }
+    };
+
+    function videoFromEvent(e) {
+        try {
+            const path = e.composedPath ? e.composedPath() : [];
+            for (let i = 0; i < Math.min(path.length, 8); i++) {
+                const n = path[i];
+                if (n && n.nodeName === 'VIDEO') return n;
+            }
+            let el = e.target;
+            for (let i = 0; i < 6 && el; i++) {
+                if (el.nodeName === 'VIDEO') return el;
+                if (el.nodeType === 1 && el.querySelector) {
+                    const v = el.querySelector('video');
+                    if (v) return v;
+                }
+                el = el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
+            }
+        } catch (err) { }
+        return null;
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       EventBus 事件总线
+    ═══════════════════════════════════════════════════════════ */
+
+    class EventBus {
+        constructor() {
+            this._handlers = Object.create(null);
+        }
+        on(type, fn) {
+            if (!this._handlers[type]) this._handlers[type] = [];
+            this._handlers[type].push(fn);
+            return () => this.off(type, fn);
+        }
+        off(type, fn) {
+            const arr = this._handlers[type];
+            if (!arr) return;
+            const idx = arr.indexOf(fn);
+            if (idx >= 0) arr.splice(idx, 1);
+        }
+        emit(type, payload) {
+            const arr = this._handlers[type];
+            if (!arr || !arr.length) return;
+            const copy = arr.slice();
+            for (const fn of copy) {
+                try { fn(payload); } catch (e) { }
+            }
+        }
+    }
+
+    const Bus = new EventBus();
+
+    /* ═══════════════════════════════════════════════════════════
+       ConfigManager 配置中心
+    ═══════════════════════════════════════════════════════════ */
+
+    const STORAGE_KEY = 'va_config_v18_0';
+
+    class ConfigManagerClass {
+        constructor(bus) {
+            this.bus = bus;
+            this._cache = null;
+            this.defaults = {
+                // 稳定播放
+                autoPlay: true,
+                bigBuffer: true,
+                seekGuard: true,
+                watchdog: true,
+                autoDowngrade: true,
+                bufferTarget: 60,
+                seekTimeout: 5000,
+
+                // UI / 日志
+                showToast: true,
+                showDetect: true,
+                logLevel: 'info', // debug / info / warn / error
+
+                // 识别与网络
+                minPreBuffer: 2,
+                fastDetect: true,
+                fetchPriority: true,
+                visibleOnly: true,
+                minVideoArea: 8000,
+
+                // 极速接管
+                protoHook: true,
+                earlyPointer: true,
+                preconnect: true,
+                rvfcMonitor: true,
+                instantPlay: true,
+
+                // 画质管理
+                qualityManage: true
+            };
+            this._installRequests();
+        }
+
         load() {
             if (this._cache) return this._cache;
             let raw = null;
-            try { raw = GM_getValue('va_config', null); } catch (e) { raw = null; }
-            this._cache = this._mergeDefaults(raw || {});
-            return this._cache;
-        },
-        _mergeDefaults(raw) {
-            const out = Object.assign({}, this.defaults, raw);
-            // 嵌套对象单独合并
-            out.rates = Array.isArray(raw.rates) && raw.rates.length ? raw.rates.slice() : this.defaults.rates.slice();
-            out.siteProfiles = raw.siteProfiles && typeof raw.siteProfiles === 'object' ? raw.siteProfiles : {};
-            return out;
-        },
-        save() { try { GM_setValue('va_config', this._cache); } catch (e) { } },
-        get(k) { return this.load()[k]; },
-        set(k, v) { this.load()[k] = v; this.save(); },
-        // 站点档案：站点配置 > 全局 > 默认
-        getSite(host) { return this.load().siteProfiles[host] || null; },
-        saveSite(host, patch) {
-            const cfg = this.load();
-            cfg.siteProfiles[host] = Object.assign(cfg.siteProfiles[host] || {}, patch);
-            this.save();
-        },
-        effective(host) {
-            const base = this.load();
-            const site = base.siteProfiles[host] || {};
-            return Object.assign({}, base, site);
-        },
-        exportJSON() { return JSON.stringify(this.load(), null, 2); },
-        importJSON(str) {
-            try { const obj = JSON.parse(str); this._cache = this._mergeDefaults(obj || {}); this.save(); return true; }
-            catch (e) { return false; }
-        },
-        reset() { this._cache = this._mergeDefaults({}); this.save(); },
-        resetSite(host) { const cfg = this.load(); delete cfg.siteProfiles[host]; this.save(); }
-    };
+            try { raw = GM_getValue(STORAGE_KEY, null); } catch (e) { }
 
-    // 沙箱 ⇄ 页面世界消息桥：va-cmd(下行) / va-evt(上行)
-    const MessageBridge = {
-        init(onEvent) {
-            this._onEvent = onEvent;
-            window.addEventListener('va-evt', (e) => { try { this._onEvent(e.detail || {}); } catch (err) { } });
-        },
-        send(cmd, payload) { try { window.dispatchEvent(new CustomEvent('va-cmd', { detail: { cmd, payload } })); } catch (e) { } }
-    };
-
-    // 全局控制台 + 设置面板：closed Shadow DOM，宿主 #va-ui-host，毛玻璃风格对齐屏蔽器
-    class UIManager {
-        constructor() {
-            this.cfg = ConfigStore.load();
-            this._state = { status: '空闲', playerType: '-', buffer: 0, recoveries: 0, adSkipped: 0, takeover: false, rate: 1 };
-            this._visible = false; this._settingsOpen = false;
-            this._build();
-        }
-        _build() {
-            const existing = document.getElementById('va-ui-host');
-            if (existing) existing.remove();
-            this.host = document.createElement('div');
-            this.host.id = 'va-ui-host';
-            this.host.style.cssText = 'position: fixed; z-index: 2147483646; top: 0; left: 0; width: 0; height: 0; overflow: visible;';
-            this.root = this.host.attachShadow({ mode: 'closed' });
-
-            const style = document.createElement('style');
-            style.textContent = `
-                :host { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 14px; }
-                .panel { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-                    background: rgba(25, 25, 30, 0.72); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-                    border: 1px solid rgba(255,255,255,0.16); padding: 20px; border-radius: 16px;
-                    box-shadow: 0 20px 64px rgba(0,0,0,0.42), inset 0 0 0 1px rgba(255,255,255,0.07);
-                    width: min(460px, calc(100vw - 48px)); max-width: calc(100vw - 48px);
-                    max-height: 84vh; overflow-y: auto; color: #eee; text-shadow: 0 1px 2px rgba(0,0,0,0.8); box-sizing: border-box; }
-                h3 { margin-top: 0; font-size: 16px; font-weight: 600; color: #fff; margin-bottom: 14px;
-                    border-bottom: 1px solid rgba(255,255,255,0.12); padding-bottom: 10px; }
-                .row { display:flex; justify-content:space-between; font-size:12px; color:#ccc; margin:5px 0; }
-                .row b { color:#fff; font-weight:600; }
-                .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; background:#888; }
-                .dot.live{ background:#34c759; box-shadow:0 0 6px #34c759; } .dot.wait{ background:#ff9500; } .dot.err{ background:#ff3b30; }
-                .buf-bar{ height:8px; background:rgba(255,255,255,0.1); border-radius:4px; overflow:hidden; margin:6px 0 12px; }
-                .buf-fill{ height:100%; background:linear-gradient(90deg,#4aa3ff,#34c759); width:0%; transition:width .3s; }
-                .btn-group{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
-                button{ padding:9px 12px; border:1px solid rgba(255,255,255,0.18); border-radius:8px; cursor:pointer; font-size:13px; font-weight:500;
-                    transition:filter .15s, transform .1s; flex:1; display:flex; align-items:center; justify-content:center; line-height:1.2;
-                    background:rgba(255,255,255,0.1); color:#fff; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); text-shadow:0 1px 2px rgba(0,0,0,0.4); }
-                button:hover:not(:disabled){ filter:brightness(1.15); transform:translateY(-1px); }
-                button:active:not(:disabled){ transform:translateY(0); filter:brightness(0.95); }
-                button:disabled{ opacity:0.3; cursor:not-allowed; }
-                .btn-primary{ background:rgba(0,122,255,0.72); } .btn-success{ background:rgba(52,199,89,0.72); }
-                .btn-warning{ background:rgba(255,149,0,0.72); } .btn-danger{ background:rgba(255,59,48,0.72); }
-                .divider{ height:1px; background:rgba(255,255,255,0.1); margin:12px 0; }
-                .sec-title{ font-size:12px; color:#9ad; margin:8px 0 4px; font-weight:600; }
-                label.opt{ display:flex; align-items:center; gap:8px; font-size:13px; color:#ddd; margin:6px 0; cursor:pointer; flex-wrap:wrap; }
-                label.opt input[type=checkbox]{ width:18px; height:18px; accent-color:#0a84ff; flex:none; }
-                label.opt input[type=number], label.opt input[type=text]{ width:64px; padding:4px 6px; margin-left:6px; border:1px solid rgba(255,255,255,0.14); border-radius:6px; background:rgba(0,0,0,0.25); color:#eee; font-size:12px; }
-                label.opt input[type=text]{ width:180px; }
-                .radio-group{ display:flex; gap:14px; margin:7px 0; font-size:13px; color:#ddd; flex-wrap:wrap; }
-                .radio-group label{ display:flex; align-items:center; gap:4px; cursor:pointer; }
-                .hint{ font-size:11px; color:#aaa; line-height:1.5; margin-top:10px; }
-                .toast{ position:fixed; top:20px; right:20px; z-index:2147483646; padding:12px 18px; border-radius:10px;
-                    background:rgba(30,30,35,0.92); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
-                    border:1px solid rgba(255,255,255,0.15); color:#fff; font-size:13px; max-width:340px; word-break:break-all;
-                    transform:translateX(120%); transition:transform .3s cubic-bezier(.4,0,.2,1); box-shadow:0 8px 32px rgba(0,0,0,0.3); }
-                .toast.show{ transform:translateX(0); } .toast.warn{ border-left:3px solid #ff9500; }
-                .toast.err{ border-left:3px solid #ff3b30; } .toast.ok{ border-left:3px solid #34c759; }
-                .close-x{ position:absolute; top:10px; right:14px; cursor:pointer; color:#aaa; font-size:18px; background:none; border:none; flex:none; padding:0 4px; }
-                .tab-bar{ display:flex; gap:6px; margin-bottom:12px; }
-                .tab{ padding:7px 12px; border-radius:8px; cursor:pointer; font-size:13px; background:rgba(255,255,255,0.08); color:#ccc; flex:1; text-align:center; }
-                .tab.active{ background:rgba(0,122,255,0.7); color:#fff; }
-                @media (max-width:480px){ .panel{ padding:16px; border-radius:14px; width:calc(100vw - 56px); max-width:calc(100vw - 56px); } button{ padding:8px 10px; font-size:12px; } label.opt input[type=text]{ width:120px; } }
-            `;
-            this.root.appendChild(style);
-
-            this._toast = document.createElement('div'); this._toast.className = 'toast'; this.root.appendChild(this._toast);
-
-            // 主控制台
-            this._panel = document.createElement('div'); this._panel.className = 'panel'; this._panel.style.display = 'none';
-            this._panel.innerHTML = `
-                <span class="close-x" data-act="close">×</span>
-                <h3>🎬 视频加速控制台</h3>
-                <div class="row"><span><span class="dot" id="va-dot"></span>状态: <b id="va-status">空闲</b></span><span>播放器: <b id="va-type">-</b></span></div>
-                <div class="row"><span>Buffer: <b id="va-buf">0.0s</b></span><span>恢复: <b id="va-rec">0</b></span><span>广告跳过: <b id="va-ad">0</b></span></div>
-                <div class="buf-bar"><div class="buf-fill" id="va-buf-fill"></div></div>
-                <div class="row"><span>接管: <b id="va-takeover">否</b></span><span>倍速: <b id="va-rate">1.0x</b></span></div>
-                <div class="btn-group">
-                    <button class="btn-warning" data-act="reload">强制重载</button>
-                    <button class="btn-primary" data-act="recover">手动恢复</button>
-                    <button class="btn-danger" data-act="downgrade">降低画质</button>
-                </div>
-                <div class="btn-group">
-                    <button class="btn-success" data-act="settings">⚙ 设置</button>
-                    <button data-act="reloadPage">刷新页面</button>
-                </div>
-                <div class="hint">提示：本脚本与"网页元素屏蔽器"配套。屏蔽器清广告，本脚本负责视频秒开、卡死自愈与自定义播放器。配置自动保存。</div>
-            `;
-            this.root.appendChild(this._panel);
-
-            // 设置面板
-            this._settings = document.createElement('div'); this._settings.className = 'panel'; this._settings.style.display = 'none';
-            this._settings.innerHTML = `
-                <span class="close-x" data-act="closeSettings">×</span>
-                <h3>⚙ 视频加速设置</h3>
-                <div class="sec-title">接管模式</div>
-                <div class="radio-group">
-                    <label><input type="radio" name="va-mode" value="overlay"> 控件覆盖</label>
-                    <label><input type="radio" name="va-mode" value="extract"> 提取播放</label>
-                    <label><input type="radio" name="va-mode" value="accel-only"> 仅加速</label>
-                </div>
-                <div class="sec-title">加载加速</div>
-                <label class="opt"><input type="checkbox" id="va-auto"> 自动播放</label>
-                <label class="opt"><input type="checkbox" id="va-big"> 超大缓冲模式</label>
-                <label class="opt"><input type="checkbox" id="va-adgate"> 广告门禁跳过</label>
-                <label class="opt"><input type="checkbox" id="va-seek"> Seek防卡死</label>
-                <label class="opt">Buffer目标: <input type="number" id="va-btgt" min="10" max="300" step="10"> s</label>
-                <label class="opt">Seek超时: <input type="number" id="va-sto" min="3" max="30" step="1"> s</label>
-                <div class="sec-title">倍速播放</div>
-                <label class="opt"><input type="checkbox" id="va-speeden"> 启用倍速</label>
-                <label class="opt">档位(逗号分隔): <input type="text" id="va-rates"></label>
-                <label class="opt">默认倍速: <input type="number" id="va-defrate" min="0.1" max="4" step="0.05"></label>
-                <label class="opt"><input type="checkbox" id="va-speedmem"> 按站点记忆倍速</label>
-                <div class="sec-title">快进快退</div>
-                <label class="opt"><input type="checkbox" id="va-seekbtns"> 控制栏按钮</label>
-                <label class="opt">按钮步长: <input type="number" id="va-seekstep" min="1" max="120" step="1"> s</label>
-                <label class="opt"><input type="checkbox" id="va-gesture"> 双击手势</label>
-                <label class="opt"><input type="checkbox" id="va-longpress"> 长按快进</label>
-                <label class="opt">长按倍数: <input type="number" id="va-longrate" min="1.5" max="5" step="0.5"> x</label>
-                <label class="opt"><input type="checkbox" id="va-kb"> 键盘快捷键</label>
-                <label class="opt">小步长: <input type="number" id="va-small" min="1" max="60" step="1"> s 大步长: <input type="number" id="va-big2" min="1" max="120" step="1"> s 超大: <input type="number" id="va-huge" min="5" max="300" step="5"> s</label>
-                <div class="sec-title">其他功能</div>
-                <label class="opt"><input type="checkbox" id="va-rotation"> 横竖屏旋转</label>
-                <label class="opt"><input type="checkbox" id="va-pip"> 画中画</label>
-                <label class="opt"><input type="checkbox" id="va-shot"> 截图</label>
-                <label class="opt"><input type="checkbox" id="va-lock"> 屏幕锁定</label>
-                <label class="opt"><input type="checkbox" id="va-volmem"> 音量记忆</label>
-                <label class="opt">控制栏自动隐藏: <input type="number" id="va-autohide" min="0" max="30" step="1"> s (0=不隐藏)</label>
-                <div class="divider"></div>
-                <div class="btn-group">
-                    <button class="btn-warning" data-act="resetSite">本站重置</button>
-                    <button data-act="exportCfg">导出设置</button>
-                    <button data-act="importCfg">导入设置</button>
-                    <button class="btn-danger" data-act="resetAll">恢复默认</button>
-                </div>
-                <div class="hint" id="va-import-hint"></div>
-            `;
-            this.root.appendChild(this._settings);
-
-            // 事件绑定
-            this._panel.addEventListener('click', (e) => {
-                const t = e.target.closest('[data-act]'); if (!t) return;
-                const act = t.getAttribute('data-act');
-                if (act === 'close') this.hide();
-                else if (act === 'settings') this._showSettings();
-                else if (act === 'reloadPage') { try { location.reload(); } catch (e) { } }
-                else MessageBridge.send(act);
-            });
-            this._settings.addEventListener('click', (e) => {
-                const t = e.target.closest('[data-act]'); if (!t) return;
-                const act = t.getAttribute('data-act');
-                if (act === 'closeSettings') { this._settings.style.display = 'none'; this._panel.style.display = ''; this._settingsOpen = false; }
-                else if (act === 'resetSite') { ConfigStore.resetSite(location.hostname); this.cfg = ConfigStore.load(); this._syncSettings(); this._broadcast(); this.toast('已重置本站配置', 'ok'); }
-                else if (act === 'resetAll') { ConfigStore.reset(); this.cfg = ConfigStore.load(); this._syncSettings(); this._broadcast(); this.toast('已恢复默认设置', 'ok'); }
-                else if (act === 'exportCfg') { this._export(); }
-                else if (act === 'importCfg') { this._import(); }
-            });
-            this._bindSettings();
-        }
-        _bindSettings() {
-            const on = (id, key, transform) => {
-                const el = this._settings.querySelector('#' + id);
-                if (!el) return;
-                el.addEventListener('change', () => {
-                    const v = transform ? transform(el) : el.checked;
-                    ConfigStore.set(key, v);
-                    this._broadcast();
-                });
-            };
-            this._settings.querySelectorAll('input[name="va-mode"]').forEach(r => r.addEventListener('change', (e) => {
-                if (e.target.checked) { ConfigStore.set('takeoverMode', e.target.value); this._broadcast(); }
-            }));
-            on('va-auto', 'autoPlay'); on('va-big', 'bigBuffer'); on('va-adgate', 'adGateBypass'); on('va-seek', 'seekGuard');
-            on('va-btgt', 'bufferTarget', el => parseInt(el.value) || 60);
-            on('va-sto', 'seekTimeout', el => (parseInt(el.value) || 8) * 1000);
-            on('va-speeden', 'speedEnabled');
-            on('va-rates', 'rates', el => el.value.split(',').map(s => parseFloat(s.trim())).filter(n => isFinite(n) && n > 0));
-            on('va-defrate', 'defaultRate', el => parseFloat(el.value) || 1);
-            on('va-speedmem', 'speedMemory');
-            on('va-seekbtns', 'seekBtnsEnabled');
-            on('va-seekstep', 'seekStep', el => parseInt(el.value) || 10);
-            on('va-gesture', 'gestureEnabled');
-            on('va-longpress', 'longPressEnabled');
-            on('va-longrate', 'longPressRate', el => parseFloat(el.value) || 3);
-            on('va-kb', 'keyboardEnabled');
-            on('va-small', 'smallStep', el => parseInt(el.value) || 5);
-            on('va-big2', 'bigStep', el => parseInt(el.value) || 10);
-            on('va-huge', 'hugeStep', el => parseInt(el.value) || 30);
-            on('va-rotation', 'rotation'); on('va-pip', 'pip'); on('va-shot', 'screenshot'); on('va-lock', 'lock'); on('va-volmem', 'volumeMemory');
-            on('va-autohide', 'autoHideSec', el => parseInt(el.value) || 0);
-        }
-        _broadcast() { MessageBridge.send('configUpdate', ConfigStore.effective(location.hostname)); }
-        _export() {
-            const json = ConfigStore.exportJSON();
-            try {
-                const ta = document.createElement('textarea');
-                ta.value = json; ta.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:160px;z-index:9999;background:#1a1a1f;color:#eee;border:1px solid #444;border-radius:8px;padding:10px;font-size:12px;';
-                this._settings.appendChild(ta); ta.select();
-                const hint = this._settings.querySelector('#va-import-hint');
-                if (hint) hint.textContent = '设置已生成于上方文本框，请复制保存。导入时粘贴覆盖后点"导入设置"。';
-                try { document.execCommand('copy'); this.toast('已复制到剪贴板', 'ok'); } catch (e) { }
-            } catch (e) { this.toast('导出失败', 'err'); }
-        }
-        _import() {
-            const hint = this._settings.querySelector('#va-import-hint');
-            let ta = this._settings.querySelector('textarea');
-            if (!ta) {
-                ta = document.createElement('textarea');
-                ta.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:120px;z-index:9999;background:#1a1a1f;color:#eee;border:1px solid #444;border-radius:8px;padding:10px;font-size:12px;';
-                ta.placeholder = '粘贴导出的 JSON 设置...';
-                this._settings.appendChild(ta);
-                if (hint) hint.textContent = '粘贴 JSON 后再次点击"导入设置"。';
-                return;
+            let obj = null;
+            if (typeof raw === 'string') {
+                try { obj = JSON.parse(raw); } catch (e) { obj = null; }
+            } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+                obj = raw;
             }
-            const ok = ConfigStore.importJSON(ta.value);
-            if (ok) { this.cfg = ConfigStore.load(); this._syncSettings(); this._broadcast(); this.toast('导入成功', 'ok'); ta.remove(); if (hint) hint.textContent = ''; }
-            else { this.toast('JSON 格式错误', 'err'); }
+
+            this._cache = Object.assign({}, this.defaults, obj || {});
+            this._normalize();
+            return this._cache;
         }
-        _showSettings() { this._panel.style.display = 'none'; this._settings.style.display = ''; this._syncSettings(); this._settingsOpen = true; }
-        _syncSettings() {
-            const c = ConfigStore.effective(location.hostname);
-            const set = (id, v) => { const el = this._settings.querySelector('#' + id); if (el) el.value = v; };
-            const chk = (id, v) => { const el = this._settings.querySelector('#' + id); if (el) el.checked = !!v; };
-            chk('va-auto', c.autoPlay); chk('va-big', c.bigBuffer); chk('va-adgate', c.adGateBypass); chk('va-seek', c.seekGuard);
-            set('va-btgt', c.bufferTarget); set('va-sto', Math.round(c.seekTimeout / 1000));
-            chk('va-speeden', c.speedEnabled); set('va-rates', (c.rates || []).join(',')); set('va-defrate', c.defaultRate); chk('va-speedmem', c.speedMemory);
-            chk('va-seekbtns', c.seekBtnsEnabled); set('va-seekstep', c.seekStep);
-            chk('va-gesture', c.gestureEnabled); chk('va-longpress', c.longPressEnabled); set('va-longrate', c.longPressRate);
-            chk('va-kb', c.keyboardEnabled); set('va-small', c.smallStep); set('va-big2', c.bigStep); set('va-huge', c.hugeStep);
-            chk('va-rotation', c.rotation); chk('va-pip', c.pip); chk('va-shot', c.screenshot); chk('va-lock', c.lock); chk('va-volmem', c.volumeMemory);
-            set('va-autohide', c.autoHideSec);
-            const modeRadio = this._settings.querySelector('input[name="va-mode"][value="' + (c.takeoverMode || 'overlay') + '"]');
-            if (modeRadio) modeRadio.checked = true;
+
+        _normalize() {
+            const c = this._cache;
+            delete c.siteProfiles;
+
+            c.bufferTarget = clamp(parseInt(c.bufferTarget, 10) || 60, 10, 300);
+            c.minPreBuffer = clamp(parseInt(c.minPreBuffer, 10) || 2, 1, 30);
+            c.seekTimeout = clamp(parseInt(c.seekTimeout, 10) || 5000, 2000, 15000);
+            c.minVideoArea = Math.max(0, parseInt(c.minVideoArea, 10) || 8000);
+
+            const levels = ['debug', 'info', 'warn', 'error'];
+            if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
+
+            const boolKeys = [
+                'autoPlay', 'bigBuffer', 'seekGuard', 'watchdog', 'autoDowngrade',
+                'showToast', 'showDetect', 'fastDetect', 'fetchPriority', 'visibleOnly',
+                'protoHook', 'earlyPointer', 'preconnect', 'rvfcMonitor', 'instantPlay',
+                'qualityManage'
+            ];
+            boolKeys.forEach(function (k) { c[k] = !!c[k]; });
         }
-        _mount() { if (this.host.isConnected) return; (document.body || document.documentElement).appendChild(this.host); }
-        toggle() { this._visible ? this.hide() : this.show(); }
-        show() { this._mount(); this.cfg = ConfigStore.load(); this._panel.style.display = ''; this._settings.style.display = 'none'; this._visible = true; }
-        showSettings() { this._mount(); this.cfg = ConfigStore.load(); this._panel.style.display = 'none'; this._settings.style.display = ''; this._syncSettings(); this._settingsOpen = true; this._visible = true; }
-        hide() { this._panel.style.display = 'none'; this._settings.style.display = 'none'; this._visible = false; }
-        toast(msg, kind) {
-            this._mount(); this._toast.textContent = msg; this._toast.className = 'toast show ' + (kind || '');
-            clearTimeout(this._toastT); this._toastT = setTimeout(() => { this._toast.className = 'toast ' + (kind || ''); }, 2800);
+
+        save() {
+            try { GM_setValue(STORAGE_KEY, JSON.stringify(this.load())); } catch (e) { }
         }
-        update(state) {
-            Object.assign(this._state, state);
-            if (!this._visible) return;
-            const s = this._state;
-            const set = (id, v) => { const el = this._panel.querySelector('#' + id); if (el) el.textContent = v; };
-            set('va-status', s.status); set('va-type', s.playerType);
-            set('va-buf', (typeof s.buffer === 'number' ? s.buffer : 0).toFixed(1) + 's');
-            set('va-rec', s.recoveries); set('va-ad', s.adSkipped);
-            set('va-takeover', s.takeover ? '是' : '否'); set('va-rate', (s.rate || 1).toFixed(2).replace(/0$/, '') + 'x');
-            const dot = this._panel.querySelector('#va-dot');
-            if (dot) dot.className = 'dot' + (s.status === '播放中' ? ' live' : s.status === '缓冲中' ? ' wait' : s.status === '错误' ? ' err' : '');
-            const fill = this._panel.querySelector('#va-buf-fill');
-            if (fill) fill.style.width = Math.min(100, ((typeof s.buffer === 'number' ? s.buffer : 0) / Math.max(10, this.cfg.bufferTarget)) * 100) + '%';
+
+        get(k) {
+            return this.load()[k];
+        }
+
+        set(k, v) {
+            const c = this.load();
+            c[k] = v;
+            this._normalize();
+            this.save();
+            this.bus.emit('CONFIG_CHANGE', { key: k, value: this.get(k), config: this.load(), local: true });
+        }
+
+        update(patch) {
+            if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return;
+            const c = this.load();
+            Object.assign(c, patch);
+            this._normalize();
+            this.save();
+            this.bus.emit('CONFIG_CHANGE', { batch: true, config: this.load(), local: true });
+        }
+
+        exportJSON() {
+            return JSON.stringify(this.load(), null, 2);
+        }
+
+        importJSON(str) {
+            try {
+                const obj = JSON.parse(str);
+                if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+                this._cache = Object.assign({}, this.defaults, obj);
+                this._normalize();
+                this.save();
+                this.bus.emit('CONFIG_CHANGE', { import: true, config: this.load(), local: true });
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        reset() {
+            this._cache = Object.assign({}, this.defaults);
+            this._normalize();
+            this.save();
+            this.bus.emit('CONFIG_CHANGE', { reset: true, config: this.load(), local: true });
+        }
+
+        applyRemote(config) {
+            if (!config || typeof config !== 'object' || Array.isArray(config)) return;
+            this._cache = Object.assign({}, this.defaults, config);
+            this._normalize();
+            this.bus.emit('CONFIG_CHANGE', { remote: true, config: this.load() });
+        }
+
+        _installRequests() {
+            this.bus.on('CONFIG_EXPORT_REQUEST', () => {
+                this.bus.emit('CONFIG_EXPORT_RESULT', { json: this.exportJSON() });
+            });
+
+            this.bus.on('CONFIG_IMPORT_REQUEST', (payload) => {
+                const json = payload && payload.json;
+                const ok = this.importJSON(json);
+                this.bus.emit('CONFIG_IMPORT_RESULT', { ok: ok });
+            });
+
+            this.bus.on('CONFIG_RESET_REQUEST', () => {
+                this.reset();
+            });
+
+            this.bus.on('CONFIG_SET', (payload) => {
+                if (!payload || !payload.key) return;
+                this.set(payload.key, payload.value);
+            });
+
+            this.bus.on('CONFIG_UPDATE', (payload) => {
+                this.update(payload);
+            });
         }
     }
 
-    // ============================================================
-    // 【页面世界注入引擎】序列化为字符串，document-start 注入
-    // ============================================================
-    function pageEngine(initialConfig) {
-        if (window.__vaInjected) return;
-        window.__vaInjected = true;
+    const ConfigManager = new ConfigManagerClass(Bus);
 
-        const CFG = Object.assign({
-            autoPlay: true, bigBuffer: true, adGateBypass: true, seekGuard: true,
-            bufferTarget: 60, seekTimeout: 8000, takeoverMode: 'overlay', autoHideSec: 3,
-            speedEnabled: true, rates: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4], defaultRate: 1, speedMemory: true,
-            seekBtnsEnabled: true, seekStep: 10, smallStep: 5, bigStep: 10, hugeStep: 30,
-            gestureEnabled: true, longPressEnabled: true, longPressRate: 3, keyboardEnabled: true,
-            rotation: true, pip: true, screenshot: true, lock: true, volumeMemory: true
-        }, initialConfig || {});
+    /* ═══════════════════════════════════════════════════════════
+       Logger 日志系统
+    ═══════════════════════════════════════════════════════════ */
 
-        const SITE_PROFILES = {
-            '_default': { containerSel: null, bufferTarget: 60, seekTimeout: 8000 },
-            'www.bilibili.com': { containerSel: '.bpx-player-video-area', bufferTarget: 120 },
-            'v.qq.com': { adGateBypass: true, bufferTarget: 90 },
-            'www.youtube.com': { bufferTarget: 120, seekTimeout: 10000 }
-        };
-        const PROFILE = Object.assign({}, SITE_PROFILES['_default'], SITE_PROFILES[location.hostname] || {});
+    const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 
-        const HOST = location.hostname;
-
-        const Bridge = {
-            send(evt, payload) { try { window.dispatchEvent(new CustomEvent('va-evt', { detail: { evt, payload } })); } catch (e) { } },
-            on(cmd, handler) { window.addEventListener('va-cmd', (e) => { const d = e.detail || {}; if (d.cmd === cmd) { try { handler(d.payload); } catch (err) { } } }); }
-        };
-
-        // ============ 工具 ============
-        const throttle = (fn, wait) => {
-            let last = 0, timer = null;
-            return function () { const now = Date.now(), args = arguments, self = this; if (now - last >= wait) { last = now; fn.apply(self, args); } else { clearTimeout(timer); timer = setTimeout(() => { last = Date.now(); fn.apply(self, args); }, wait - (now - last)); } };
-        };
-        const isVideoResource = (url) => /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v)(\?|$)|\/(seg|chunk|frag|segment)s?\//i.test(url || '');
-        const isLive = (video) => !isFinite(video.duration) || video.duration === Infinity;
-
-        // ============ Registry ============
-        const PlayerRegistry = {
-            _map: new WeakMap(),
-            get(v) { return this._map.get(v); },
-            set(v, info) { this._map.set(v, info); }
-        };
-        const IORegistry = {
-            _list: [],
-            track(inst, cb) { this._list.push({ inst, cb }); },
-            forEach(fn) { this._list.forEach(o => fn(o.inst, o.cb)); }
-        };
-
-        // ============ HLS/Dash/Shaka 默认配置 ============
-        const VA_HLS_DEFAULTS = {
-            maxBufferLength: 60, maxMaxBufferLength: 300, maxBufferSize: 60 * 1024 * 1024,
-            maxBufferHole: 0.5, startFragPrefetch: true, testBandwidth: true, progressive: true,
-            backBufferLength: 90, lowLatencyMode: false
-        };
-
-        function wrapHls(Orig) {
-            if (!Orig || typeof Orig !== 'function' || Orig.__vaPatched) return Orig;
-            function HookedHls(cfg) {
-                const merged = Object.assign({}, VA_HLS_DEFAULTS, cfg || {});
-                if (!CFG.bigBuffer) merged.maxBufferLength = CFG.bufferTarget;
-                return new Orig(merged);
-            }
-            HookedHls.prototype = Orig.prototype;
-            try { HookedHls.isSupported = Orig.isSupported ? Orig.isSupported.bind(Orig) : Orig.isSupported; } catch (e) { }
-            for (const k of Object.getOwnPropertyNames(Orig)) { if (!(k in HookedHls)) { try { HookedHls[k] = Orig[k]; } catch (e) { } } }
-            HookedHls.__vaPatched = true;
-            return HookedHls;
+    class LoggerClass {
+        constructor(bus) {
+            this.bus = bus;
         }
-
-        function installPlayerHooks() {
-            let tries = 0;
-            const tick = () => {
-                if (window.Hls && !window.Hls.__vaPatched) { try { window.Hls = wrapHls(window.Hls); } catch (e) { } }
-                if (window.dashjs && window.dashjs.MediaPlayer && !window.dashjs.__vaPatched) {
-                    try {
-                        // 包装工厂函数本身，不能在临时实例上改 create
-                        const OrigMP = window.dashjs.MediaPlayer;
-                        function WrappedMP() {
-                            const inst = OrigMP.apply(this, arguments);
-                            const origCreate = inst.create;
-                            inst.create = function () {
-                                const p = origCreate.apply(this, arguments);
-                                try { p.updateSettings({ streaming: { buffer: { stableBufferTime: 30, bufferTimeAtTopQuality: 60, bufferToKeep: 30 }, abr: { autoSwitchBitrate: { video: true } } } }); } catch (e) { }
-                                return p;
-                            };
-                            return inst;
-                        }
-                        WrappedMP.prototype = OrigMP.prototype;
-                        for (const k of Object.getOwnPropertyNames(OrigMP)) { try { WrappedMP[k] = OrigMP[k]; } catch (e) { } }
-                        window.dashjs.MediaPlayer = WrappedMP;
-                        window.dashjs.__vaPatched = true;
-                    } catch (e) { }
-                }
-                if (window.shaka && window.shaka.Player && !window.shaka.__vaPatched) {
-                    try {
-                        const OrigP = window.shaka.Player;
-                        function WrappedP(video, dependency) {
-                            const p = new OrigP(video, dependency);
-                            try { p.configure({ streaming: { rebufferingGoal: 2, bufferingGoal: 60, bufferBehind: 90 } }); } catch (e) { }
-                            return p;
-                        }
-                        WrappedP.prototype = OrigP.prototype;
-                        for (const k of Object.getOwnPropertyNames(OrigP)) { try { WrappedP[k] = OrigP[k]; } catch (e) { } }
-                        window.shaka.Player = WrappedP;
-                        window.shaka.__vaPatched = true;
-                    } catch (e) { }
-                }
-                tries++;
-                if (tries < 200) setTimeout(tick, 100); // 20s 持续探测
+        _minLevel() {
+            const lv = ConfigManager.get('logLevel') || 'info';
+            return LOG_LEVELS[lv] || LOG_LEVELS.info;
+        }
+        log(level, scope, message, data) {
+            const num = LOG_LEVELS[level] || LOG_LEVELS.info;
+            if (num < this._minLevel()) return;
+            const entry = {
+                ts: NOW(),
+                level: level,
+                scope: scope,
+                message: message,
+                data: data === undefined ? null : data,
+                remote: false
             };
-            tick();
+            this.bus.emit('LOG_EMIT', entry);
+        }
+        debug(scope, msg, data) { this.log('debug', scope, msg, data); }
+        info(scope, msg, data) { this.log('info', scope, msg, data); }
+        warn(scope, msg, data) { this.log('warn', scope, msg, data); }
+        error(scope, msg, data) { this.log('error', scope, msg, data); }
+    }
+
+    const Logger = new LoggerClass(Bus);
+
+    /* ═══════════════════════════════════════════════════════════
+       StateStore 状态聚合器
+    ═══════════════════════════════════════════════════════════ */
+
+    class StateStoreClass {
+        constructor(bus) {
+            this.bus = bus;
+            this.local = null;
+            this.remote = new Map();
+            this._last = 0;
+
+            this.bus.on('LOCAL_STATE', (state) => {
+                this.local = state;
+                this._aggregate();
+            });
+
+            this.bus.on('REMOTE_STATE', (payload) => {
+                if (!payload || !payload.state) return;
+                const id = payload.iframeId || 'unknown';
+                this.remote.set(id, { state: payload.state, ts: NOW() });
+                this._aggregate();
+            });
+
+            this.bus.on('STATE_TICK', () => this._aggregate(true));
         }
 
-        function hotPatchHls(hls) {
-            if (!hls || !hls.config) return;
+        _idle() {
+            return {
+                status: '未检测到视频',
+                statusKey: 'idle',
+                playerType: 'unknown',
+                playerLabel: '-',
+                buffer: 0,
+                recoveries: 0,
+                videos: 0,
+                currentTime: 0,
+                duration: 0,
+                videoWidth: 0,
+                videoHeight: 0,
+                readyState: 0,
+                networkType: getNetworkType(),
+                quality: { level: -1, total: 0, bandwidth: 0, height: 0 },
+                canChangeQuality: false,
+                bandwidth: 0,
+                seeking: false,
+                stallLevel: 0
+            };
+        }
+
+        _aggregate(force) {
+            const now = NOW();
+            if (!force && now - this._last < 500) return;
+            this._last = now;
+
+            const cutoff = now - 15000;
+            let remoteVideos = 0;
+            let remoteRecoveries = 0;
+            let latest = null;
+            let latestTs = 0;
+
+            this.remote.forEach((entry, key) => {
+                if (!entry || entry.ts < cutoff) {
+                    this.remote.delete(key);
+                    return;
+                }
+                const st = entry.state || {};
+                remoteVideos += st.videos || 0;
+                remoteRecoveries += st.recoveries || 0;
+                if (entry.ts >= latestTs) {
+                    latestTs = entry.ts;
+                    latest = st;
+                }
+            });
+
+            const local = this.local || this._idle();
+            const videos = (local.videos || 0) + remoteVideos;
+            const recoveries = (local.recoveries || 0) + remoteRecoveries;
+
+            let base;
+            if (local.videos > 0) base = local;
+            else if (latest) base = latest;
+            else base = this._idle();
+
+            const agg = Object.assign({}, base, { videos: videos, recoveries: recoveries });
+            this.bus.emit('STATE_AGGREGATED', agg);
+        }
+    }
+
+    const StateStore = new StateStoreClass(Bus);
+
+    /* ═══════════════════════════════════════════════════════════
+       CrossWindowBridge 跨窗口通信桥
+    ═══════════════════════════════════════════════════════════ */
+
+    class CrossWindowBridge {
+        constructor(bus) {
+            this.bus = bus;
+            this._initListener();
+            this._install();
+        }
+
+        _postTop(type, payload) {
+            if (!IS_TOP && PW.top) {
+                try {
+                    PW.top.postMessage(Object.assign({
+                        __va_msg: true,
+                        type: type,
+                        iframeId: IFRAME_ID
+                    }, payload || {}), '*');
+                } catch (e) { }
+            }
+        }
+
+        broadcastToFrames(type, payload) {
             try {
-                hls.config.maxBufferLength = CFG.bigBuffer ? VA_HLS_DEFAULTS.maxBufferLength : CFG.bufferTarget;
-                hls.config.maxMaxBufferLength = VA_HLS_DEFAULTS.maxMaxBufferLength;
-                hls.config.maxBufferHole = VA_HLS_DEFAULTS.maxBufferHole;
-                hls.config.startFragPrefetch = true;
-                hls.config.backBufferLength = VA_HLS_DEFAULTS.backBufferLength;
-                hls.config.lowLatencyMode = false;
+                const msg = Object.assign({ __va_msg: true, type: type }, payload || {});
+                HOOKED_DOCS.forEach(function (doc) {
+                    try {
+                        if (!doc || typeof doc.querySelectorAll !== 'function') return;
+                        const iframes = doc.querySelectorAll('iframe');
+                        iframes.forEach(function (iframe) {
+                            try {
+                                if (iframe.contentWindow) iframe.contentWindow.postMessage(msg, '*');
+                            } catch (e) { }
+                        });
+                    } catch (e) { }
+                });
             } catch (e) { }
         }
 
-        // ============ IO Hook ============
-        function installIOHook() {
-            if (!window.IntersectionObserver || window.IntersectionObserver.__vaPatched) return;
-            const Orig = window.IntersectionObserver;
-            function HookedIO(cb, opts) { const inst = new Orig(cb, opts); try { IORegistry.track(inst, cb); } catch (e) { } return inst; }
-            HookedIO.prototype = Orig.prototype;
-            for (const k of Object.getOwnPropertyNames(Orig)) { try { HookedIO[k] = Orig[k]; } catch (e) { } }
-            HookedIO.__vaPatched = true;
-            window.IntersectionObserver = HookedIO;
+        _initListener() {
+            PW.addEventListener('message', (e) => {
+                const d = e.data;
+                if (!d || typeof d !== 'object' || !d.__va_msg) return;
+                this._handle(d, e.source);
+            });
         }
 
-        // ============ Fetch 链式包装（兼容屏蔽器 __proBlockerHooked） ============
-        function installFetchPriority() {
-            const base = window.fetch;
-            if (!base || base.__vaPatched) return;
-            const wrapped = function (input, init) {
-                try { const url = typeof input === 'string' ? input : (input && input.url) || ''; if (isVideoResource(url) && init) { init.priority = 'high'; if (!init.credentials) init.credentials = 'include'; } } catch (e) { }
-                return base.apply(this, arguments);
-            };
-            wrapped.__vaPatched = true;
-            window.fetch = wrapped;
-        }
-
-        // ============ PlayerTypeDetector ============
-        const PlayerTypeDetector = {
-            detect(video) {
-                if (video.hls || video._hls) { PlayerRegistry.set(video, { type: 'hls', player: video.hls || video._hls }); return 'hls'; }
-                if (video.dashjs) { PlayerRegistry.set(video, { type: 'dash', player: video.dashjs }); return 'dash'; }
-                for (const k of ['hls', '_hls', '__hls', 'hlsPlayer', 'player']) {
-                    const v = video[k];
-                    if (v && (v.config || v.startLoad || v.attachMedia)) { PlayerRegistry.set(video, { type: 'hls', player: v }); return 'hls'; }
-                }
-                if (window.shaka && video.shakaPlayer) { PlayerRegistry.set(video, { type: 'shaka', player: video.shakaPlayer }); return 'shaka'; }
-                // Video.js / JW Player 识别（底层多为 HLS.js，仅标记类型用于显示）
-                if (video.id && window.videojs && window.videojs.getPlayer) { try { if (window.videojs.getPlayer(video.id)) { PlayerRegistry.set(video, { type: 'videojs', player: null }); return 'videojs'; } } catch (e) { } }
-                if (window.jwplayer) { try { const p = window.jwplayer(video.id || undefined); if (p && p.getPlaylist) { PlayerRegistry.set(video, { type: 'jw', player: null }); return 'jw'; } } catch (e) { } }
-                const src = video.currentSrc || video.src || '';
-                if (src.indexOf('blob:') === 0) { PlayerRegistry.set(video, { type: 'mse', player: null }); return 'mse'; }
-                if (src) { PlayerRegistry.set(video, { type: 'native', player: null }); return 'native'; }
-                return 'unknown';
-            }
-        };
-
-        // ============ PreloadAccelerator ============
-        const PreloadAccelerator = {
-            _connected: new Set(),
-            apply(video, type) {
-                try {
-                    video.preload = 'auto';
-                    const lazy = video.getAttribute('data-src') || video.getAttribute('data-video') || video.getAttribute('data-lazy-src');
-                    if (lazy && !video.src) video.src = lazy;
-                    video.removeAttribute('data-src'); video.removeAttribute('data-lazy-src');
-                } catch (e) { }
-                const src = video.currentSrc || video.src || '';
-                if (src) { try { this._preconnect(src); } catch (e) { } }
-                const info = PlayerRegistry.get(video);
-                if ((type === 'hls') || (info && info.type === 'hls')) { if (info && info.player) hotPatchHls(info.player); }
-                else if (info && info.type === 'dash' && info.player) { try { info.player.updateSettings({ streaming: { buffer: { stableBufferTime: 30, bufferTimeAtTopQuality: 60, bufferToKeep: 30 } } }); } catch (e) { } }
-                else if (info && info.type === 'shaka' && info.player) { try { info.player.configure({ streaming: { rebufferingGoal: 2, bufferingGoal: 60, bufferBehind: 90 } }); } catch (e) { } }
-            },
-            _preconnect(url) {
-                try {
-                    const u = new URL(url, location.href);
-                    if (u.origin === location.origin || this._connected.has(u.origin)) return;
-                    this._connected.add(u.origin);
-                    const link = document.createElement('link');
-                    link.rel = 'preconnect'; link.href = u.origin; link.crossOrigin = 'anonymous';
-                    (document.head || document.documentElement).appendChild(link);
-                } catch (e) { }
-            }
-        };
-
-        // ============ BufferManager ============
-        class BufferManager {
-            constructor(session) { this.session = session; this._iv = null; this._onTimeUpdate = null; }
-            watch() {
-                const v = this.session.video;
-                const check = () => this._check();
-                this._onTimeUpdate = throttle(check, 1000);
-                v.addEventListener('timeupdate', this._onTimeUpdate);
-                this._iv = setInterval(check, 3000);
-            }
-            _check() {
-                const v = this.session.video;
-                if (!v.buffered.length || v.paused || v.ended) { this.session.reportBuffer(0); return; }
-                const ahead = this.bufferAhead(v);
-                this.session.reportBuffer(ahead);
-                if (ahead < 2) this.session.emergencyLoad();
-                else if (ahead < 8) this.session.boostLoad();
-                if (this.backBuffer(v) > 120) this.session.trimBackBuffer(30);
-            }
-            bufferAhead(video) {
-                for (let i = 0; i < video.buffered.length; i++) { if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.buffered.end(i) - video.currentTime; }
-                return 0;
-            }
-            backBuffer(video) {
-                try { for (let i = 0; i < video.buffered.length; i++) { if (video.currentTime >= video.buffered.start(i) && video.currentTime <= video.buffered.end(i)) return video.currentTime - video.buffered.start(i); } } catch (e) { }
-                return 0;
-            }
-            stop() {
-                if (this._iv) { clearInterval(this._iv); this._iv = null; }
-                if (this._onTimeUpdate) { try { this.session.video.removeEventListener('timeupdate', this._onTimeUpdate); } catch (e) { } this._onTimeUpdate = null; }
-            }
-        }
-
-        // ============ SeekGuard ============
-        class SeekGuard {
-            constructor(session) {
-                this.session = session;
-                this.retry = 0; this.t = null; this.seekTarget = 0; this._wasPlaying = false;
-                const v = session.video;
-                this._onSeeking = () => { if (!CFG.seekGuard) return; this.retry = 0; this._wasPlaying = !v.paused; this.seekTarget = v.currentTime; this.arm(); };
-                this._onSeeked = () => { setTimeout(() => { if (v.ended || !v.paused) return; if (this._wasPlaying && v.readyState >= 3) { try { v.play().catch(() => { }); } catch (e) { } } }, 500); };
-                this._onCanPlay = () => this.disarm();
-                this._onPlaying = () => this.disarm();
-                v.addEventListener('seeking', this._onSeeking);
-                v.addEventListener('seeked', this._onSeeked);
-                v.addEventListener('canplay', this._onCanPlay);
-                v.addEventListener('playing', this._onPlaying);
-            }
-            arm() { clearTimeout(this.t); this.t = setTimeout(() => this.escalate(), CFG.seekTimeout || 8000); }
-            disarm() { clearTimeout(this.t); this.retry = 0; }
-            escalate() {
-                if (!CFG.seekGuard) return;
-                const v = this.session.video;
-                if (v.readyState >= 3 && !v.paused) { this.disarm(); return; }
-                this.retry++;
-                if (this.retry === 1) this.session.softRecover();
-                else if (this.retry === 2) this.session.engineRecover();
-                else if (this.retry === 3) this.session.rebuildVideoElement();
-                else { this.session.notify('自动恢复失败，请点击面板"强制重载"'); return; }
-                this.arm();
-            }
-            destroy() {
-                clearTimeout(this.t);
-                const v = this.session.video;
-                v.removeEventListener('seeking', this._onSeeking); v.removeEventListener('seeked', this._onSeeked);
-                v.removeEventListener('canplay', this._onCanPlay); v.removeEventListener('playing', this._onPlaying);
-            }
-        }
-
-        // ============ StallRecoveryWatchdog（含丢帧率/内存监控） ============
-        class StallRecoveryWatchdog {
-            constructor(session) {
-                this.session = session;
-                this.lastTime = -1; this.stallStart = 0; this.waitingSince = 0;
-                this.stallCount = 0; this._lastStallTime = 0; this._readyLowSince = 0; this._iv = null;
-                this._droppedFrames = 0; this._totalFrames = 0; this._lastFrameCheck = 0;
-                this._prevDropped = 0; this._prevTotal = 0;
-                const v = session.video;
-                this._onWaiting = () => { this.waitingSince = Date.now(); };
-                this._onPlaying = () => { this.waitingSince = 0; this.stallStart = 0; };
-                v.addEventListener('waiting', this._onWaiting);
-                v.addEventListener('playing', this._onPlaying);
-                this._iv = setInterval(() => this._check(), 1000);
-            }
-            _check() {
-                const v = this.session.video;
-                if (v.paused || v.ended) { this.lastTime = v.currentTime; return; }
-                const t = v.currentTime;
-                if (t === this.lastTime) { if (!this.stallStart) this.stallStart = Date.now(); if (Date.now() - this.stallStart >= 5000) this._recover(); }
-                else { this.stallStart = 0; this.lastTime = t; }
-                if (this.waitingSince && Date.now() - this.waitingSince >= 5000) { this.waitingSince = 0; this._recover(); }
-                if (v.readyState <= 2) { if (!this._readyLowSince) this._readyLowSince = Date.now(); else if (Date.now() - this._readyLowSince >= 5000) { this._readyLowSince = 0; this._recover(); } }
-                else { this._readyLowSince = 0; }
-                // 丢帧率监控：累计 5s，丢帧率 >10% 提示并降质
-                this._checkDroppedFrames();
-            }
-            _checkDroppedFrames() {
-                const v = this.session.video;
-                if (typeof v.getVideoPlaybackQuality !== 'function') return;
-                try {
-                    const q = v.getVideoPlaybackQuality();
-                    const now = Date.now();
-                    // getVideoPlaybackQuality 返回累计值，需计算增量
-                    const dDropped = Math.max(0, (q.droppedVideoFrames || 0) - this._prevDropped);
-                    const dTotal = Math.max(0, (q.totalVideoFrames || 0) - this._prevTotal);
-                    this._prevDropped = q.droppedVideoFrames || 0;
-                    this._prevTotal = q.totalVideoFrames || 0;
-                    this._droppedFrames += dDropped;
-                    this._totalFrames += dTotal;
-                    if (now - this._lastFrameCheck >= 5000) {
-                        if (this._totalFrames > 0 && this._droppedFrames / this._totalFrames > 0.1) {
-                            this.session.notify('丢帧率过高，自动降一档画质');
-                            this.session.downgradeQuality();
-                        }
-                        this._droppedFrames = 0; this._totalFrames = 0; this._lastFrameCheck = now;
-                    }
-                } catch (e) { }
-            }
-            _recover() {
-                this.stallStart = 0;
-                const now = Date.now();
-                if (now - this._lastStallTime < 60000) this.stallCount++; else this.stallCount = 1;
-                this._lastStallTime = now;
-                if (this.stallCount >= 3) { this.session.downgradeQuality(); this.stallCount = 0; }
-                this.session.engineRecover();
-            }
-            destroy() {
-                clearInterval(this._iv);
-                const v = this.session.video;
-                v.removeEventListener('waiting', this._onWaiting); v.removeEventListener('playing', this._onPlaying);
-            }
-        }
-
-        // ============ AdGateBypass（含误伤提示） ============
-        class AdGateBypass {
-            constructor(session) { this.session = session; this._iv = null; this._warnedBlocked = false; }
-            start() { if (!CFG.adGateBypass) return; this._iv = setInterval(() => this._poll(), 2000); }
-            _poll() {
-                const v = this.session.video; if (!v) return;
-                const container = this._findContainer(v); if (!container) return;
-                if (this._isAdState(container, v)) { this.sweep(container); this.session.adSkipped(); return; }
-                // 误伤检测：容器存在但 video 无 src/currentSrc 且非广告态 → 视频源可能被屏蔽器拦截
-                if (!this._warnedBlocked) {
-                    const src = v.currentSrc || v.src || '';
-                    if (!src && v.readyState === 0 && v.paused) {
-                        // 容器存在 5s 以上才提示，避免初始化抖动
-                        if (!this._noSrcSince) this._noSrcSince = Date.now();
-                        else if (Date.now() - this._noSrcSince >= 5000) {
-                            this.session.notify('视频源域名疑似被广告过滤拦截，请检查屏蔽器域名黑名单');
-                            this._warnedBlocked = true;
-                        }
-                    } else { this._noSrcSince = 0; }
-                }
-            }
-            _findContainer(video) {
-                let el = video.parentElement, best = null;
-                while (el && el !== document.body) { const cls = (typeof el.className === 'string') ? el.className : ''; if (/player|video|media|preroll|ad-/i.test(cls)) best = el; el = el.parentElement; }
-                return best || video.parentElement;
-            }
-            _isAdState(container, video) {
-                if (!container) return false;
-                const cls = (typeof container.className === 'string') ? container.className : '';
-                if (/ad-loading|ad-playing|preroll|showing-ad|vast-/i.test(cls)) return true;
-                try {
-                    const nodes = container.querySelectorAll('*');
-                    for (let i = 0; i < nodes.length && i < 60; i++) { const t = (nodes[i].textContent || '').trim(); if (t && /\d+\s*(s|秒)/.test(t) && t.length < 12) return true; }
-                } catch (e) { }
-                try {
-                    const btns = container.querySelectorAll('button,[role="button"],[class*="skip"],[class*="ad-"]');
-                    for (let i = 0; i < btns.length && i < 80; i++) { const t = (btns[i].textContent || '').trim(); if (t && t.length < 20 && /跳过|skip\s*ad|关闭广告|skip[\s-]?ad/i.test(t)) return true; }
-                } catch (e) { }
-                return false;
-            }
-            sweep(container) {
-                try {
-                    container.classList.remove('ad-loading', 'ad-playing', 'preroll', 'showing-ad');
-                    container.querySelectorAll('[class*="preroll"],[class*="countdown"],[class*="vast-"]').forEach(el => { if (el.querySelector && el.querySelector('video')) return; el.remove(); });
-                    const skip = Array.from(container.querySelectorAll('button,[role="button"],[class*="skip"],[class*="ad-"]')).find(el => { const t = (el.textContent || '').trim(); return t.length < 20 && /跳过|skip\s*ad|关闭广告|skip[\s-]?ad/i.test(t); });
-                    if (skip) { try { skip.click(); } catch (e) { } }
-                    const video = container.querySelector('video');
-                    if (video) { try { video.play().catch(() => { }); } catch (e) { } }
-                    container.dispatchEvent(new Event('adCompleted', { bubbles: true }));
-                    container.dispatchEvent(new Event('ads-ad-ended', { bubbles: true }));
-                } catch (e) { }
-            }
-            stop() { if (this._iv) { clearInterval(this._iv); this._iv = null; } }
-        }
-
-        // ============ LazyInitUnlocker ============
-        const LazyInitUnlocker = {
-            forceInit(container) {
-                try { IORegistry.forEach((inst, cb) => { try { cb([{ target: container, isIntersecting: true, intersectionRatio: 1, boundingClientRect: container.getBoundingClientRect() }], inst); } catch (e) { } }); } catch (e) { }
-                try { window.dispatchEvent(new Event('scroll')); } catch (e) { }
-                try { window.dispatchEvent(new Event('resize')); } catch (e) { }
-            }
-        };
-
-        // ============================================================
-        // 【播放器接管层】
-        // ============================================================
-        const PlayerSkin = {
-            css: `
-                :host { all: initial; }
-                * { box-sizing: border-box; }
-                .va-wrap { position: relative; width: 100%; height: 100%; overflow: hidden; background: #000; }
-                .va-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
-                .va-wrap.va-portrait video { transform: rotate(90deg); transform-origin: center center; object-fit: contain; }
-                .va-gesture { position: absolute; inset: 0; display: flex; z-index: 5; }
-                .va-zone { flex: 1; }
-                .va-center-fb { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 9; padding: 14px 22px; border-radius: 14px; background: rgba(0,0,0,0.55); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: #fff; font-size: 22px; font-weight: 600; opacity: 0; transition: opacity .25s; pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
-                .va-center-fb.show { opacity: 1; }
-                .va-top-bar { position: absolute; top: 0; left: 0; right: 0; z-index: 8; display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: linear-gradient(180deg, rgba(0,0,0,0.5), transparent); color: #fff; font-size: 13px; transition: opacity .3s; gap: 6px; }
-                .va-top-bar.va-hidden { opacity: 0; pointer-events: none; }
-                .va-top-bar button { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2); color: #fff; border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; flex: none; }
-                .va-top-bar button:hover { background: rgba(255,255,255,0.2); }
-                .va-loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 7; width: 54px; height: 54px; border: 4px solid rgba(255,255,255,0.2); border-top-color: #4aa3ff; border-radius: 50%; animation: va-spin 0.9s linear infinite; }
-                @keyframes va-spin { to { transform: translate(-50%,-50%) rotate(360deg); } }
-                .va-ctrl { position: absolute; bottom: 0; left: 0; right: 0; z-index: 8; padding: 10px 14px; background: linear-gradient(0deg, rgba(0,0,0,0.6), transparent); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: #fff; transition: opacity .3s, transform .3s; }
-                .va-ctrl.va-hidden { opacity: 0; transform: translateY(8px); pointer-events: none; }
-                .va-bar-bg { background: rgba(25,25,30,0.72); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.16); border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); padding: 8px 12px; display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
-                .va-btn { background: none; border: none; color: #fff; cursor: pointer; font-size: 16px; padding: 4px 6px; border-radius: 6px; flex: none; display: flex; align-items: center; justify-content: center; min-width: 28px; min-height: 28px; }
-                .va-btn:hover { background: rgba(255,255,255,0.18); }
-                .va-time { font-size: 12px; color: #ddd; font-variant-numeric: tabular-nums; white-space: nowrap; }
-                .va-progress { position: relative; flex: 1; height: 4px; background: rgba(255,255,255,0.18); border-radius: 2px; cursor: pointer; min-width: 80px; }
-                .va-progress:hover { height: 8px; }
-                .va-buffered { position: absolute; left: 0; top: 0; height: 100%; background: rgba(255,255,255,0.25); border-radius: 2px; }
-                .va-played { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, #007AFF, #4aa3ff); border-radius: 2px; }
-                .va-thumb { position: absolute; top: 50%; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 0 8px rgba(74,163,255,0.8); transform: translate(-50%,-50%); pointer-events: none; }
-                .va-hover-tip { position: absolute; bottom: 16px; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: #fff; font-size: 11px; padding: 3px 6px; border-radius: 4px; pointer-events: none; opacity: 0; transition: opacity .15s; white-space: nowrap; }
-                .va-hover-tip.show { opacity: 1; }
-                .va-vol-wrap { display: flex; align-items: center; gap: 4px; }
-                .va-vol { width: 60px; height: 4px; background: rgba(255,255,255,0.2); border-radius: 2px; cursor: pointer; }
-                .va-vol-fill { height: 100%; background: #fff; border-radius: 2px; }
-                .va-rate-menu { position: absolute; bottom: 48px; right: 14px; z-index: 9; background: rgba(25,25,30,0.92); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.16); border-radius: 10px; padding: 6px; display: none; min-width: 90px; }
-                .va-rate-menu.show { display: block; }
-                .va-rate-menu div { padding: 6px 12px; color: #fff; font-size: 13px; cursor: pointer; border-radius: 6px; text-align: center; }
-                .va-rate-menu div:hover { background: rgba(255,255,255,0.15); }
-                .va-rate-menu div.active { background: rgba(74,163,255,0.5); }
-                .va-lock { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 15; font-size: 32px; color: #fff; opacity: 0; transition: opacity .3s; pointer-events: none; text-shadow: 0 2px 8px rgba(0,0,0,0.6); }
-                .va-lock.show { opacity: 0.9; }
-                .va-wrap.va-locked .va-gesture, .va-wrap.va-locked .va-ctrl, .va-wrap.va-locked .va-top-bar { display: none; }
-                .va-wrap.va-locked .va-lock-btn { display: flex; }
-                .va-lock-btn { position: absolute; top: 14px; left: 14px; z-index: 16; display: none; }
-                @media (max-width: 600px) { .va-time { font-size: 11px; } .va-btn { font-size: 14px; min-width: 24px; } .va-vol { width: 44px; } }
-            `
-        };
-
-        // SpeedController
-        class SpeedController {
-            constructor(session) {
-                this.session = session; this.video = session.video;
-                this.RATES = (CFG.rates && CFG.rates.length) ? CFG.rates.slice() : [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
-                // 站点记忆 > 全局默认
-                let initRate = CFG.defaultRate || 1;
-                if (CFG.speedMemory) { try { const site = ConfigStore_getSiteRate(HOST); if (site) initRate = site; } catch (e) { } }
-                this.rate = initRate;
-                this._iv = null;
-                try { this.video.playbackRate = this.rate; this.video.preservesPitch = true; } catch (e) { }
-                this._iv = setInterval(() => { try { if (!this.video.paused && Math.abs(this.video.playbackRate - this.rate) > 0.01) this.video.playbackRate = this.rate; } catch (e) { } }, 2000);
-            }
-            set(rate) {
-                this.rate = rate;
-                try { this.video.playbackRate = rate; this.video.preservesPitch = true; } catch (e) { }
-                if (CFG.speedMemory) { try { ConfigStore_saveSiteRate(HOST, rate); } catch (e) { } }
-                Bridge.send('rateChange', { rate });
-            }
-            step(delta) {
-                let idx = this.RATES.indexOf(this.rate);
-                if (idx < 0) idx = this.RATES.indexOf(1);
-                if (idx < 0) idx = 0;
-                idx = Math.max(0, Math.min(this.RATES.length - 1, idx + delta));
-                this.set(this.RATES[idx]);
-            }
-            destroy() { if (this._iv) clearInterval(this._iv); }
-        }
-
-        // RotationController
-        class RotationController {
-            constructor(session) { this.session = session; this.video = session.video; this.portrait = false; }
-            toggle() {
-                if (!CFG.rotation) return;
-                this.portrait = !this.portrait;
-                const wrap = this.session.takeover.wrap;
-                if (!wrap) return;
-                if (this.portrait) {
-                    const rect = wrap.getBoundingClientRect();
-                    const W = rect.width, H = rect.height;
-                    const v = this.video;
-                    v.style.transform = 'rotate(90deg)'; v.style.transformOrigin = 'center center';
-                    v.style.width = H + 'px'; v.style.height = W + 'px'; v.style.position = 'absolute';
-                    v.style.left = (W - H) / 2 + 'px'; v.style.top = (H - W) / 2 + 'px';
-                    wrap.classList.add('va-portrait');
-                } else {
-                    const v = this.video;
-                    v.style.transform = ''; v.style.width = ''; v.style.height = ''; v.style.position = ''; v.style.left = ''; v.style.top = '';
-                    wrap.classList.remove('va-portrait');
-                }
-            }
-        }
-
-        // CustomPlayerControls
-        class CustomPlayerControls {
-            constructor(session) {
-                this.session = session; this.video = session.video;
-                this.speed = new SpeedController(session);
-                this.rotation = new RotationController(session);
-                this._hideTimer = null; this._rateMenuOpen = false; this._locked = false;
-                this._savedRate = null;
-                this._build();
-                this._bind();
-                this._autoHide();
-                this._applyLiveState();   // _prog 在 _bind 中赋值，直播态需在此之后
-            }
-            _build() {
-                const root = this.session.takeover.root;   // closed Shadow DOM 必须用缓存 root
-                const wrap = document.createElement('div'); wrap.className = 'va-wrap';
-                const video = this.video;
-                wrap.appendChild(video);
-                this._wrap = wrap;
-
-                const gesture = document.createElement('div'); gesture.className = 'va-gesture';
-                const zoneL = document.createElement('div'); zoneL.className = 'va-zone';
-                const zoneR = document.createElement('div'); zoneR.className = 'va-zone';
-                gesture.appendChild(zoneL); gesture.appendChild(zoneR);
-                this._zoneL = zoneL; this._zoneR = zoneR;
-
-                const centerFb = document.createElement('div'); centerFb.className = 'va-center-fb'; this._centerFb = centerFb;
-
-                const topBar = document.createElement('div'); topBar.className = 'va-top-bar va-hidden';
-                topBar.innerHTML = `<span class="va-title">视频加速播放器</span><span><button data-act="extract">提取播放</button><button data-act="restore">恢复原播放器</button><button data-act="pip">画中画</button><button data-act="shot">截图</button></span>`;
-                this._topBar = topBar;
-
-                const loading = document.createElement('div'); loading.className = 'va-loading'; loading.style.display = 'none'; this._loading = loading;
-                const lock = document.createElement('div'); lock.className = 'va-lock'; lock.textContent = '🔒'; this._lock = lock;
-                const lockBtn = document.createElement('button'); lockBtn.className = 'va-btn va-lock-btn'; lockBtn.textContent = '🔓'; lockBtn.dataset.act = 'unlock'; this._lockBtn = lockBtn;
-
-                const ctrl = document.createElement('div'); ctrl.className = 'va-ctrl va-hidden';
-                ctrl.innerHTML = `
-                    <div class="va-bar-bg">
-                        <button class="va-btn" data-act="play">▶</button>
-                        <button class="va-btn" data-act="back">⏪</button>
-                        <button class="va-btn" data-act="fwd">⏩</button>
-                        <span class="va-time va-cur">0:00</span>
-                        <div class="va-progress"><div class="va-buffered"></div><div class="va-played"></div><div class="va-thumb"></div><div class="va-hover-tip"></div></div>
-                        <span class="va-time va-dur">0:00</span>
-                        <div class="va-vol-wrap"><button class="va-btn" data-act="mute">🔊</button><div class="va-vol"><div class="va-vol-fill"></div></div></div>
-                        <button class="va-btn" data-act="rate">1.0x</button>
-                        <button class="va-btn" data-act="rotate">🔄</button>
-                        <button class="va-btn" data-act="lock">🔒</button>
-                        <button class="va-btn" data-act="fs">⛶</button>
-                    </div>
-                `;
-                this._ctrl = ctrl;
-
-                const rateMenu = document.createElement('div'); rateMenu.className = 'va-rate-menu';
-                rateMenu.innerHTML = this.speed.RATES.map(r => `<div data-rate="${r}">${r}x</div>`).join('');
-                this._rateMenu = rateMenu;
-
-                wrap.appendChild(gesture); wrap.appendChild(centerFb); wrap.appendChild(topBar);
-                wrap.appendChild(loading); wrap.appendChild(lock); wrap.appendChild(lockBtn);
-                wrap.appendChild(ctrl); wrap.appendChild(rateMenu);
-                root.appendChild(wrap);
-
-                this.session.takeover.wrap = wrap;
-                this._onProgress();
-                this._updateVolFill(this.video.volume);
-                this._syncMuteBtn();
-            }
-            _bind() {
-                const v = this.video;
-                this._vHandlers = {
-                    play: () => this._setPlayBtn('⏸'),
-                    pause: () => this._setPlayBtn('▶'),
-                    timeupdate: () => this._onProgress(),
-                    durationchange: () => { this._onProgress(); this._applyLiveState(); },
-                    progress: () => this._onProgress(),
-                    waiting: () => { if (this._loading) this._loading.style.display = ''; },
-                    playing: () => { if (this._loading) this._loading.style.display = 'none'; },
-                    canplay: () => { if (this._loading) this._loading.style.display = 'none'; },
-                    ratechange: () => { const b = this._ctrl.querySelector('[data-act=rate]'); if (b) b.textContent = v.playbackRate.toFixed(2).replace(/0$/, '') + 'x'; }
-                };
-                for (const [k, fn] of Object.entries(this._vHandlers)) v.addEventListener(k, fn);
-
-                this._ctrl.addEventListener('click', (e) => this._onCtrlClick(e));
-                this._lockBtn.addEventListener('click', () => this._toggleLock());
-                this._rateMenu.addEventListener('click', (e) => {
-                    const t = e.target.closest('[data-rate]'); if (!t) return;
-                    this.speed.set(parseFloat(t.dataset.rate));
-                    this._rateMenu.classList.remove('show'); this._rateMenuOpen = false;
-                    this._feedback(this.speed.rate + 'x');
-                });
-                this._topBar.addEventListener('click', (e) => {
-                    const t = e.target.closest('[data-act]'); if (!t) return;
-                    const act = t.dataset.act;
-                    if (act === 'restore') this.session.takeover.disable();
-                    else if (act === 'pip') this._pip();
-                    else if (act === 'shot') this._screenshot();
-                    else if (act === 'extract') this.session.takeover.openExtract();
-                });
-
-                // 进度条拖拽（handler 保存到实例以便 destroy 移除）
-                const prog = this._ctrl.querySelector('.va-progress');
-                this._prog = prog; this._tip = prog.querySelector('.va-hover-tip');
-                let dragging = false;
-                const seekTo = (clientX) => { const rect = prog.getBoundingClientRect(); let ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)); if (isFinite(v.duration) && v.duration > 0) v.currentTime = ratio * v.duration; };
-                this._onProgDown = (e) => { dragging = true; seekTo(e.clientX); e.preventDefault(); };
-                this._onProgMove = (e) => { if (dragging) seekTo(e.clientX); };
-                this._onUp = () => { dragging = false; volDrag = false; };
-                this._onProgHover = (e) => {
-                    if (dragging) return;
-                    const rect = prog.getBoundingClientRect();
-                    let ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                    if (isFinite(v.duration) && v.duration > 0) { this._tip.textContent = this._fmt(ratio * v.duration); this._tip.style.left = (ratio * 100) + '%'; this._tip.classList.add('show'); }
-                };
-                this._onProgLeave = () => this._tip.classList.remove('show');
-                prog.addEventListener('mousedown', this._onProgDown);
-                window.addEventListener('mousemove', this._onProgMove);
-                window.addEventListener('mouseup', this._onUp);
-                prog.addEventListener('mousemove', this._onProgHover);
-                prog.addEventListener('mouseleave', this._onProgLeave);
-
-                // 音量
-                const vol = this._ctrl.querySelector('.va-vol');
-                let volDrag = false;
-                const setVol = (clientX) => { const rect = vol.getBoundingClientRect(); let ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)); v.volume = ratio; v.muted = false; this._updateVolFill(ratio); if (CFG.volumeMemory) try { ConfigStore_saveSiteVolume(HOST, ratio, v.muted); } catch (e) { } };
-                this._onVolDown = (e) => { volDrag = true; setVol(e.clientX); e.preventDefault(); };
-                this._onVolMove = (e) => { if (volDrag) setVol(e.clientX); };
-                vol.addEventListener('mousedown', this._onVolDown);
-                window.addEventListener('mousemove', this._onVolMove);
-
-                // 手势
-                if (CFG.gestureEnabled) this._bindGesture();
-            }
-            _bindGesture() {
-                let longPressT = null;
-                const handle = (zone, delta) => {
-                    let lastTap = 0;
-                    zone.addEventListener('click', () => {
-                        if (this._locked) return;
-                        if (isLive(this.video)) { this._wake(); return; }
-                        const now = Date.now();
-                        if (now - lastTap < 300) { this.session.seekBy(delta); this._feedback(delta > 0 ? '⏩ +' + (CFG.seekStep || 10) + 's' : '⏪ -' + (CFG.seekStep || 10) + 's'); lastTap = 0; }
-                        else { lastTap = now; this._wake(); }
-                    });
-                };
-                handle(this._zoneL, -(CFG.seekStep || 10)); handle(this._zoneR, (CFG.seekStep || 10));
-                if (CFG.longPressEnabled) {
-                    const startLong = () => { if (this._locked) return; longPressT = setTimeout(() => { this._savedRate = this.speed.rate; this.speed.set(CFG.longPressRate || 3); this._feedback('⏩ ' + (CFG.longPressRate || 3) + 'x 快进中'); }, 1000); };
-                    const cancelLong = () => { if (longPressT) { clearTimeout(longPressT); longPressT = null; } if (this._savedRate) { this.speed.set(this._savedRate); this._savedRate = null; } };
-                    this._zoneR.addEventListener('mousedown', startLong); this._zoneR.addEventListener('mouseup', cancelLong);
-                    this._zoneR.addEventListener('touchstart', startLong); this._zoneR.addEventListener('touchend', cancelLong);
-                }
-            }
-            _onCtrlClick(e) {
-                const t = e.target.closest('[data-act]'); if (!t) return;
-                const act = t.dataset.act;
-                this._wake();
-                if (this._locked && act !== 'lock' && act !== 'unlock') return;
-                if (act === 'play') { if (this.video.paused) this.video.play().catch(() => { }); else this.video.pause(); }
-                else if (act === 'back') this.session.seekBy(-(CFG.seekStep || 10));
-                else if (act === 'fwd') this.session.seekBy(CFG.seekStep || 10);
-                else if (act === 'mute') { this.video.muted = !this.video.muted; this._syncMuteBtn(); if (CFG.volumeMemory) try { ConfigStore_saveSiteVolume(HOST, this.video.volume, this.video.muted); } catch (e) { } }
-                else if (act === 'rate') { this._rateMenu.classList.toggle('show'); this._rateMenuOpen = !this._rateMenuOpen; this._updateRateMenu(); }
-                else if (act === 'rotate') this.rotation.toggle();
-                else if (act === 'lock') this._toggleLock();
-                else if (act === 'fs') this._toggleFullscreen();
-            }
-            _toggleLock() {
-                if (!CFG.lock) return;
-                this._locked = !this._locked;
-                this._wrap.classList.toggle('va-locked', this._locked);
-                this._lock.classList.toggle('show', this._locked);
-                this._feedback(this._locked ? '已锁定' : '已解锁');
-            }
-            _pip() {
-                if (!CFG.pip) return;
-                try { if (document.pictureInPictureElement) document.exitPictureInPicture(); else if (this.video.requestPictureInPicture) this.video.requestPictureInPicture(); } catch (e) { }
-            }
-            _screenshot() {
-                if (!CFG.screenshot) return;
-                const v = this.video;
-                try {
-                    if (!v.videoWidth) { this.session.notify('视频未就绪，无法截图'); return; }
-                    const canvas = document.createElement('canvas');
-                    canvas.width = v.videoWidth; canvas.height = v.videoHeight;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-                    canvas.toBlob((blob) => {
-                        if (!blob) { this.session.notify('截图失败（视频可能受 DRM/跨域保护）'); return; }
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url; a.download = 'va-screenshot-' + Date.now() + '.png';
-                        document.body.appendChild(a); a.click(); a.remove();
-                        setTimeout(() => URL.revokeObjectURL(url), 1000);
-                        this._feedback('📷 已截图');
-                    }, 'image/png');
-                } catch (e) { this.session.notify('截图失败（视频可能受 DRM/跨域保护）'); }
-            }
-            _toggleFullscreen() { const wrap = this._wrap; try { if (document.fullscreenElement) document.exitFullscreen(); else wrap.requestFullscreen && wrap.requestFullscreen(); } catch (e) { } }
-            _updateRateMenu() { const cur = this.speed.rate; this._rateMenu.querySelectorAll('[data-rate]').forEach(d => d.classList.toggle('active', Math.abs(parseFloat(d.dataset.rate) - cur) < 0.01)); }
-            _updateVolFill(ratio) { const fill = this._ctrl.querySelector('.va-vol-fill'); if (fill) fill.style.width = (ratio * 100) + '%'; }
-            _syncMuteBtn() { const b = this._ctrl.querySelector('[data-act=mute]'); if (b) b.textContent = this.video.muted ? '🔇' : '🔊'; }
-            _onProgress() {
-                const v = this.video;
-                const cur = this._ctrl.querySelector('.va-cur'), dur = this._ctrl.querySelector('.va-dur');
-                const played = this._ctrl.querySelector('.va-played'), buffered = this._ctrl.querySelector('.va-buffered'), thumb = this._ctrl.querySelector('.va-thumb');
-                cur.textContent = this._fmt(v.currentTime);
-                if (isLive(v)) { dur.textContent = '直播'; played.style.width = '0%'; thumb.style.left = '0%'; buffered.style.width = '0%'; return; }
-                if (isFinite(v.duration) && v.duration > 0) {
-                    dur.textContent = this._fmt(v.duration);
-                    const pct = (v.currentTime / v.duration) * 100;
-                    played.style.width = pct + '%'; thumb.style.left = pct + '%';
-                } else { dur.textContent = '0:00'; played.style.width = '0%'; thumb.style.left = '0%'; }
-                if (v.buffered.length) {
-                    let end = 0;
-                    for (let i = 0; i < v.buffered.length; i++) { if (v.currentTime >= v.buffered.start(i) && v.currentTime <= v.buffered.end(i)) { end = v.buffered.end(i); break; } }
-                    if (end && isFinite(v.duration) && v.duration > 0) buffered.style.width = (end / v.duration) * 100 + '%';
-                }
-            }
-            _applyLiveState() {
-                // 直播流：隐藏进度条与快进快退按钮，避免无效操作
-                const live = isLive(this.video);
-                const prog = this._prog; const back = this._ctrl.querySelector('[data-act=back]'); const fwd = this._ctrl.querySelector('[data-act=fwd]');
-                if (prog) prog.style.display = live ? 'none' : '';
-                if (back) back.style.display = live ? 'none' : '';
-                if (fwd) fwd.style.display = live ? 'none' : '';
-            }
-            _fmt(s) { if (!isFinite(s) || s < 0) s = 0; s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60; return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`; }
-            _setPlayBtn(t) { const b = this._ctrl.querySelector('[data-act=play]'); if (b) b.textContent = t; }
-            _feedback(msg) { this._centerFb.textContent = msg; this._centerFb.classList.add('show'); clearTimeout(this._fbT); this._fbT = setTimeout(() => this._centerFb.classList.remove('show'), 700); }
-            _wake() { this._ctrl.classList.remove('va-hidden'); this._topBar.classList.remove('va-hidden'); this._autoHide(); }
-            _autoHide() {
-                clearTimeout(this._hideTimer);
-                const sec = CFG.autoHideSec || 0;
-                if (sec <= 0) return;
-                this._hideTimer = setTimeout(() => { if (!this.video.paused && !this._locked) { this._ctrl.classList.add('va-hidden'); this._topBar.classList.add('va-hidden'); } }, sec * 1000);
-            }
-            show() { this._ctrl.classList.remove('va-hidden'); this._topBar.classList.remove('va-hidden'); }
-            onConfig() { this._applyLiveState(); }
-            destroy() {
-                this.speed.destroy();
-                clearTimeout(this._hideTimer); clearTimeout(this._fbT);
-                try {
-                    if (this._vHandlers) { for (const [k, fn] of Object.entries(this._vHandlers)) this.video.removeEventListener(k, fn); }
-                    if (this._onProgMove) window.removeEventListener('mousemove', this._onProgMove);
-                    if (this._onVolMove) window.removeEventListener('mousemove', this._onVolMove);
-                    if (this._onUp) window.removeEventListener('mouseup', this._onUp);
-                } catch (e) { }
-                try {
-                    const host = this.session.takeover.host;
-                    const wrap = this._wrap;
-                    const video = this.video;
-                    if (wrap && wrap.contains(video)) {
-                        video.style.transform = ''; video.style.width = ''; video.style.height = ''; video.style.position = ''; video.style.left = ''; video.style.top = '';
-                        if (host && host.parentNode) host.parentNode.insertBefore(video, host);
-                    }
-                    if (wrap && wrap.parentNode) wrap.remove();
-                } catch (e) { }
-            }
-        }
-
-        // KeyboardController
-        class KeyboardController {
-            constructor(session) {
-                this.session = session; this.video = session.video;
-                this._hovered = false;
-                this._onKey = (e) => this._handle(e);
-                document.addEventListener('keydown', this._onKey, true);
-            }
-            setHover(v) { this._hovered = !!v; }
-            _active() {
-                if (!CFG.keyboardEnabled || !this.session.takeover || !this.session.takeover.enabled) return false;
-                const fs = document.fullscreenElement;
-                const inOurFs = fs && this.session.takeover.wrap && this.session.takeover.wrap.contains(fs);
-                const focused = document.activeElement === this.video;
-                return inOurFs || this._hovered || focused;
-            }
-            _handle(e) {
-                if (!this._active()) return;
-                const tag = (e.target && e.target.tagName) || '';
-                if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;
-                const v = this.video; const controls = this.session.controls;
-                const key = e.key;
-                if (key === ' ') { e.preventDefault(); if (v.paused) v.play().catch(() => { }); else v.pause(); }
-                else if (key === 'ArrowLeft') { e.preventDefault(); this.session.seekBy(-(e.shiftKey ? (CFG.hugeStep || 30) : (CFG.smallStep || 5))); }
-                else if (key === 'ArrowRight') { e.preventDefault(); this.session.seekBy(e.shiftKey ? (CFG.hugeStep || 30) : (CFG.smallStep || 5)); }
-                else if (key === 'j' || key === 'J') { e.preventDefault(); this.session.seekBy(-(CFG.bigStep || 10)); }
-                else if (key === 'l' || key === 'L') { e.preventDefault(); this.session.seekBy(CFG.bigStep || 10); }
-                else if (key === 'ArrowUp') { e.preventDefault(); v.volume = Math.min(1, v.volume + 0.1); if (controls) controls._updateVolFill(v.volume); }
-                else if (key === 'ArrowDown') { e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); if (controls) controls._updateVolFill(v.volume); }
-                else if (key === 'm' || key === 'M') { e.preventDefault(); v.muted = !v.muted; if (controls) controls._syncMuteBtn(); }
-                else if (key === '[') { e.preventDefault(); if (controls) controls.speed.step(-1); }
-                else if (key === ']') { e.preventDefault(); if (controls) controls.speed.step(1); }
-                else if (key === 'r' || key === 'R') { e.preventDefault(); if (controls) controls.rotation.toggle(); }
-                else if (key === 'f' || key === 'F') { e.preventDefault(); if (controls) controls._toggleFullscreen(); }
-                else if (key === 'p' || key === 'P') { e.preventDefault(); if (controls) controls._pip(); }
-                else if (key === 's' || key === 'S') { e.preventDefault(); if (controls) controls._screenshot(); }
-                else if (key === 'Escape') { /* 浏览器处理全屏退出 */ }
-                else if (/^[0-9]$/.test(key)) { e.preventDefault(); if (!isLive(v) && isFinite(v.duration) && v.duration > 0) v.currentTime = v.duration * (parseInt(key) / 10); }
-            }
-            destroy() { document.removeEventListener('keydown', this._onKey, true); }
-        }
-
-        // ExtractPlayer
-        class ExtractPlayer {
-            constructor(session) { this.session = session; this.video = session.video; this._modal = null; }
-            canExtract() { const src = this.video.currentSrc || this.video.src || ''; return src.indexOf('http') === 0 && src.indexOf('blob:') !== 0; }
-            open() {
-                if (!this.canExtract()) { this.session.notify('MSE/blob 视频无法提取，已使用覆盖模式'); return; }
-                if (this._modal) return;
-                const src = this.video.currentSrc || this.video.src;
-                const modal = document.createElement('div');
-                modal.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,0.92);display:flex;align-items:center;justify-content:center;';
-                const nv = document.createElement('video');
-                nv.src = src; nv.style.cssText = 'max-width:95vw;max-height:90vh;';
-                nv.controls = true; nv.currentTime = this.video.currentTime; nv.volume = this.video.volume; nv.playbackRate = this.video.playbackRate;
-                modal.appendChild(nv);
-                const closeBtn = document.createElement('button');
-                closeBtn.textContent = '✕ 关闭';
-                closeBtn.style.cssText = 'position:fixed;top:20px;right:20px;padding:10px 16px;background:rgba(255,255,255,0.15);color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer;';
-                closeBtn.onclick = () => this.close();
-                modal.appendChild(closeBtn);
-                document.body.appendChild(modal);
-                this._modal = modal; this._nv = nv;
-                try { nv.play().catch(() => { }); } catch (e) { }
-            }
-            close() { if (!this._modal) return; try { this.video.currentTime = this._nv.currentTime; } catch (e) { } this._modal.remove(); this._modal = null; this._nv = null; }
-        }
-
-        // PlayerTakeoverController
-        class PlayerTakeoverController {
-            constructor(session) {
-                this.session = session; this.video = session.video;
-                this.enabled = false; this.wrap = null; this.controls = null; this.kb = null; this.extract = null;
-                this.host = null; this.root = null;
-            }
-            enable() {
-                if (this.enabled) return;
-                if (CFG.takeoverMode === 'accel-only') return;
-                const src = this.video.currentSrc || this.video.src || '';
-                if (CFG.takeoverMode === 'extract' && src.indexOf('http') === 0 && src.indexOf('blob:') !== 0) {
-                    this.extract = new ExtractPlayer(this.session); this.extract.open(); this.enabled = true; return;
-                }
-                this._buildOverlay();
-                this.enabled = true;
-            }
-            _buildOverlay() {
-                const video = this.video;
-                // 捕获视频原始高度，防止移入 shadow DOM 后 auto 高度父容器塌缩
-                const vh = video.offsetHeight;
-                const host = document.createElement('div');
-                host.id = 'va-player-host-' + this.session.id;
-                host.style.cssText = 'position: relative; width: 100%; height: 100%;' + (vh ? ' min-height:' + vh + 'px;' : '') + ' z-index: 2147483547;';
-                const root = host.attachShadow({ mode: 'closed' });
-                const style = document.createElement('style'); style.textContent = PlayerSkin.css; root.appendChild(style);
-                this.host = host; this.root = root;
-
-                const parent = video.parentElement || document.body;
-                // 插入到视频原位置，避免 appendChild 导致布局位移
-                if (parent === document.body || !video.nextSibling) parent.appendChild(host);
-                else parent.insertBefore(host, video.nextSibling);
-
-                this.controls = new CustomPlayerControls(this.session);
-                this.kb = new KeyboardController(this.session);
-                this.session.controls = this.controls;
-                if (this.controls._wrap) {
-                    this.controls._wrap.addEventListener('mouseenter', () => { if (this.kb) this.kb.setHover(true); });
-                    this.controls._wrap.addEventListener('mouseleave', () => { if (this.kb) this.kb.setHover(false); });
-                }
-                Bridge.send('takeover', { takeover: true });
-            }
-            openExtract() { if (!this.extract) this.extract = new ExtractPlayer(this.session); this.extract.open(); }
-            onConfig() { if (this.controls) this.controls.onConfig(); }
-            disable() {
-                if (!this.enabled) return;
-                if (this.extract) { this.extract.close(); this.extract = null; }
-                if (this.controls) { this.controls.destroy(); this.controls = null; }
-                if (this.kb) { this.kb.destroy(); this.kb = null; }
-                if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
-                this.host = null; this.wrap = null; this.root = null;
-                this.enabled = false;
-                Bridge.send('takeover', { takeover: false });
-            }
-        }
-
-        // 沙箱世界存储访问桥（页面世界不能直接调 GM_*，通过 va-cmd 请求；此处提供缓存式访问）
-        // 简化方案：站点记忆只在页面世界用 sessionStorage 缓存 + 经 Bridge 同步到沙箱 GM
-        function ConfigStore_getSiteRate(host) {
-            try { const v = sessionStorage.getItem('va_rate_' + host); return v ? parseFloat(v) : null; } catch (e) { return null; }
-        }
-        function ConfigStore_saveSiteRate(host, rate) {
-            try { sessionStorage.setItem('va_rate_' + host, String(rate)); } catch (e) { }
-            Bridge.send('siteRate', { host, rate });
-        }
-        function ConfigStore_getSiteVolume(host) {
-            try { const v = sessionStorage.getItem('va_vol_' + host); return v ? JSON.parse(v) : null; } catch (e) { return null; }
-        }
-        function ConfigStore_saveSiteVolume(host, vol, muted) {
-            try { sessionStorage.setItem('va_vol_' + host, JSON.stringify({ vol, muted })); } catch (e) { }
-            Bridge.send('siteVolume', { host, vol, muted });
-        }
-
-        // ============================================================
-        // 【VideoSession】单视频生命周期
-        // ============================================================
-        let sessionCounter = 0;
-        const _allSessions = new Set();
-        class VideoSession {
-            constructor(video) {
-                this.id = ++sessionCounter;
-                this.video = video;
-                this.type = PlayerTypeDetector.detect(video);
-                this.recoveries = 0; this._adSkipped = 0; this._dead = false;
-                this._lastBufReport = 0; this._lastBufVal = -1;
-                video.__vaSession = this;
-                _allSessions.add(this);
-
-                PreloadAccelerator.apply(video, this.type);
-
-                this.buffer = new BufferManager(this);
-                this.seek = new SeekGuard(this);
-                this.stall = new StallRecoveryWatchdog(this);
-                this.adgate = new AdGateBypass(this);
-                this.takeover = new PlayerTakeoverController(this);
-                this.controls = null;
-
-                this.buffer.watch();
-                this.adgate.start();
-
-                // 恢复站点音量记忆
-                if (CFG.volumeMemory) {
-                    try { const sv = ConfigStore_getSiteVolume(HOST); if (sv) { video.volume = sv.vol; video.muted = !!sv.muted; } } catch (e) { }
-                }
-
-                try { this.takeover.enable(); } catch (e) { }
-
-                this._report();
-            }
-            _report() {
-                Bridge.send('session', {
-                    status: this.video.paused ? '空闲' : '播放中', playerType: this.type,
-                    buffer: this.buffer.bufferAhead(this.video), recoveries: this.recoveries, adSkipped: this._adSkipped,
-                    takeover: this.takeover.enabled, rate: this.video.playbackRate
-                });
-            }
-            reportBuffer(ahead) {
-                const now = Date.now();
-                if (this._lastBufReport && now - this._lastBufReport < 1500 && Math.abs(this._lastBufVal - ahead) < 1) return;
-                this._lastBufReport = now; this._lastBufVal = ahead;
-                const v = this.video;
-                Bridge.send('state', { buffer: ahead, status: v.paused ? '已暂停' : '播放中' });
-            }
-            seekBy(delta) {
-                const v = this.video;
-                if (isLive(v) || !isFinite(v.duration) || v.duration <= 0) return;
-                v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + delta));
-            }
-            emergencyLoad() { const info = PlayerRegistry.get(this.video); try { if (info && info.type === 'hls' && info.player) info.player.startLoad(); else this.video.load(); } catch (e) { } }
-            boostLoad() { const info = PlayerRegistry.get(this.video); if (info && info.type === 'hls' && info.player) { try { info.player.startLoad(this.video.currentTime); } catch (e) { } } }
-            trimBackBuffer(seconds) { const info = PlayerRegistry.get(this.video); if (info && info.type === 'hls' && info.player && info.player.config) { try { info.player.config.backBufferLength = seconds; } catch (e) { } } }
-            softRecover() {
-                this.recoveries++;
-                const info = PlayerRegistry.get(this.video);
-                try {
-                    if (info && info.type === 'hls' && info.player) { try { info.player.startLoad(this.video.currentTime); } catch (e) { this.video.load(); } }
-                    else this.video.load();
-                    if (CFG.autoPlay) this.video.play().catch(() => { });
-                } catch (e) { }
-                this._report();
-            }
-            engineRecover() {
-                this.recoveries++;
-                const info = PlayerRegistry.get(this.video);
-                try {
-                    if (info && info.type === 'hls' && info.player) { try { info.player.recoverMediaError(); } catch (e) { try { info.player.startLoad(this.video.currentTime); } catch (e2) { } } }
-                    else if (info && info.type === 'dash' && info.player) { info.player.seek(this.video.currentTime); info.player.play(); }
-                    else { this.video.currentTime = this.video.currentTime; this.video.load(); }
-                    if (CFG.autoPlay) this.video.play().catch(() => { });
-                } catch (e) { }
-                this._report();
-            }
-            downgradeQuality() {
-                const info = PlayerRegistry.get(this.video);
-                try {
-                    if (info && info.type === 'hls' && info.player) { const cur = info.player.currentLevel; if (cur > 0) { info.player.nextLevel = cur - 1; this.notify('自动降一档画质以保持流畅'); } }
-                    else if (info && info.type === 'dash' && info.player) { const cur = info.player.getQualityFor && info.player.getQualityFor('video'); if (cur > 0) { info.player.setQualityFor('video', cur - 1); this.notify('自动降一档画质以保持流畅'); } }
-                } catch (e) { }
-            }
-            rebuildVideoElement() {
-                this.recoveries++;
-                const old = this.video;
-                try {
-                    const wasTakeover = this.takeover.enabled;
-                    if (wasTakeover) this.takeover.disable();
-                    const clone = old.cloneNode(false);
-                    const ctx = { currentTime: old.currentTime, volume: old.volume, muted: old.muted, playbackRate: old.playbackRate, loop: old.loop, crossorigin: old.crossOrigin };
-                    const info = PlayerRegistry.get(old);
-                    // 销毁前捕获 manifest URL，否则 destroy 后丢失
-                    let manifestUrl = null;
-                    if (info && info.type === 'hls' && info.player) { try { manifestUrl = info.player.url || null; } catch (e) { } try { info.player.destroy(); } catch (e) { } }
-                    if (old.parentNode) old.parentNode.replaceChild(clone, old);
-                    try { delete old.__vaSession; } catch (e) { }
-                    clone.currentTime = ctx.currentTime; clone.volume = ctx.volume; clone.muted = ctx.muted;
-                    clone.playbackRate = ctx.playbackRate; clone.loop = ctx.loop;
-                    if (ctx.crossorigin) clone.crossOrigin = ctx.crossorigin;
-
-                    if (info && info.type === 'hls' && window.Hls && window.Hls.isSupported() && manifestUrl) {
-                        const hls = new window.Hls();
-                        hls.loadSource(manifestUrl);
-                        hls.attachMedia(clone);
-                        hls.on(window.Hls.Events.MANIFEST_PARSED, () => { clone.currentTime = ctx.currentTime; if (CFG.autoPlay) clone.play().catch(() => { }); });
-                        PlayerRegistry.set(clone, { type: 'hls', player: hls });
-                    } else if (info && info.type === 'native') {
-                        clone.load(); if (CFG.autoPlay) clone.play().catch(() => { });
-                    } else if (info && (info.type === 'mse' || info.type === 'dash' || info.type === 'shaka')) {
-                        // MSE/blob/dash/shaka 无法通过克隆重建，回退到 load() 尝试
-                        try { clone.load(); } catch (e) { }
-                    }
-
-                    this.seek.destroy(); this.stall.destroy(); this.buffer.stop(); this.adgate.stop();
-                    this.video = clone;
-                    this.type = info ? info.type : PlayerTypeDetector.detect(clone);
-                    this.seek = new SeekGuard(this); this.stall = new StallRecoveryWatchdog(this);
-                    this.buffer = new BufferManager(this); this.adgate = new AdGateBypass(this);
-                    this.takeover = new PlayerTakeoverController(this);
-                    this.buffer.watch(); this.adgate.start();
-                    clone.__vaSession = this;
-                    VideoDiscoveryEngine._seen.add(clone);
-                    if (wasTakeover) { try { this.takeover.enable(); } catch (e) { } }
-                    this.notify('视频元素已自动重建');
-                } catch (e) { this.notify('元素重建失败，请手动重载'); }
-                this._report();
-            }
-            adSkipped() { this._adSkipped++; Bridge.send('adSkip', { count: this._adSkipped }); }
-            notify(msg) { Bridge.send('notify', { msg }); }
-            destroy() {
-                this._dead = true; _allSessions.delete(this);
-                try { this.seek.destroy(); } catch (e) { }
-                try { this.stall.destroy(); } catch (e) { }
-                try { this.buffer.stop(); } catch (e) { }
-                try { this.adgate.stop(); } catch (e) { }
-                try { this.takeover.disable(); } catch (e) { }
-                try { if (this._srcObserver) this._srcObserver.disconnect(); } catch (e) { }
-                try { delete this.video.__vaSession; } catch (e) { }
-            }
-        }
-
-        // ============ VideoDiscoveryEngine（含 iframe 同源递归） ============
-        const VideoDiscoveryEngine = {
-            _seen: new WeakSet(),
-            _observer: null,
-            init() {
-                this._scanAll();
-                this._observer = new MutationObserver((muts) => {
-                    for (const m of muts) {
-                        for (const node of m.addedNodes) {
-                            if (node.nodeType !== 1) continue;
-                            if (node.tagName === 'VIDEO') this._takeOver(node);
-                            else this._scanWithin(node);
-                            if (node.tagName === 'IFRAME') this._scanIframe(node);
-                        }
-                    }
-                });
-                this._observer.observe(document.documentElement, { childList: true, subtree: true });
-                setTimeout(() => {
-                    if (!this._hasAnyVideo()) {
-                        const container = document.querySelector(PROFILE.containerSel || 'body');
-                        if (container) LazyInitUnlocker.forceInit(container);
-                    }
-                }, 5000);
-            },
-            _hasAnyVideo() { return !!document.querySelector('video'); },
-            _scanAll() { this._scanWithin(document.documentElement); document.querySelectorAll('iframe').forEach(f => this._scanIframe(f)); },
-            _scanWithin(root) {
-                try { root.querySelectorAll && root.querySelectorAll('video').forEach(v => this._takeOver(v)); } catch (e) { }
-                try { const all = root.querySelectorAll ? root.querySelectorAll('*') : []; for (const el of all) { if (el.shadowRoot) this._scanWithin(el.shadowRoot); } } catch (e) { }
-                try { root.querySelectorAll && root.querySelectorAll('iframe').forEach(f => this._scanIframe(f)); } catch (e) { }
-            },
-            _scanIframe(iframe) {
-                try {
-                    const doc = iframe.contentDocument;
-                    if (doc && doc.documentElement) this._scanWithin(doc.documentElement);
-                } catch (e) { /* 跨域 iframe 抛 SecurityError，静默跳过 */ }
-            },
-            _takeOver(video) {
-                if (this._seen.has(video)) return;
-                this._seen.add(video);
-                if (video.__vaSession) return;
-                let session = null;
-                try { session = new VideoSession(video); } catch (e) { }
-                if (session) {
+        _handle(d, source) {
+            if (IS_TOP) {
+                if (d.type === 'VA_STATE_UPDATE') {
+                    this.bus.emit('REMOTE_STATE', { iframeId: d.iframeId, state: d.state });
+                } else if (d.type === 'VA_LOG') {
+                    const entry = Object.assign({
+                        ts: NOW(),
+                        level: 'info',
+                        scope: 'iframe',
+                        message: '',
+                        data: null,
+                        remote: true
+                    }, d.entry || {});
+                    this.bus.emit('LOG_EMIT', entry);
+                } else if (d.type === 'VA_TOAST') {
+                    this.bus.emit('TOAST', { msg: d.msg, kind: d.kind, remote: true });
+                } else if (d.type === 'VA_REQ_CFG') {
                     try {
-                        const obs = new MutationObserver(() => { try { session.type = PlayerTypeDetector.detect(video); } catch (e) { } });
-                        obs.observe(video, { attributes: true, attributeFilter: ['src', 'data-src', 'data-video', 'data-lazy-src'] });
-                        session._srcObserver = obs;
+                        source.postMessage({
+                            __va_msg: true,
+                            type: 'VA_CFG_SYNC',
+                            config: ConfigManager.load()
+                        }, '*');
                     } catch (e) { }
                 }
+            } else {
+                if (d.type === 'VA_CFG_SYNC') {
+                    ConfigManager.applyRemote(d.config);
+                } else if (d.type === 'VA_CMD') {
+                    this.bus.emit('CMD', { cmd: d.cmd, remote: true });
+                }
             }
-        };
+        }
 
-        // ============ HealthMonitor ============
-        const HealthMonitor = {
-            _iv: null,
-            start() {
-                this._iv = setInterval(() => this._patrol(), 3000);
-                document.addEventListener('visibilitychange', () => { if (!document.hidden) this._patrol(); });
-                window.addEventListener('popstate', () => setTimeout(() => VideoDiscoveryEngine._scanAll(), 500));
-                window.addEventListener('hashchange', () => setTimeout(() => VideoDiscoveryEngine._scanAll(), 500));
-            },
-            _patrol() {
-                if (document.hidden) return;
-                _allSessions.forEach(s => {
-                    const v = s.video;
-                    if (!v || s._dead) { _allSessions.delete(s); return; }
-                    if (!document.documentElement.contains(v)) { s.destroy(); return; }
-                    if (performance.memory && performance.memory.usedJSHeapSize / performance.memory.jsHeapSizeLimit > 0.9) { try { s.trimBackBuffer(30); } catch (e) { } }
-                });
+        _install() {
+            // 子 iframe 上报本地状态
+            this.bus.on('LOCAL_STATE', (state) => {
+                if (!IS_TOP) this._postTop('VA_STATE_UPDATE', { state: state });
+            });
+
+            // 子 iframe 上报日志
+            this.bus.on('LOG_EMIT', (entry) => {
+                if (!IS_TOP && entry && !entry.remote) this._postTop('VA_LOG', { entry: entry });
+            });
+
+            // 子 iframe 请求 Toast
+            this.bus.on('TOAST', (payload) => {
+                if (!IS_TOP && payload && !payload.remote) this._postTop('VA_TOAST', payload);
+            });
+
+            // 顶层配置变化同步到子 iframe
+            this.bus.on('CONFIG_CHANGE', (payload) => {
+                if (IS_TOP && !(payload && payload.remote)) {
+                    this.broadcastToFrames('VA_CFG_SYNC', { config: ConfigManager.load() });
+                }
+            });
+
+            // 顶层命令下发到子 iframe
+            this.bus.on('CMD', (payload) => {
+                if (IS_TOP && !(payload && payload.remote)) {
+                    this.broadcastToFrames('VA_CMD', { cmd: payload && payload.cmd });
+                }
+            });
+
+            // 子 iframe 启动时请求配置
+            if (!IS_TOP) {
+                this._postTop('VA_REQ_CFG', {});
             }
-        };
-
-        // ============ 指令处理 ============
-        Bridge.on('configUpdate', (cfg) => {
-            Object.assign(CFG, cfg);
-            // 通知已接管会话更新依赖配置的 UI（如直播态、步长）
-            _allSessions.forEach(s => { try { if (s.takeover) s.takeover.onConfig(); } catch (e) { } });
-        });
-        Bridge.on('reload', () => { _allSessions.forEach(s => { try { s.video.load(); if (CFG.autoPlay) s.video.play().catch(() => { }); s._report(); } catch (e) { } }); });
-        Bridge.on('recover', () => { _allSessions.forEach(s => s.engineRecover()); });
-        Bridge.on('downgrade', () => { _allSessions.forEach(s => s.downgradeQuality()); });
-
-        // ============ 启动 ============
-        installIOHook();
-        installFetchPriority();
-        installPlayerHooks();
-        VideoDiscoveryEngine.init();
-        HealthMonitor.start();
-        Bridge.send('ready', { host: HOST });
+        }
     }
 
-    // ============================================================
-    // 【沙箱世界】注入页面引擎 + 启动 UI
-    // ============================================================
-    function injectPageWorld() {
-        const cfg = ConfigStore.effective(location.hostname);
-        const script = document.createElement('script');
-        script.textContent = '(' + pageEngine.toString() + ')(' + JSON.stringify(cfg) + ');';
-        try { (document.head || document.documentElement).appendChild(script); }
-        catch (e) { setTimeout(() => { try { (document.head || document.documentElement).appendChild(script); } catch (e2) { } }, 0); }
-        script.remove();
-    }
+    const Bridge = new CrossWindowBridge(Bus);
 
-    let ui;
-    function boot() {
-        ui = new UIManager();
-        MessageBridge.init((detail) => {
-            const { evt, payload } = detail;
-            if (evt === 'ready') { ui && ui.toast('视频加速引擎已就绪', 'ok'); }
-            else if (evt === 'notify') { ui && ui.toast(payload.msg, 'warn'); }
-            else if (evt === 'session' || evt === 'state') { ui && ui.update(payload || {}); }
-            else if (evt === 'adSkip') { ui && ui.update({ adSkipped: payload.count }); }
-            else if (evt === 'takeover') { ui && ui.update({ takeover: payload.takeover }); }
-            else if (evt === 'rateChange') { ui && ui.update({ rate: payload.rate }); }
-            else if (evt === 'siteRate') { try { ConfigStore.saveSite(payload.host, { defaultRate: payload.rate }); } catch (e) { } }
-            else if (evt === 'siteVolume') { try { ConfigStore.saveSite(payload.host, { volume: payload.vol, muted: payload.muted }); } catch (e) { } }
-        });
-        injectPageWorld();
+    /* ═══════════════════════════════════════════════════════════
+       preconnect / fetch 工具
+    ═══════════════════════════════════════════════════════════ */
+
+    const preconnectedHosts = new Set();
+
+    function addPreconnect(url, doc) {
         try {
-            GM_registerMenuCommand('🎬 视频加速控制台', () => ui.toggle());
-            GM_registerMenuCommand('⚙ 设置', () => ui.showSettings());
-            GM_registerMenuCommand('⚡ 强制重载当前视频', () => MessageBridge.send('reload'));
-            GM_registerMenuCommand('🔧 手动恢复播放', () => MessageBridge.send('recover'));
-            GM_registerMenuCommand('📉 降低画质', () => MessageBridge.send('downgrade'));
+            if (!ConfigManager.get('preconnect')) return;
+            if (!url || url.indexOf('blob:') === 0 || url.indexOf('data:') === 0) return;
+            const host = getHost(url);
+            if (!host || host === LOC.host || preconnectedHosts.has(host)) return;
+            preconnectedHosts.add(host);
+
+            const D = doc || DOC;
+            const append = function () {
+                try {
+                    const target = D.head || D.documentElement;
+                    if (!target) return;
+
+                    const dns = D.createElement('link');
+                    dns.rel = 'dns-prefetch';
+                    dns.href = '//' + host;
+                    target.appendChild(dns);
+
+                    const pre = D.createElement('link');
+                    pre.rel = 'preconnect';
+                    pre.href = '//' + host;
+                    pre.crossOrigin = 'anonymous';
+                    target.appendChild(pre);
+                } catch (e) { }
+            };
+
+            const target = D.head || D.documentElement;
+            if (target) append();
+            else D.addEventListener('DOMContentLoaded', append, { once: true });
         } catch (e) { }
     }
 
-    boot();
+    /* ═══════════════════════════════════════════════════════════
+       HookManager：原型 / fetch / 手势
+    ═══════════════════════════════════════════════════════════ */
+
+    class HookManagerClass {
+        constructor(bus) {
+            this.bus = bus;
+        }
+
+        installAll(win, doc) {
+            try { this.installFetch(win); } catch (e) { }
+            try { this.patchMediaPrototype(win); } catch (e) { }
+            try { this.addGesture(doc); } catch (e) { }
+        }
+
+        installFetch(W) {
+            W = W || PW;
+            try {
+                if (!W.fetch || W.fetch.__vaPatched) return;
+                const base = W.fetch;
+
+                const wrapped = function (input, init) {
+                    try {
+                        if (ConfigManager.get('fetchPriority')) {
+                            let url = '';
+                            if (typeof input === 'string') url = input;
+                            else if (input && input.url) url = input.url;
+
+                            if (isVideoResource(url)) {
+                                const newInit = Object.assign({}, init || {});
+                                newInit.priority = 'high';
+                                addPreconnect(url, W.document || DOC);
+                                return base.call(this, input, newInit);
+                            }
+                        }
+                    } catch (e) { }
+                    return base.apply(this, arguments);
+                };
+
+                wrapped.__vaPatched = true;
+                W.fetch = wrapped;
+            } catch (e) { }
+        }
+
+        patchMediaPrototype(W) {
+            W = W || PW;
+            if (!W || !W.HTMLMediaElement || W.HTMLMediaElement.__vaPatched) return;
+
+            try {
+                const Proto = W.HTMLMediaElement.prototype;
+                const bus = this.bus;
+
+                const srcDesc = Object.getOwnPropertyDescriptor(Proto, 'src');
+                if (srcDesc && srcDesc.get && srcDesc.set) {
+                    Object.defineProperty(Proto, 'src', {
+                        configurable: true,
+                        enumerable: true,
+                        get: function () {
+                            return srcDesc.get.call(this);
+                        },
+                        set: function (v) {
+                            srcDesc.set.call(this, v);
+                            try {
+                                addPreconnect(v, this.ownerDocument);
+                                if (ConfigManager.get('protoHook')) {
+                                    bus.emit('VIDEO_FOUND', { video: this, reason: 'src', force: true });
+                                }
+                            } catch (e) { }
+                        }
+                    });
+                }
+
+                const origPlay = Proto.play;
+                if (typeof origPlay === 'function' && !origPlay.__vaPatched) {
+                    Proto.play = function () {
+                        try {
+                            if (ConfigManager.get('protoHook')) {
+                                bus.emit('VIDEO_FOUND', { video: this, reason: 'play', force: true });
+                            }
+                            if (ConfigManager.get('instantPlay')) {
+                                bus.emit('VIDEO_BOOST', { video: this, reason: 'play' });
+                            }
+                            addPreconnect(this.currentSrc || this.src, this.ownerDocument);
+                        } catch (e) { }
+                        return origPlay.apply(this, arguments);
+                    };
+                    Proto.play.__vaPatched = true;
+                }
+
+                const origLoad = Proto.load;
+                if (typeof origLoad === 'function' && !origLoad.__vaPatched) {
+                    Proto.load = function () {
+                        try {
+                            if (ConfigManager.get('protoHook')) {
+                                bus.emit('VIDEO_FOUND', { video: this, reason: 'load', force: false });
+                            }
+                            bus.emit('VIDEO_BOOST', { video: this, reason: 'load' });
+                        } catch (e) { }
+                        return origLoad.apply(this, arguments);
+                    };
+                    Proto.load.__vaPatched = true;
+                }
+
+                W.HTMLMediaElement.__vaPatched = true;
+            } catch (e) { }
+        }
+
+        addGesture(doc) {
+            if (!doc || doc.__vaGesture) return;
+            try {
+                doc.__vaGesture = true;
+                const bus = this.bus;
+
+                const handler = function (e) {
+                    try {
+                        if (!ConfigManager.get('earlyPointer')) return;
+
+                        const t = e.target;
+                        if (
+                            t &&
+                            t.closest &&
+                            t.nodeName !== 'VIDEO' &&
+                            t.closest('button, input, select, textarea, a, label, [role="button"], [role="slider"], [role="menuitem"]')
+                        ) {
+                            return;
+                        }
+
+                        const video = videoFromEvent(e);
+                        if (!video) return;
+
+                        bus.emit('VIDEO_FOUND', { video: video, reason: 'pointer', force: true });
+                        bus.emit('VIDEO_BOOST', { video: video, reason: 'pointer' });
+
+                        if (ConfigManager.get('autoPlay') && video.paused && !video.ended) {
+                            const s = video.__vaSession;
+                            if (!s || !s._userPaused) {
+                                tryPlay(video);
+                            }
+                        }
+                    } catch (err) { }
+                };
+
+                ['pointerdown', 'mousedown', 'touchstart'].forEach(function (ev) {
+                    doc.addEventListener(ev, handler, { capture: true, passive: true });
+                });
+            } catch (e) { }
+        }
+    }
+
+    const HookManager = new HookManagerClass(Bus);
+
+    /* ═══════════════════════════════════════════════════════════
+       Detector：DOM / iframe / 可见性检测
+    ═══════════════════════════════════════════════════════════ */
+
+    class DetectorClass {
+        constructor(bus) {
+            this.bus = bus;
+            this._hookedDocs = new WeakSet();
+            this._observedDocs = new WeakSet();
+            this._pendingNodes = new Set();
+            this._scanScheduled = false;
+            this._viewportObs = null;
+            this._viewportTargets = new WeakSet();
+            this._patrolIv = null;
+            this._initViewportObserver();
+        }
+
+        start() {
+            this._setupDoc(DOC, PW);
+
+            try {
+                DOC.addEventListener('load', (e) => {
+                    const t = e.target;
+                    if (t && t.nodeName === 'IFRAME') this._hookIframe(t);
+                }, true);
+            } catch (e) { }
+
+            this._patrolIv = setInterval(() => this._patrol(), 2500);
+        }
+
+        _setupDoc(doc, win) {
+            if (!doc) return;
+            win = win || (doc.defaultView || PW);
+
+            try { HOOKED_DOCS.add(doc); } catch (e) { }
+
+            try {
+                HookManager.installAll(win, doc);
+            } catch (e) { }
+
+            if (this._hookedDocs.has(doc)) return;
+            this._hookedDocs.add(doc);
+
+            try {
+                if (doc.documentElement) this._scanWithin(doc.documentElement);
+            } catch (e) { }
+
+            this._observeDoc(doc, win);
+        }
+
+        _observeDoc(doc, win) {
+            if (!doc || this._observedDocs.has(doc)) return;
+            const MO = (win && win.MutationObserver) || PW.MutationObserver;
+            if (!MO || !doc.documentElement) return;
+
+            this._observedDocs.add(doc);
+
+            try {
+                const obs = new MO((muts) => this._onMutations(muts));
+                obs.observe(doc.documentElement, { childList: true, subtree: true });
+            } catch (e) { }
+        }
+
+        _initViewportObserver() {
+            if (this._viewportObs || typeof PW.IntersectionObserver !== 'function') return;
+
+            this._viewportObs = new PW.IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    if (entry.isIntersecting && entry.target.nodeName === 'VIDEO') {
+                        this.bus.emit('VIDEO_FOUND', { video: entry.target, reason: 'viewport', force: true });
+                        try {
+                            this._viewportObs.unobserve(entry.target);
+                            this._viewportTargets.delete(entry.target);
+                        } catch (e) { }
+                    }
+                }
+            }, { rootMargin: '300px' });
+        }
+
+        watchViewport(video) {
+            if (!video) return;
+            if (this._viewportTargets.has(video)) return;
+
+            if (this._viewportObs && video.ownerDocument === DOC) {
+                this._viewportTargets.add(video);
+                try { this._viewportObs.observe(video); } catch (e) { }
+            } else {
+                this.bus.emit('VIDEO_FOUND', { video: video, reason: 'viewport-direct', force: false });
+            }
+        }
+
+        _onMutations(muts) {
+            if (!ConfigManager.get('fastDetect')) return;
+
+            let need = false;
+
+            for (const m of muts) {
+                for (const node of m.addedNodes) {
+                    if (node.nodeType !== 1) continue;
+
+                    if (node.nodeName === 'VIDEO') {
+                        this.bus.emit('VIDEO_FOUND', { video: node, reason: 'mutation', force: false });
+                        need = true;
+                    } else if (node.nodeName === 'IFRAME') {
+                        this._hookIframe(node);
+                        need = true;
+                    } else if (node.querySelector) {
+                        this._pendingNodes.add(node);
+                        need = true;
+                    }
+                }
+            }
+
+            if (need) this._scheduleScan();
+        }
+
+        _scheduleScan() {
+            if (this._scanScheduled) return;
+            this._scanScheduled = true;
+
+            const flush = () => {
+                this._scanScheduled = false;
+                const nodes = Array.from(this._pendingNodes);
+                this._pendingNodes.clear();
+
+                for (const n of nodes) {
+                    try {
+                        if (n.isConnected) this._scanWithin(n);
+                    } catch (e) { }
+                }
+            };
+
+            try {
+                const raf = PW.requestAnimationFrame
+                    ? PW.requestAnimationFrame.bind(PW)
+                    : function (cb) { return PW.setTimeout(cb, 50); };
+                raf(flush);
+            } catch (e) {
+                PW.setTimeout(flush, 50);
+            }
+        }
+
+        _hookIframe(f) {
+            if (!f || f.nodeName !== 'IFRAME') return false;
+
+            let doc = null;
+            let win = null;
+
+            try {
+                win = f.contentWindow;
+                doc = win ? win.document : null;
+            } catch (e) { }
+
+            if (doc && doc.documentElement) {
+                this._setupDoc(doc, win);
+                return true;
+            }
+
+            try {
+                f.addEventListener('load', () => {
+                    try {
+                        const w = f.contentWindow;
+                        const d = w && w.document;
+                        if (d && d.documentElement) this._setupDoc(d, w);
+                    } catch (e) { }
+                }, { once: true });
+            } catch (e) { }
+
+            return false;
+        }
+
+        _scanWithin(root) {
+            if (!root) return;
+
+            try {
+                const name = root.nodeName || '';
+                if (name === 'VIDEO') {
+                    this.bus.emit('VIDEO_FOUND', { video: root, reason: 'scan', force: false });
+                } else if (name === 'IFRAME') {
+                    this._hookIframe(root);
+                }
+
+                if (root.querySelectorAll) {
+                    const els = root.querySelectorAll('video,iframe');
+                    const limit = Math.min(els.length, 800);
+                    for (let i = 0; i < limit; i++) {
+                        const el = els[i];
+                        if (el.nodeName === 'VIDEO') {
+                            this.bus.emit('VIDEO_FOUND', { video: el, reason: 'scan', force: false });
+                        } else if (el.nodeName === 'IFRAME') {
+                            this._hookIframe(el);
+                        }
+                    }
+                }
+            } catch (e) { }
+
+            try {
+                if (root.querySelectorAll) {
+                    const all = root.querySelectorAll('*');
+                    const limit = Math.min(all.length, 250);
+                    for (let i = 0; i < limit; i++) {
+                        const sr = all[i].shadowRoot;
+                        if (sr) this._scanWithin(sr);
+                    }
+                }
+            } catch (e) { }
+        }
+
+        refresh() {
+            try {
+                if (DOC.documentElement) this._scanWithin(DOC.documentElement);
+            } catch (e) { }
+        }
+
+        _patrol() {
+            if (DOC.hidden) return;
+            try { this.refresh(); } catch (e) { }
+            this.bus.emit('PATROL', {});
+        }
+    }
+
+    const Detector = new DetectorClass(Bus);
+
+    /* ═══════════════════════════════════════════════════════════
+       播放器适配器
+    ═══════════════════════════════════════════════════════════ */
+
+    const PLAYER_LABEL = {
+        hls: 'HLS.js',
+        dash: 'dash.js',
+        shaka: 'Shaka',
+        mse: 'MSE',
+        native: '原生',
+        videojs: 'Video.js',
+        jw: 'JW',
+        unknown: '未知'
+    };
+
+    function getHls(video) {
+        const keys = ['hls', '_hls', '__hls', 'hlsjs', 'hlsPlayer', '__hlsjs'];
+        for (const k of keys) {
+            try {
+                const h = video[k];
+                if (h && typeof h === 'object' && (h.config || h.startLoad || h.recoverMediaError)) {
+                    return h;
+                }
+            } catch (e) { }
+        }
+        return null;
+    }
+
+    function getDash(video) {
+        const keys = ['dashjs', '_dashjs', '__dashjs', 'dash'];
+        for (const k of keys) {
+            try {
+                const d = video[k];
+                if (d && typeof d === 'object' && (d.refreshManifest || d.getBufferLength || d.attachSource)) {
+                    return d;
+                }
+            } catch (e) { }
+        }
+        return null;
+    }
+
+    function applyHlsConfig(hls) {
+        if (!hls || !hls.config) return;
+        try {
+            const big = ConfigManager.get('bigBuffer');
+            const target = clamp(parseInt(ConfigManager.get('bufferTarget'), 10) || 60, 10, 300);
+
+            hls.config.maxBufferLength = big ? 120 : Math.max(30, target);
+            hls.config.maxMaxBufferLength = big ? 600 : 300;
+            hls.config.maxBufferHole = 0.2;
+            hls.config.startFragPrefetch = true;
+            hls.config.backBufferLength = big ? 90 : 30;
+            hls.config.nudgeOffset = 0.1;
+            hls.config.nudgeMaxRetry = 5;
+            hls.config.fragLoadingMaxRetry = 6;
+            hls.config.fragLoadingMaxRetryTimeout = 8000;
+            hls.config.autoStartLoad = true;
+        } catch (e) { }
+    }
+
+    const PlayerRegistry = {
+        _map: new WeakMap(),
+        get(v) {
+            try { return this._map.get(v); } catch (e) { return undefined; }
+        },
+        set(v, info) {
+            try { this._map.set(v, info); } catch (e) { }
+        }
+    };
+
+    const Adaptor = {
+        detect(video) {
+            let info = { type: 'unknown', player: null };
+
+            try {
+                const hls = getHls(video);
+                if (hls) {
+                    info = { type: 'hls', player: hls };
+                    applyHlsConfig(hls);
+                    PlayerRegistry.set(video, info);
+                    return info;
+                }
+
+                const dash = getDash(video);
+                if (dash) {
+                    info = { type: 'dash', player: dash };
+                    PlayerRegistry.set(video, info);
+                    return info;
+                }
+
+                const src = video.currentSrc || video.src || '';
+                if (src.indexOf('blob:') === 0) {
+                    info = { type: 'mse', player: null };
+                } else if (src) {
+                    info = { type: 'native', player: null };
+                } else {
+                    info = { type: 'unknown', player: null };
+                }
+            } catch (e) { }
+
+            PlayerRegistry.set(video, info);
+            return info;
+        },
+
+        applyConfig(video) {
+            const info = PlayerRegistry.get(video);
+            if (info && info.type === 'hls' && info.player) {
+                applyHlsConfig(info.player);
+            }
+        },
+
+        canChangeQuality(video) {
+            if (!ConfigManager.get('qualityManage')) return false;
+            const info = PlayerRegistry.get(video);
+            if (!info || info.type !== 'hls' || !info.player) return false;
+            try {
+                return Array.isArray(info.player.levels) && info.player.levels.length > 1;
+            } catch (e) {
+                return false;
+            }
+        },
+
+        switchLevel(video, delta) {
+            if (!this.canChangeQuality(video)) return false;
+            const info = PlayerRegistry.get(video);
+            const hls = info.player;
+
+            try {
+                const levels = hls.levels || [];
+                let cur = hls.currentLevel;
+
+                if (typeof cur !== 'number' || cur < 0) {
+                    cur = (typeof hls.loadLevel === 'number' && hls.loadLevel >= 0) ? hls.loadLevel : 0;
+                }
+
+                const target = cur + delta;
+                if (target < 0 || target >= levels.length) return false;
+
+                hls.autoLevelEnabled = false;
+                try { hls.nextLevel = target; } catch (e) { }
+                try { if ('loadLevel' in hls) hls.loadLevel = target; } catch (e) { }
+
+                return true;
+            } catch (e) {
+                return false;
+            }
+        },
+
+        getInfo(video) {
+            const info = PlayerRegistry.get(video);
+
+            if (info && info.type === 'hls' && info.player) {
+                try {
+                    const levels = info.player.levels || [];
+                    const cur = info.player.currentLevel;
+                    const lv = (typeof cur === 'number' && cur >= 0 && levels[cur]) ? levels[cur] : null;
+
+                    return {
+                        level: (typeof cur === 'number') ? cur : -1,
+                        total: levels.length,
+                        bandwidth: lv ? (lv.bitrate || 0) : estimateBandwidth(),
+                        height: lv ? (lv.height || 0) : (video.videoHeight || 0)
+                    };
+                } catch (e) { }
+            }
+
+            return {
+                level: -1,
+                total: 0,
+                bandwidth: estimateBandwidth(),
+                height: video.videoHeight || 0
+            };
+        },
+
+        boost(video) {
+            try {
+                if (!video || video.nodeName !== 'VIDEO') return;
+                video.preload = 'auto';
+
+                const lazy = video.getAttribute && (video.getAttribute('data-src') || video.getAttribute('data-lazy-src'));
+                if (lazy && !video.src && /^(https?:)?\/\//i.test(lazy)) video.src = lazy;
+
+                addPreconnect(video.currentSrc || video.src, video.ownerDocument);
+            } catch (e) { }
+        },
+
+        startLoad(video) {
+            const info = PlayerRegistry.get(video);
+            if (info && info.type === 'hls' && info.player) {
+                try { info.player.startLoad(video.currentTime); } catch (e) { }
+            } else {
+                try { video.preload = 'auto'; } catch (e) { }
+            }
+        },
+
+        reloadSegment(video) {
+            const info = PlayerRegistry.get(video);
+            if (info && info.type === 'hls' && info.player) {
+                try { info.player.startLoad(video.currentTime); } catch (e) { }
+            } else {
+                try {
+                    if (isFinite(video.duration) && video.duration > 0) {
+                        video.currentTime = clamp(video.currentTime + 0.1, 0, video.duration - 0.1);
+                    } else {
+                        video.currentTime += 0.1;
+                    }
+                } catch (e) { }
+            }
+        },
+
+        trimBack(video, seconds) {
+            const info = PlayerRegistry.get(video);
+            if (info && info.type === 'hls' && info.player && info.player.config) {
+                try { info.player.config.backBufferLength = seconds; } catch (e) { }
+            }
+        }
+    };
+
+    /* ═══════════════════════════════════════════════════════════
+       VideoSession 单视频会话
+    ═══════════════════════════════════════════════════════════ */
+
+    let sessionCounter = 0;
+
+    class VideoSession {
+        constructor(video, opts) {
+            opts = opts || {};
+
+            this.id = ++sessionCounter;
+            this.video = video;
+            this.info = Adaptor.detect(video);
+            this.type = this.info.type;
+            this.recoveries = 0;
+
+            this._dead = false;
+            this.isSeeking = false;
+            this.seekTarget = 0;
+            this._seekStartTime = 0;
+            this._wasPlayingBeforeSeek = false;
+
+            this._bufferIv = null;
+            this._stallIv = null;
+
+            this._lastTime = -1;
+            this._stallStart = 0;
+            this._stallLevel = 0;
+
+            this._lastBoost = 0;
+            this._lastEmergency = 0;
+            this._lastRecoverAt = 0;
+            this._lowCount = 0;
+
+            this._playedOnce = false;
+            this._userPaused = false;
+            this._autoTried = 0;
+
+            this._lastFrameTs = 0;
+            this._rvfcRunning = false;
+            this._rvfcId = 0;
+
+            video.__vaSession = this;
+
+            try {
+                Adaptor.boost(video);
+            } catch (e) { }
+
+            this._bindEvents();
+
+            this._bufferIv = setInterval(() => this._bufferCheck(), 700);
+            this._stallIv = setInterval(() => this._stallCheck(), 450);
+
+            if (opts.force) {
+                this._userPaused = false;
+                this._boostLoad();
+            }
+
+            this._startRvfc();
+
+            if (ConfigManager.get('showDetect') && ConfigManager.get('showToast')) {
+                Bus.emit('TOAST', { msg: '已接管视频 #' + this.id, kind: 'ok', remote: false });
+            }
+
+            Logger.info('Session', '接管视频 #' + this.id, { type: this.type, reason: opts.reason || 'unknown' });
+            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+
+        _bindEvents() {
+            const v = this.video;
+
+            this._onSeeking = () => {
+                if (!ConfigManager.get('seekGuard')) return;
+                this._wasPlayingBeforeSeek = !v.paused;
+                this.isSeeking = true;
+                this.seekTarget = v.currentTime;
+                this._seekStartTime = NOW();
+                this._stallLevel = 0;
+            };
+
+            this._onSeeked = () => {
+                this.isSeeking = false;
+                this._stallLevel = 0;
+                this._boostAfterSeek();
+
+                if (
+                    ConfigManager.get('autoPlay') &&
+                    !this._userPaused &&
+                    this._wasPlayingBeforeSeek &&
+                    v.paused &&
+                    !v.ended
+                ) {
+                    tryPlay(v);
+                }
+            };
+
+            this._onLoaded = () => this._maybeAutoPlay();
+            this._onCanPlay = () => this._maybeAutoPlay();
+            this._onWaiting = () => { this._stallLevel = Math.max(this._stallLevel, 1); };
+
+            this._onPause = () => {
+                if (this._playedOnce && !v.ended) this._userPaused = true;
+                this._stopRvfc();
+            };
+
+            this._onPlay = () => {
+                this._playedOnce = true;
+                this._userPaused = false;
+                this._boostLoad();
+                this._startRvfc();
+                Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+            };
+
+            this._onClick = (e) => {
+                if (!ConfigManager.get('autoPlay') || !v.paused || v.ended) return;
+                if (e && e.defaultPrevented) return;
+
+                try {
+                    const t = e.target;
+                    if (
+                        t &&
+                        t.closest &&
+                        t.closest('button, input, select, textarea, a, label, [role="button"], [role="slider"], [role="menuitem"]')
+                    ) {
+                        return;
+                    }
+                } catch (err) { }
+
+                this._userPaused = false;
+                this._autoTried = 0;
+                this._boostLoad();
+                tryPlay(v);
+            };
+
+            this._onError = () => {
+                try {
+                    if (
+                        ConfigManager.get('watchdog') &&
+                        !this._userPaused &&
+                        !v.ended &&
+                        NOW() - this._lastEmergency > 2500
+                    ) {
+                        this._lastEmergency = NOW();
+                        this._emergencyLoad();
+                        Logger.warn('Session', '视频错误，触发紧急恢复 #' + this.id);
+                    }
+                } catch (e) { }
+            };
+
+            v.addEventListener('seeking', this._onSeeking);
+            v.addEventListener('seeked', this._onSeeked);
+            v.addEventListener('loadedmetadata', this._onLoaded);
+            v.addEventListener('canplay', this._onCanPlay);
+            v.addEventListener('waiting', this._onWaiting);
+            v.addEventListener('pause', this._onPause);
+            v.addEventListener('play', this._onPlay);
+            v.addEventListener('click', this._onClick, true);
+            v.addEventListener('error', this._onError, true);
+        }
+
+        _maybeAutoPlay() {
+            if (!ConfigManager.get('autoPlay') || this._userPaused || this._playedOnce || this._autoTried >= 3) return;
+
+            const v = this.video;
+            const doc = v.ownerDocument || DOC;
+            if (doc.hidden || !v.paused || v.ended) return;
+
+            const ahead = this._bufferAhead();
+            const minPre = ConfigManager.get('minPreBuffer') || 2;
+
+            if (ahead >= minPre || isLive(v) || v.readyState >= 3 || (this._autoTried === 0 && v.readyState >= 2)) {
+                this._autoTried++;
+                tryPlay(v);
+            }
+        }
+
+        _startRvfc() {
+            if (!ConfigManager.get('rvfcMonitor')) return;
+
+            const v = this.video;
+            if (!v || this._dead || this._rvfcRunning || typeof v.requestVideoFrameCallback !== 'function') return;
+
+            this._rvfcRunning = true;
+
+            const step = () => {
+                if (this._dead) {
+                    this._rvfcRunning = false;
+                    return;
+                }
+
+                try {
+                    if (!v.paused && !v.ended) {
+                        this._lastFrameTs = NOW();
+                        this._lastTime = v.currentTime;
+                        Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+                        this._rvfcId = v.requestVideoFrameCallback(step);
+                    } else {
+                        this._rvfcRunning = false;
+                    }
+                } catch (e) {
+                    this._rvfcRunning = false;
+                }
+            };
+
+            try {
+                this._rvfcId = v.requestVideoFrameCallback(step);
+            } catch (e) {
+                this._rvfcRunning = false;
+            }
+        }
+
+        _stopRvfc() {
+            try {
+                if (this._rvfcId && this.video && typeof this.video.cancelVideoFrameCallback === 'function') {
+                    this.video.cancelVideoFrameCallback(this._rvfcId);
+                }
+            } catch (e) { }
+            this._rvfcRunning = false;
+            this._rvfcId = 0;
+        }
+
+        _bufferCheck() {
+            const v = this.video;
+            if (!v || this._dead) return;
+
+            const ahead = this._bufferAhead();
+            const now = NOW();
+
+            if (ahead < 1 && v.readyState < 3 && !v.paused && !this.isSeeking) {
+                if (now - this._lastEmergency > 3000) {
+                    this._lastEmergency = now;
+                    this._emergencyLoad();
+                    this._lowCount++;
+
+                    if (
+                        this._lowCount >= 2 &&
+                        ConfigManager.get('autoDowngrade') &&
+                        ConfigManager.get('qualityManage')
+                    ) {
+                        if (Adaptor.switchLevel(v, -1)) {
+                            Bus.emit('TOAST', { msg: '网络不佳，已降画质', kind: 'warn', remote: false });
+                            Logger.warn('Session', '自动降低画质 #' + this.id);
+                        }
+                        this._lowCount = 0;
+                    }
+                }
+            } else if (ahead < 8 && !v.paused && !this.isSeeking) {
+                if (now - this._lastBoost > 8000) {
+                    this._lastBoost = now;
+                    this._boostLoad();
+                }
+                if (ahead > 5) this._lowCount = 0;
+            } else {
+                this._lowCount = 0;
+            }
+
+            const back = this._backBuffer();
+            if (back > 120) Adaptor.trimBack(v, 30);
+
+            if (this.isSeeking && ConfigManager.get('seekGuard')) {
+                const timeout = ConfigManager.get('seekTimeout') || 5000;
+                if (NOW() - this._seekStartTime > timeout) this._forceSeekRecover();
+            }
+
+            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+
+        _stallCheck() {
+            if (!ConfigManager.get('watchdog')) return;
+
+            const v = this.video;
+            if (!v || this._dead) return;
+
+            const doc = v.ownerDocument || DOC;
+            if (doc.hidden) return;
+
+            if (v.paused || v.ended || this.isSeeking || v.playbackRate === 0 || v.readyState < 3) {
+                this._lastTime = v.currentTime;
+                this._stallStart = 0;
+                this._stallLevel = 0;
+                return;
+            }
+
+            const now = NOW();
+            const t = v.currentTime;
+
+            const frameRecent = ConfigManager.get('rvfcMonitor') &&
+                this._lastFrameTs &&
+                (now - this._lastFrameTs < 1200);
+
+            if (t === this._lastTime && !frameRecent) {
+                if (!this._stallStart) this._stallStart = NOW();
+
+                const stalled = NOW() - this._stallStart;
+
+                if (stalled >= 1800 && this._stallLevel === 0) {
+                    this._stallLevel = 1;
+                    Bus.emit('STALL_DETECTED', { session: this, level: 1 });
+                } else if (stalled >= 3800 && this._stallLevel === 1) {
+                    this._stallLevel = 2;
+                    Bus.emit('STALL_DETECTED', { session: this, level: 2 });
+                } else if (stalled >= 6500 && this._stallLevel === 2) {
+                    this._stallLevel = 3;
+                    this._stallStart = 0;
+                    Bus.emit('STALL_DETECTED', { session: this, level: 3 });
+                }
+            } else {
+                this._stallStart = 0;
+                this._stallLevel = 0;
+                this._lastTime = t;
+            }
+        }
+
+        _safeSeek(target) {
+            const v = this.video;
+            try {
+                let hi;
+                if (isFinite(v.duration) && v.duration > 0) hi = Math.max(0, v.duration - 0.1);
+                else hi = target + 1;
+                v.currentTime = clamp(target, 0, hi);
+            } catch (e) { }
+        }
+
+        _nudge() {
+            this._safeSeek(this.video.currentTime + 0.1);
+        }
+
+        _reloadSegment() {
+            Adaptor.reloadSegment(this.video);
+        }
+
+        _forceSeekRecover() {
+            this.isSeeking = false;
+            this._stallLevel = 0;
+
+            const v = this.video;
+            const info = PlayerRegistry.get(v) || this.info;
+            const target = (typeof this.seekTarget === 'number' && this.seekTarget >= 0) ? this.seekTarget : v.currentTime;
+
+            try {
+                if (info && info.type === 'hls' && info.player) {
+                    info.player.startLoad(target);
+                } else {
+                    if (Math.abs(v.currentTime - target) < 0.1) this._safeSeek(target + 0.1);
+                    else this._safeSeek(target);
+                }
+            } catch (e) { }
+
+            if (
+                ConfigManager.get('autoPlay') &&
+                !this._userPaused &&
+                this._wasPlayingBeforeSeek &&
+                v.paused &&
+                !v.ended
+            ) {
+                tryPlay(v);
+            }
+
+            Bus.emit('TOAST', { msg: 'Seek超时，已强制恢复', kind: 'warn', remote: false });
+            Logger.warn('Session', 'Seek 超时恢复 #' + this.id);
+            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+
+        _boostAfterSeek() {
+            const info = PlayerRegistry.get(this.video) || this.info;
+            if (info && info.type === 'hls' && info.player) {
+                try { info.player.startLoad(this.video.currentTime); } catch (e) { }
+            } else {
+                try { this.video.preload = 'auto'; } catch (e) { }
+            }
+        }
+
+        _bufferAhead() {
+            const v = this.video;
+            try {
+                const t = v.currentTime;
+                for (let i = 0; i < v.buffered.length; i++) {
+                    const start = v.buffered.start(i);
+                    const end = v.buffered.end(i);
+                    if (t >= start - 0.3 && t <= end) return Math.max(0, end - t);
+                }
+            } catch (e) { }
+            return 0;
+        }
+
+        _backBuffer() {
+            const v = this.video;
+            try {
+                const t = v.currentTime;
+                for (let i = 0; i < v.buffered.length; i++) {
+                    const start = v.buffered.start(i);
+                    const end = v.buffered.end(i);
+                    if (t >= start && t <= end) return Math.max(0, t - start);
+                }
+            } catch (e) { }
+            return 0;
+        }
+
+        _emergencyLoad() {
+            const info = PlayerRegistry.get(this.video) || this.info;
+
+            if (info && info.type === 'hls' && info.player) {
+                try { info.player.startLoad(this.video.currentTime); } catch (e) { }
+            } else if (this.video.error || this.video.networkState === 3) {
+                this.safeLoad(true);
+            } else {
+                this._boostLoad();
+            }
+        }
+
+        _boostLoad() {
+            Adaptor.startLoad(this.video);
+        }
+
+        safeLoad(force) {
+            const v = this.video;
+            const info = PlayerRegistry.get(v) || this.info;
+
+            if (info && (info.type === 'hls' || info.type === 'dash')) return;
+
+            const src = v.currentSrc || v.src || '';
+            if (src.indexOf('blob:') === 0) return;
+
+            try {
+                if (!force && !v.error && v.networkState !== 3) return;
+
+                const target = v.currentTime;
+                v.load();
+
+                if (target > 0) {
+                    v.addEventListener('loadedmetadata', () => {
+                        try { v.currentTime = target; } catch (e) { }
+                    }, { once: true });
+                }
+
+                if (ConfigManager.get('autoPlay') && !this._userPaused) {
+                    v.addEventListener('canplay', () => {
+                        tryPlay(v);
+                    }, { once: true });
+                }
+            } catch (e) { }
+        }
+
+        softReload() {
+            const v = this.video;
+            const info = PlayerRegistry.get(v) || this.info;
+            const src = v.currentSrc || v.src || '';
+
+            try {
+                if (info && info.type === 'hls' && info.player) {
+                    try { info.player.recoverMediaError(); } catch (e) { }
+                    try { info.player.startLoad(v.currentTime); } catch (e) { }
+                } else if (info && info.type === 'dash' && info.player) {
+                    try {
+                        if (typeof info.player.refreshManifest === 'function') info.player.refreshManifest();
+                    } catch (e) { }
+                } else if (src && src.indexOf('blob:') !== 0) {
+                    this.safeLoad(true);
+                } else {
+                    this._nudge();
+                }
+
+                if (ConfigManager.get('autoPlay') && !v.ended) {
+                    this._userPaused = false;
+                    tryPlay(v);
+                }
+            } catch (e) { }
+
+            this._stallLevel = 0;
+            Logger.warn('Session', '软重载 #' + this.id);
+            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+
+        engineRecover() {
+            const now = NOW();
+            if (now - this._lastRecoverAt < 2000) return;
+
+            this._lastRecoverAt = now;
+            this.recoveries++;
+
+            const v = this.video;
+            const target = (typeof this.seekTarget === 'number' && this.seekTarget >= 0) ? this.seekTarget : v.currentTime;
+            const info = PlayerRegistry.get(v) || this.info;
+
+            try {
+                if (info && info.type === 'hls' && info.player) {
+                    try { info.player.recoverMediaError(); } catch (e) { }
+                    try { info.player.startLoad(target); } catch (e) { }
+                } else if (info && info.type === 'native' && (v.error || v.networkState === 3)) {
+                    this.safeLoad(true);
+                } else {
+                    this._safeSeek(target + 0.05);
+                }
+
+                if (ConfigManager.get('autoPlay') && !v.ended) {
+                    this._userPaused = false;
+                    tryPlay(v);
+                }
+            } catch (e) { }
+
+            this._stallLevel = 0;
+            Logger.warn('Session', '引擎恢复 #' + this.id, { recoveries: this.recoveries });
+            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+
+        getState() {
+            const v = this.video;
+            const q = Adaptor.getInfo(v);
+
+            return {
+                status: v.paused ? (v.ended ? '已停止' : '已暂停') : '播放中',
+                statusKey: v.paused ? (v.ended ? 'stop' : 'pause') : 'play',
+                playerType: this.type,
+                playerLabel: PLAYER_LABEL[this.type] || this.type,
+                buffer: this._bufferAhead(),
+                currentTime: v.currentTime || 0,
+                duration: isFinite(v.duration) ? v.duration : 0,
+                videoWidth: v.videoWidth || 0,
+                videoHeight: v.videoHeight || 0,
+                readyState: v.readyState,
+                networkType: getNetworkType(),
+                quality: q,
+                canChangeQuality: Adaptor.canChangeQuality(v),
+                bandwidth: q.bandwidth || estimateBandwidth(),
+                seeking: this.isSeeking,
+                stallLevel: this._stallLevel
+            };
+        }
+
+        destroy() {
+            this._dead = true;
+
+            if (this._bufferIv) { clearInterval(this._bufferIv); this._bufferIv = null; }
+            if (this._stallIv) { clearInterval(this._stallIv); this._stallIv = null; }
+
+            this._stopRvfc();
+
+            try {
+                this.video.removeEventListener('seeking', this._onSeeking);
+                this.video.removeEventListener('seeked', this._onSeeked);
+                this.video.removeEventListener('loadedmetadata', this._onLoaded);
+                this.video.removeEventListener('canplay', this._onCanPlay);
+                this.video.removeEventListener('waiting', this._onWaiting);
+                this.video.removeEventListener('pause', this._onPause);
+                this.video.removeEventListener('play', this._onPlay);
+                this.video.removeEventListener('click', this._onClick, true);
+                this.video.removeEventListener('error', this._onError, true);
+            } catch (e) { }
+
+            try { delete this.video.__vaSession; } catch (e) { }
+
+            Bus.emit('SESSION_DESTROY', { session: this });
+            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       SessionManager 会话管理器
+    ═══════════════════════════════════════════════════════════ */
+
+    class SessionManagerClass {
+        constructor(bus) {
+            this.bus = bus;
+            this.sessions = new Set();
+            this.seen = new WeakSet();
+
+            this._lastPublish = 0;
+            this._publishTimer = null;
+
+            this._install();
+        }
+
+        _install() {
+            this.bus.on('VIDEO_FOUND', (payload) => {
+                if (!payload || !payload.video) return;
+                this._queueTakeOver(payload.video, payload);
+            });
+
+            this.bus.on('VIDEO_BOOST', (payload) => {
+                if (!payload || !payload.video) return;
+                this.boostVideo(payload.video, payload.reason);
+            });
+
+            this.bus.on('CMD', (payload) => {
+                if (!payload || !payload.cmd) return;
+                this.command(payload.cmd, payload.remote);
+            });
+
+            this.bus.on('SESSION_UPDATE', () => {
+                this._schedulePublish();
+            });
+
+            this.bus.on('SESSION_DESTROY', (payload) => {
+                if (!payload || !payload.session) return;
+                this.sessions.delete(payload.session);
+                try { this.seen.delete(payload.session.video); } catch (e) { }
+            });
+
+            this.bus.on('PATROL', () => {
+                this._patrolCleanup();
+                this._publishLocal(true);
+            });
+
+            this.bus.on('CONFIG_CHANGE', () => {
+                this.applyConfig();
+            });
+        }
+
+        _queueTakeOver(video, opts) {
+            opts = opts || {};
+            if (!video || video.nodeName !== 'VIDEO') return;
+
+            const s = video.__vaSession;
+            if (s) {
+                if (opts.force) {
+                    s._userPaused = false;
+                    s._boostLoad();
+                    if (ConfigManager.get('autoPlay') && video.paused && !video.ended) {
+                        tryPlay(video);
+                    }
+                }
+                return;
+            }
+
+            if (this.seen.has(video)) return;
+            if (!video.isConnected && !opts.force) return;
+
+            if (
+                ConfigManager.get('visibleOnly') &&
+                !opts.force &&
+                video.ownerDocument === DOC &&
+                Detector._viewportObs
+            ) {
+                Detector.watchViewport(video);
+                return;
+            }
+
+            this._takeOver(video, opts);
+        }
+
+        _takeOver(video, opts) {
+            opts = opts || {};
+
+            if (this.seen.has(video) || video.__vaSession) return;
+            if (!video || (!video.isConnected && !opts.force)) return;
+
+            if (ConfigManager.get('visibleOnly') && !opts.force) {
+                if (!isVisible(video) || videoArea(video) < (ConfigManager.get('minVideoArea') || 0)) return;
+            }
+
+            this.seen.add(video);
+
+            try {
+                const session = new VideoSession(video, opts);
+                this.sessions.add(session);
+                this.bus.emit('SESSION_CREATED', { session: session });
+                this._schedulePublish();
+            } catch (e) {
+                Logger.error('SessionManager', '接管视频失败', e);
+            }
+        }
+
+        boostVideo(video, reason) {
+            try {
+                if (!video || video.nodeName !== 'VIDEO') return;
+
+                video.preload = 'auto';
+
+                const lazy = video.getAttribute && (video.getAttribute('data-src') || video.getAttribute('data-lazy-src'));
+                if (lazy && !video.src && /^(https?:)?\/\//i.test(lazy)) video.src = lazy;
+
+                addPreconnect(video.currentSrc || video.src, video.ownerDocument);
+
+                const s = video.__vaSession;
+                if (s) {
+                    s._userPaused = false;
+                    s._boostLoad();
+                }
+            } catch (e) { }
+        }
+
+        command(cmd, remote) {
+            if (cmd === 'recover') {
+                this.sessions.forEach(function (s) {
+                    try { s._userPaused = false; s.engineRecover(); } catch (e) { }
+                });
+                Logger.info('Command', '执行恢复播放', { remote: !!remote });
+            } else if (cmd === 'reload') {
+                this.sessions.forEach(function (s) {
+                    try { s._userPaused = false; s.softReload(); } catch (e) { }
+                });
+                Logger.info('Command', '执行重新加载', { remote: !!remote });
+            } else if (cmd === 'upgrade' || cmd === 'downgrade') {
+                let ok = false;
+                const delta = cmd === 'upgrade' ? 1 : -1;
+
+                this.sessions.forEach(function (s) {
+                    try {
+                        if (Adaptor.switchLevel(s.video, delta)) ok = true;
+                    } catch (e) { }
+                });
+
+                if (!remote && this.sessions.size > 0) {
+                    if (ok) {
+                        Bus.emit('TOAST', { msg: cmd === 'upgrade' ? '已提升画质' : '已降低画质', kind: 'ok', remote: false });
+                    } else {
+                        Bus.emit('TOAST', { msg: cmd === 'upgrade' ? '无法提升画质' : '无法降低画质', kind: 'warn', remote: false });
+                    }
+                }
+
+                Logger.info('Command', cmd === 'upgrade' ? '提升画质' : '降低画质', { ok: ok, remote: !!remote });
+            }
+
+            this._publishLocal(true);
+        }
+
+        applyConfig() {
+            this.sessions.forEach(function (s) {
+                try {
+                    Adaptor.applyConfig(s.video);
+                    s.video.preload = 'auto';
+                } catch (e) { }
+            });
+            this._publishLocal(true);
+        }
+
+        _schedulePublish() {
+            if (this._publishTimer) return;
+            this._publishTimer = setTimeout(() => {
+                this._publishTimer = null;
+                this._publishLocal(true);
+            }, 120);
+        }
+
+        _publishLocal(force) {
+            const now = NOW();
+            if (!force && now - this._lastPublish < 600) return;
+            this._lastPublish = now;
+
+            const state = this._collectLocalState();
+            this.bus.emit('LOCAL_STATE', state);
+        }
+
+        _collectLocalState() {
+            let videos = this.sessions.size;
+            let recoveries = 0;
+            let primary = null;
+            let bestScore = -1;
+
+            this.sessions.forEach(function (s) {
+                recoveries += s.recoveries || 0;
+
+                const v = s.video;
+                if (!v) return;
+
+                let score = 0;
+                if (!v.paused) score += 10000;
+                if (!v.ended) score += 1000;
+                if (v.readyState >= 3) score += 100;
+                score += videoArea(v);
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    primary = s;
+                }
+            });
+
+            if (!primary) {
+                return {
+                    status: '未检测到视频',
+                    statusKey: 'idle',
+                    playerType: 'unknown',
+                    playerLabel: '-',
+                    buffer: 0,
+                    recoveries: recoveries,
+                    videos: videos,
+                    currentTime: 0,
+                    duration: 0,
+                    videoWidth: 0,
+                    videoHeight: 0,
+                    readyState: 0,
+                    networkType: getNetworkType(),
+                    quality: { level: -1, total: 0, bandwidth: 0, height: 0 },
+                    canChangeQuality: false,
+                    bandwidth: 0,
+                    seeking: false,
+                    stallLevel: 0
+                };
+            }
+
+            const st = primary.getState();
+            st.videos = videos;
+            st.recoveries = recoveries;
+            return st;
+        }
+
+        _patrolCleanup() {
+            const toDestroy = [];
+
+            this.sessions.forEach((s) => {
+                const v = s.video;
+
+                if (!v || s._dead) {
+                    toDestroy.push(s);
+                    return;
+                }
+
+                if (!v.isConnected) {
+                    toDestroy.push(s);
+                    return;
+                }
+
+                if (s.type === 'unknown' || s.type === 'mse') {
+                    const newInfo = Adaptor.detect(v);
+                    if (newInfo.type !== 'unknown' && newInfo.type !== s.type) {
+                        s.info = newInfo;
+                        s.type = newInfo.type;
+                    }
+                }
+            });
+
+            toDestroy.forEach(function (s) {
+                try { s.destroy(); } catch (e) { }
+            });
+        }
+    }
+
+    const SessionManager = new SessionManagerClass(Bus);
+
+    /* ═══════════════════════════════════════════════════════════
+       RecoveryStrategy 分级恢复策略
+    ═══════════════════════════════════════════════════════════ */
+
+    const RecoveryStrategy = {
+        init() {
+            Bus.on('STALL_DETECTED', (payload) => {
+                if (!payload || !payload.session || payload.session._dead) return;
+
+                const session = payload.session;
+                const level = payload.level;
+
+                try {
+                    if (level === 1) {
+                        session._nudge();
+                        Logger.info('Recovery', 'L1 轻推 #' + session.id);
+                    } else if (level === 2) {
+                        session._reloadSegment();
+                        Logger.warn('Recovery', 'L2 重载切片 #' + session.id);
+                    } else if (level === 3) {
+                        session.engineRecover();
+                        Logger.warn('Recovery', 'L3 引擎恢复 #' + session.id);
+                    }
+                } catch (e) {
+                    Logger.error('Recovery', '恢复执行失败 #' + session.id, e);
+                }
+            });
+        }
+    };
+
+    RecoveryStrategy.init();
+
+    /* ═══════════════════════════════════════════════════════════
+       UIManager 控制台
+    ═══════════════════════════════════════════════════════════ */
+
+    class UIManager {
+        constructor(bus) {
+            this.bus = bus;
+            this._state = {};
+            this._visible = false;
+
+            this._logs = [];
+            this._logFilter = 'all';
+
+            this._timeline = [];
+            this._lastStallMarker = 0;
+            this._lastRecoveries = 0;
+            this._lastTimelineRender = 0;
+
+            this._build();
+            this._mountWhenReady();
+            this._subscribe();
+        }
+
+        _build() {
+            const existing = DOC.getElementById('va-ui-host');
+            if (existing) existing.remove();
+
+            this.host = DOC.createElement('div');
+            this.host.id = 'va-ui-host';
+            this.host.style.cssText = 'position:fixed;z-index:2147483646;top:0;left:0;width:0;height:0;overflow:visible;';
+
+            this.root = this.host.attachShadow({ mode: 'closed' });
+
+            const style = DOC.createElement('style');
+            style.textContent = `
+                :host{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px}
+                *{box-sizing:border-box}
+                .panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+                    background:rgba(12,12,18,.94);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+                    border:1px solid rgba(255,255,255,.12);border-radius:14px;
+                    box-shadow:0 20px 60px rgba(0,0,0,.5);
+                    width:min(460px,calc(100vw - 24px));max-height:80vh;overflow:hidden;color:#e8e8ec;
+                    display:flex;flex-direction:column}
+                .hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;
+                    border-bottom:1px solid rgba(255,255,255,.08)}
+                .hdr h3{margin:0;font-size:15px;font-weight:600;color:#fff}
+                .close-x{background:none;border:none;color:#666;font-size:18px;cursor:pointer;padding:2px 6px;border-radius:5px}
+                .close-x:hover{color:#fff;background:rgba(255,255,255,.1)}
+                .tabs{display:flex;padding:0 12px;border-bottom:1px solid rgba(255,255,255,.08);gap:2px}
+                .tab{padding:9px 12px;cursor:pointer;font-size:12px;color:#777;border-bottom:2px solid transparent;user-select:none}
+                .tab:hover{color:#bbb}
+                .tab.active{color:#fff;border-bottom-color:#0a84ff}
+                .body{padding:10px 14px 12px;overflow-y:auto;flex:1;min-height:0}
+                .page{display:none}
+                .page.active{display:block}
+                .row{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#999;margin:3px 0;flex-wrap:wrap}
+                .row b{color:#fff}
+                .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;background:#555}
+                .dot.live{background:#30d158;box-shadow:0 0 6px #30d158}
+                .dot.pause{background:#8e8e93}
+                .dot.stop{background:#ff9f0a}
+                .dot.seek{background:#bf5af2;box-shadow:0 0 6px #bf5af2}
+                .buf-wrap{margin:8px 0}
+                .buf-label{display:flex;justify-content:space-between;font-size:11px;color:#888;margin-bottom:4px}
+                .buf-bar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden}
+                .buf-fill{height:100%;background:linear-gradient(90deg,#0a84ff,#30d158);width:0%;transition:width .25s cubic-bezier(0.4,0,.2,1);border-radius:3px}
+                .info-box{background:rgba(255,255,255,.04);border-radius:8px;padding:6px 10px;margin:5px 0;font-size:12px;color:#999;line-height:1.6}
+                .info-box span{color:#ddd;font-weight:500}
+                .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin:8px 0}
+                .stat-card{background:rgba(255,255,255,.05);border-radius:8px;padding:6px 8px;text-align:center}
+                .stat-card .val{font-size:15px;font-weight:700;color:#fff}
+                .stat-card .lbl{font-size:10px;color:#777}
+                .btn-group{display:flex;gap:5px;flex-wrap:wrap;margin:6px 0}
+                button.act{padding:8px 10px;border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;
+                    font-size:12px;font-weight:500;flex:1;display:flex;align-items:center;justify-content:center;
+                    background:rgba(255,255,255,.07);color:#fff;transition:all .15s}
+                button.act:hover:not(:disabled){filter:brightness(1.2);transform:translateY(-1px)}
+                button.act:active:not(:disabled){transform:translateY(1px);filter:brightness(0.9)}
+                button.act:disabled{opacity:.3;cursor:not-allowed}
+                .btn-p{background:rgba(10,132,255,.6)}
+                .btn-w{background:rgba(255,159,10,.6)}
+                .btn-g{background:rgba(48,209,88,.6)}
+                .btn-d{background:rgba(255,69,58,.6)}
+                .divider{height:1px;background:rgba(255,255,255,.08);margin:8px 0}
+                .sec-title{font-size:11px;color:#0a84ff;margin:8px 0 4px;font-weight:600}
+                label.opt{display:flex;align-items:center;gap:7px;font-size:12px;color:#bbb;margin:5px 0;cursor:pointer}
+                label.opt input[type=checkbox]{width:15px;height:15px;accent-color:#0a84ff;cursor:pointer}
+                label.opt input[type=number],label.opt select{width:88px;padding:4px 6px;margin-left:auto;border:1px solid rgba(255,255,255,.12);
+                    border-radius:6px;background:rgba(0,0,0,.3);color:#eee;font-size:12px}
+                .hint{font-size:11px;color:#666;line-height:1.5;margin-top:8px}
+                .toast{position:fixed;top:18px;right:18px;padding:8px 14px;border-radius:10px;
+                    background:rgba(28,28,35,.95);border:1px solid rgba(255,255,255,.12);color:#fff;font-size:13px;
+                    transform:translateX(120%);transition:transform .25s,opacity .25s;opacity:0;pointer-events:none;z-index:10}
+                .toast.show{transform:translateX(0);opacity:1}
+                .toast.ok{border-left:3px solid #30d158}
+                .toast.warn{border-left:3px solid #ff9f0a}
+                .toast.err{border-left:3px solid #ff453a}
+                .stall-badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:6px}
+                .stall-badge.s1{background:rgba(255,159,10,.3);color:#ff9f0a}
+                .stall-badge.s2{background:rgba(255,69,58,.3);color:#ff453a}
+                .stall-badge.s3{background:rgba(255,0,0,.4);color:#fff}
+                .fab{position:fixed;bottom:18px;right:18px;width:38px;height:38px;border-radius:50%;
+                    background:rgba(10,132,255,.75);color:#fff;display:flex;align-items:center;justify-content:center;
+                    font-size:18px;cursor:pointer;opacity:.45;transition:opacity .15s,transform .15s;z-index:9;user-select:none}
+                .fab:hover{opacity:1;transform:scale(1.06)}
+                .timeline-wrap{margin:8px 0}
+                .timeline{position:relative;height:18px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
+                .tl-item{position:absolute;top:2px;bottom:2px;width:3px;border-radius:1px}
+                .tl-stall{background:#ff9f0a}
+                .tl-warn{background:#ffd60a}
+                .tl-error{background:#ff453a}
+                .tl-recover{background:#30d158}
+                .log-toolbar{display:flex;align-items:center;gap:6px;margin:8px 0}
+                .log-toolbar span{font-size:11px;color:#0a84ff;font-weight:600}
+                .log-toolbar select{margin-left:auto;padding:3px 6px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(0,0,0,.3);color:#eee;font-size:11px}
+                .mini{padding:3px 8px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.07);color:#fff;cursor:pointer;font-size:11px}
+                .logs{height:160px;overflow:auto;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:6px;font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.45}
+                .log-line{white-space:pre-wrap;word-break:break-all}
+                .log-line.debug{color:#8e8e93}
+                .log-line.info{color:#d0d0d8}
+                .log-line.warn{color:#ffd60a}
+                .log-line.error{color:#ff453a}
+                .dep-hint{font-size:11px;color:#ff9f0a;background:rgba(255,159,10,.08);border:1px solid rgba(255,159,10,.25);border-radius:6px;padding:5px 8px;margin:4px 0}
+            `;
+            this.root.appendChild(style);
+
+            this._toast = DOC.createElement('div');
+            this._toast.className = 'toast';
+            this.root.appendChild(this._toast);
+
+            this._fab = DOC.createElement('div');
+            this._fab.className = 'fab';
+            this._fab.textContent = '🎬';
+            this._fab.title = '视频加速控制台';
+            this._fab.addEventListener('click', () => this.toggle());
+            this.root.appendChild(this._fab);
+
+            this._panel = DOC.createElement('div');
+            this._panel.className = 'panel';
+            this._panel.style.display = 'none';
+
+            this._panel.innerHTML = `
+                <div class="hdr"><h3>🎬 视频加速控制台</h3><button class="close-x" data-act="close">✕</button></div>
+                <div class="tabs">
+                    <div class="tab active" data-tab="monitor">📊 实时监控</div>
+                    <div class="tab" data-tab="settings">⚙️ 功能设置</div>
+                    <div class="tab" data-tab="tools">📦 数据管理</div>
+                </div>
+                <div class="body">
+                    <div class="page active" id="page-monitor">
+                        <div class="row">
+                            <span><span class="dot" id="va-dot"></span><b id="va-status">检测中</b><span id="va-stall"></span></span>
+                            <span>播放器: <b id="va-type">-</b></span>
+                            <span>视频数: <b id="va-count">0</b></span>
+                        </div>
+
+                        <div class="buf-wrap">
+                            <div class="buf-label"><span>前方缓冲</span><span id="va-buf-time">0s</span></div>
+                            <div class="buf-bar"><div class="buf-fill" id="va-buf-fill"></div></div>
+                        </div>
+
+                        <div class="info-box">
+                            画质: <span id="va-quality">-</span> · 带宽: <span id="va-bw">-</span> · 分辨率: <span id="va-res">-</span><br>
+                            网络健康: <span id="va-health">-</span> · 网络类型: <span id="va-net">-</span>
+                        </div>
+
+                        <div class="timeline-wrap">
+                            <div class="buf-label"><span>近 60 秒卡顿 / 恢复时间轴</span></div>
+                            <div class="timeline" id="va-timeline"></div>
+                        </div>
+
+                        <div class="stat-grid">
+                            <div class="stat-card"><div class="val" id="va-rec">0</div><div class="lbl">恢复次数</div></div>
+                            <div class="stat-card"><div class="val" id="va-ready">-</div><div class="lbl">就绪状态</div></div>
+                        </div>
+
+                        <div class="info-box">进度: <span id="va-progress">--/--</span></div>
+
+                        <div class="btn-group">
+                            <button class="act btn-p" data-act="recover">恢复播放</button>
+                            <button class="act btn-w" data-act="reload">重新加载</button>
+                        </div>
+                        <div class="btn-group">
+                            <button class="act btn-g" data-act="upgrade" id="va-up">提升画质</button>
+                            <button class="act btn-d" data-act="downgrade" id="va-down">降低画质</button>
+                        </div>
+
+                        <div class="hint">恢复播放：修复卡死 / 错误；重新加载：按播放器类型安全重载。</div>
+                    </div>
+
+                    <div class="page" id="page-settings">
+                        <div class="sec-title">注入与嗅探策略</div>
+                        <label class="opt"><input type="checkbox" id="va-proto"> 原型嗅探（src / play / load）</label>
+                        <label class="opt"><input type="checkbox" id="va-pointer"> pointerdown 预启动</label>
+                        <label class="opt"><input type="checkbox" id="va-fast"> DOM 动态扫描</label>
+                        <label class="opt"><input type="checkbox" id="va-visible"> 仅接管可见视频</label>
+                        <label class="opt">最小接管面积 <input type="number" id="va-area" min="0" step="1000"></label>
+
+                        <div class="divider"></div>
+
+                        <div class="sec-title">网络与缓冲策略</div>
+                        <label class="opt"><input type="checkbox" id="va-fetch"> 视频请求高优先级</label>
+                        <label class="opt"><input type="checkbox" id="va-preconnect"> DNS / preconnect 预热</label>
+                        <label class="opt"><input type="checkbox" id="va-instant"> play() 即时增强</label>
+                        <label class="opt"><input type="checkbox" id="va-big"> 超大缓冲</label>
+                        <label class="opt">缓冲目标 <input type="number" id="va-btgt" min="10" max="300" step="10"> 秒</label>
+                        <label class="opt">预缓冲量 <input type="number" id="va-prebuf" min="1" max="30"> 秒</label>
+                        <label class="opt"><input type="checkbox" id="va-quality"> 画质管理（HLS 切换）</label>
+                        <label class="opt"><input type="checkbox" id="va-autodown"> 缓冲不足自动降画质</label>
+                        <div id="va-dep-down" class="dep-hint" style="display:none">提示：自动降画质依赖“画质管理”。</div>
+
+                        <div class="divider"></div>
+
+                        <div class="sec-title">容错与自愈策略</div>
+                        <label class="opt"><input type="checkbox" id="va-auto"> 自动播放 / 续播</label>
+                        <label class="opt"><input type="checkbox" id="va-seek"> Seek 保护（超时恢复）</label>
+                        <label class="opt">Seek 超时 <input type="number" id="va-seekto" min="2000" max="15000" step="500"> ms</label>
+                        <label class="opt"><input type="checkbox" id="va-watchdog"> 卡死分级恢复</label>
+                        <label class="opt"><input type="checkbox" id="va-rvfc"> RVFC 帧级卡顿监控</label>
+
+                        <div class="divider"></div>
+
+                        <div class="sec-title">检测与提示</div>
+                        <label class="opt"><input type="checkbox" id="va-toast"> 显示操作提示</label>
+                        <label class="opt"><input type="checkbox" id="va-detect"> 显示接管通知</label>
+                        <label class="opt">日志级别
+                            <select id="va-loglevel">
+                                <option value="debug">Debug</option>
+                                <option value="info">Info</option>
+                                <option value="warn">Warn</option>
+                                <option value="error">Error</option>
+                            </select>
+                        </label>
+
+                        <div class="hint">v18 优先使用原型嗅探 + 手势预启动；缓冲 / 自动降画质主要对 HLS.js 生效。</div>
+                    </div>
+
+                    <div class="page" id="page-tools">
+                        <div class="btn-group">
+                            <button class="act" data-act="exportCfg">导出配置</button>
+                            <button class="act" data-act="importCfg">导入配置</button>
+                        </div>
+                        <div class="btn-group">
+                            <button class="act btn-d" data-act="resetAll">恢复默认</button>
+                        </div>
+
+                        <div class="log-toolbar">
+                            <span>运行日志</span>
+                            <select id="va-logfilter">
+                                <option value="all">全部</option>
+                                <option value="info">Info+</option>
+                                <option value="warn">Warn+</option>
+                                <option value="error">Error</option>
+                            </select>
+                            <button class="mini" data-act="clearLogs">清空</button>
+                        </div>
+                        <div class="logs" id="va-logs"></div>
+
+                        <div class="hint" id="va-hint"></div>
+                        <div class="divider"></div>
+                        <div class="hint">v18.0：微内核架构、事件总线、日志流、网络健康评分、卡顿时间轴。</div>
+                    </div>
+                </div>
+            `;
+
+            this.root.appendChild(this._panel);
+
+            this._panel.querySelectorAll('.tab').forEach((tab) => {
+                tab.addEventListener('click', () => {
+                    this._panel.querySelectorAll('.tab').forEach(function (t) { t.classList.remove('active'); });
+                    this._panel.querySelectorAll('.page').forEach(function (p) { p.classList.remove('active'); });
+
+                    tab.classList.add('active');
+                    const page = this._panel.querySelector('#page-' + tab.dataset.tab);
+                    if (page) page.classList.add('active');
+                });
+            });
+
+            this._panel.addEventListener('click', (e) => {
+                const t = e.target.closest('[data-act]');
+                if (!t) return;
+
+                const act = t.getAttribute('data-act');
+
+                if (act === 'close') {
+                    this.hide();
+                } else if (act === 'exportCfg') {
+                    this.bus.emit('CONFIG_EXPORT_REQUEST', {});
+                } else if (act === 'importCfg') {
+                    this._import();
+                } else if (act === 'resetAll') {
+                    this.bus.emit('CONFIG_RESET_REQUEST', {});
+                    this.toast('已恢复默认', 'ok');
+                } else if (act === 'clearLogs') {
+                    this._logs = [];
+                    this._renderAllLogs();
+                } else if (['recover', 'reload', 'upgrade', 'downgrade'].indexOf(act) >= 0) {
+                    this.bus.emit('CMD', { cmd: act, remote: false });
+                }
+            });
+
+            const logFilter = this._panel.querySelector('#va-logfilter');
+            if (logFilter) {
+                logFilter.addEventListener('change', () => {
+                    this._logFilter = logFilter.value;
+                    this._renderAllLogs();
+                });
+            }
+
+            this._bindSettings();
+        }
+
+        _subscribe() {
+            this.bus.on('STATE_AGGREGATED', (state) => {
+                this._maybeAddStateMarkers(state);
+                this.update(state);
+            });
+
+            this.bus.on('LOG_EMIT', (entry) => {
+                this._appendLog(entry);
+            });
+
+            this.bus.on('TOAST', (payload) => {
+                if (payload && payload.msg) this.toast(payload.msg, payload.kind);
+            });
+
+            this.bus.on('UI_TOGGLE', () => {
+                this.toggle();
+            });
+
+            this.bus.on('CONFIG_EXPORT_RESULT', (payload) => {
+                if (!payload || !payload.json) return;
+                const ta = this._ensureTextarea();
+                ta.value = payload.json;
+                ta.select();
+
+                let ok = false;
+                try { ok = DOC.execCommand('copy'); } catch (e) { }
+                if (ok) this.toast('已复制到剪贴板', 'ok');
+                else this.toast('请手动复制', 'warn');
+            });
+
+            this.bus.on('CONFIG_IMPORT_RESULT', (payload) => {
+                const ok = payload && payload.ok;
+                const ta = this._panel.querySelector('#va-cfg-ta');
+                const hint = this._panel.querySelector('#va-hint');
+
+                if (ok) {
+                    if (ta) ta.remove();
+                    if (hint) hint.textContent = '';
+                    this._syncSettings();
+                    this.toast('导入成功', 'ok');
+                } else {
+                    this.toast('导入失败：JSON 格式错误', 'err');
+                }
+            });
+
+            this.bus.on('CONFIG_CHANGE', () => {
+                this._syncSettings();
+            });
+        }
+
+        _bindSettings() {
+            const bus = this.bus;
+
+            const bind = (id, key, transform) => {
+                const el = this._panel.querySelector('#' + id);
+                if (!el) return;
+
+                el.addEventListener('change', () => {
+                    const value = transform ? transform(el) : el.checked;
+                    bus.emit('CONFIG_SET', { key: key, value: value });
+                });
+            };
+
+            // 注入与嗅探
+            bind('va-proto', 'protoHook');
+            bind('va-pointer', 'earlyPointer');
+            bind('va-fast', 'fastDetect');
+            bind('va-visible', 'visibleOnly');
+            bind('va-area', 'minVideoArea', function (el) { return parseInt(el.value, 10) || 0; });
+
+            // 网络与缓冲
+            bind('va-fetch', 'fetchPriority');
+            bind('va-preconnect', 'preconnect');
+            bind('va-instant', 'instantPlay');
+            bind('va-big', 'bigBuffer');
+            bind('va-btgt', 'bufferTarget', function (el) { return parseInt(el.value, 10) || 60; });
+            bind('va-prebuf', 'minPreBuffer', function (el) { return parseInt(el.value, 10) || 2; });
+            bind('va-quality', 'qualityManage');
+            bind('va-autodown', 'autoDowngrade');
+
+            // 容错与自愈
+            bind('va-auto', 'autoPlay');
+            bind('va-seek', 'seekGuard');
+            bind('va-seekto', 'seekTimeout', function (el) { return parseInt(el.value, 10) || 5000; });
+            bind('va-watchdog', 'watchdog');
+            bind('va-rvfc', 'rvfcMonitor');
+
+            // 检测与提示
+            bind('va-toast', 'showToast');
+            bind('va-detect', 'showDetect');
+            bind('va-loglevel', 'logLevel', function (el) { return el.value; });
+        }
+
+        _syncSettings() {
+            const chk = (id, v) => {
+                const el = this._panel.querySelector('#' + id);
+                if (el) el.checked = !!v;
+            };
+            const set = (id, v) => {
+                const el = this._panel.querySelector('#' + id);
+                if (el) el.value = v;
+            };
+
+            chk('va-proto', ConfigManager.get('protoHook'));
+            chk('va-pointer', ConfigManager.get('earlyPointer'));
+            chk('va-fast', ConfigManager.get('fastDetect'));
+            chk('va-visible', ConfigManager.get('visibleOnly'));
+            set('va-area', ConfigManager.get('minVideoArea'));
+
+            chk('va-fetch', ConfigManager.get('fetchPriority'));
+            chk('va-preconnect', ConfigManager.get('preconnect'));
+            chk('va-instant', ConfigManager.get('instantPlay'));
+            chk('va-big', ConfigManager.get('bigBuffer'));
+            set('va-btgt', ConfigManager.get('bufferTarget'));
+            set('va-prebuf', ConfigManager.get('minPreBuffer'));
+            chk('va-quality', ConfigManager.get('qualityManage'));
+            chk('va-autodown', ConfigManager.get('autoDowngrade'));
+
+            chk('va-auto', ConfigManager.get('autoPlay'));
+            chk('va-seek', ConfigManager.get('seekGuard'));
+            set('va-seekto', ConfigManager.get('seekTimeout'));
+            chk('va-watchdog', ConfigManager.get('watchdog'));
+            chk('va-rvfc', ConfigManager.get('rvfcMonitor'));
+
+            chk('va-toast', ConfigManager.get('showToast'));
+            chk('va-detect', ConfigManager.get('showDetect'));
+            set('va-loglevel', ConfigManager.get('logLevel'));
+
+            this._updateDependency();
+        }
+
+        _updateDependency() {
+            const el = this._panel.querySelector('#va-dep-down');
+            if (!el) return;
+            const show = ConfigManager.get('autoDowngrade') && !ConfigManager.get('qualityManage');
+            el.style.display = show ? 'block' : 'none';
+        }
+
+        _ensureTextarea() {
+            let ta = this._panel.querySelector('#va-cfg-ta');
+            if (!ta) {
+                ta = DOC.createElement('textarea');
+                ta.id = 'va-cfg-ta';
+                ta.style.cssText = 'width:100%;height:80px;margin-top:8px;background:rgba(0,0,0,.3);color:#eee;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:8px;font-size:11px;font-family:ui-monospace,Consolas,monospace;';
+                this._panel.querySelector('#page-tools').appendChild(ta);
+            }
+            return ta;
+        }
+
+        _import() {
+            let ta = this._panel.querySelector('#va-cfg-ta');
+            const hint = this._panel.querySelector('#va-hint');
+
+            if (!ta) {
+                ta = this._ensureTextarea();
+                ta.placeholder = '粘贴 JSON 配置后再次点击导入';
+                if (hint) hint.textContent = '粘贴配置后再次点击“导入配置”。';
+                return;
+            }
+
+            if (!ta.value.trim()) {
+                this.toast('请先粘贴 JSON 配置', 'warn');
+                return;
+            }
+
+            this.bus.emit('CONFIG_IMPORT_REQUEST', { json: ta.value });
+        }
+
+        _mountWhenReady() {
+            if (this.host.isConnected) return;
+
+            const doMount = () => {
+                try {
+                    (DOC.body || DOC.documentElement).appendChild(this.host);
+                } catch (e) { }
+            };
+
+            if (DOC.body) {
+                doMount();
+            } else {
+                DOC.addEventListener('DOMContentLoaded', doMount, { once: true });
+            }
+        }
+
+        _mount() {
+            this._mountWhenReady();
+        }
+
+        toggle() {
+            this._visible ? this.hide() : this.show();
+        }
+
+        show() {
+            this._mount();
+            this._syncSettings();
+            this._renderAllLogs();
+            this._renderTimeline();
+
+            this._panel.style.display = '';
+            this._visible = true;
+
+            if (this._fab) this._fab.style.display = 'none';
+        }
+
+        hide() {
+            this._panel.style.display = 'none';
+            this._visible = false;
+
+            if (this._fab) this._fab.style.display = 'flex';
+        }
+
+        toast(msg, kind) {
+            if (ConfigManager.get('showToast') === false) return;
+
+            this._mount();
+            this._toast.textContent = msg;
+            this._toast.className = 'toast show ' + (kind || '');
+
+            clearTimeout(this._toastT);
+            this._toastT = setTimeout(() => {
+                this._toast.className = 'toast';
+            }, 2000);
+        }
+
+        _fmtTime(s) {
+            if (!isFinite(s) || s <= 0) return '--:--';
+            const m = Math.floor(s / 60);
+            const sec = Math.floor(s % 60);
+            return m + ':' + String(sec).padStart(2, '0');
+        }
+
+        _fmtBw(bps) {
+            if (!bps || bps <= 0) return '未知';
+            if (bps >= 1000000) return (bps / 1000000).toFixed(1) + ' Mbps';
+            if (bps >= 1000) return (bps / 1000).toFixed(0) + ' Kbps';
+            return bps + ' bps';
+        }
+
+        _healthScore(s) {
+            let score = 0;
+
+            const bw = s.bandwidth || 0;
+            if (bw > 0) score += clamp(Math.round((bw / 8000000) * 45), 0, 45);
+
+            if (s.readyState >= 3) score += 20;
+            else if (s.readyState >= 2) score += 10;
+
+            const buf = s.buffer || 0;
+            if (buf >= 10) score += 20;
+            else if (buf >= 4) score += 12;
+            else if (buf >= 1) score += 5;
+
+            if (s.stallLevel >= 3) score -= 25;
+            else if (s.stallLevel === 2) score -= 15;
+            else if (s.stallLevel === 1) score -= 8;
+
+            if (s.recoveries) score -= Math.min(15, s.recoveries * 2);
+
+            return clamp(score, 0, 100);
+        }
+
+        _matchesFilter(entry) {
+            const f = this._logFilter || 'all';
+            if (f === 'all') return true;
+
+            const order = { debug: 10, info: 20, warn: 30, error: 40 };
+            return (order[entry.level] || 20) >= (order[f] || 20);
+        }
+
+        _appendLog(entry) {
+            if (!entry) return;
+
+            this._logs.push(entry);
+            if (this._logs.length > 300) this._logs.shift();
+
+            if (this._visible && this._matchesFilter(entry)) {
+                this._renderLogLine(entry);
+            }
+
+            if (entry.level === 'warn' || entry.level === 'error') {
+                this._addTimelineMarker(entry.level === 'error' ? 'error' : 'warn', entry.message || entry.level);
+            }
+        }
+
+        _renderLogLine(entry) {
+            const logsEl = this._panel.querySelector('#va-logs');
+            if (!logsEl) return;
+
+            const nearBottom = logsEl.scrollHeight - logsEl.scrollTop - logsEl.clientHeight < 40;
+
+            const div = DOC.createElement('div');
+            div.className = 'log-line ' + entry.level;
+
+            const time = new Date(entry.ts).toLocaleTimeString();
+            const scope = entry.remote ? (entry.scope + ':remote') : entry.scope;
+            div.textContent = '[' + time + '] [' + entry.level.toUpperCase() + '] ' + scope + ': ' + entry.message;
+
+            logsEl.appendChild(div);
+
+            while (logsEl.children.length > 300) {
+                logsEl.removeChild(logsEl.firstChild);
+            }
+
+            if (nearBottom) logsEl.scrollTop = logsEl.scrollHeight;
+        }
+
+        _renderAllLogs() {
+            const logsEl = this._panel.querySelector('#va-logs');
+            if (!logsEl) return;
+
+            logsEl.innerHTML = '';
+            for (const entry of this._logs) {
+                if (this._matchesFilter(entry)) this._renderLogLine(entry);
+            }
+        }
+
+        _addTimelineMarker(type, label) {
+            const now = NOW();
+            this._timeline.push({ ts: now, type: type, label: label || '' });
+            if (this._timeline.length > 120) this._timeline.shift();
+
+            if (this._visible && now - this._lastTimelineRender > 1000) {
+                this._lastTimelineRender = now;
+                this._renderTimeline();
+            }
+        }
+
+        _maybeAddStateMarkers(state) {
+            if (!state) return;
+            const now = NOW();
+
+            if (state.stallLevel > 0 && now - this._lastStallMarker > 2000) {
+                this._lastStallMarker = now;
+                this._addTimelineMarker('stall', '卡顿等级 ' + state.stallLevel);
+            }
+
+            if (state.recoveries && state.recoveries > this._lastRecoveries) {
+                this._lastRecoveries = state.recoveries;
+                this._addTimelineMarker('recover', '恢复');
+            }
+        }
+
+        _renderTimeline() {
+            const el = this._panel.querySelector('#va-timeline');
+            if (!el) return;
+
+            const now = NOW();
+            const cutoff = now - 60000;
+
+            this._timeline = this._timeline.filter(function (x) { return x.ts >= cutoff; });
+
+            el.innerHTML = '';
+
+            for (const item of this._timeline) {
+                const age = now - item.ts;
+                const left = Math.max(0, Math.min(100, (1 - age / 60000) * 100));
+
+                const div = DOC.createElement('div');
+                div.className = 'tl-item tl-' + item.type;
+                div.style.left = left + '%';
+                div.title = new Date(item.ts).toLocaleTimeString() + ' ' + item.label;
+
+                el.appendChild(div);
+            }
+        }
+
+        update(state) {
+            if (!state) return;
+
+            Object.assign(this._state, state);
+            if (!this._visible) return;
+
+            const s = this._state;
+
+            const set = (id, v) => {
+                const el = this._panel.querySelector('#' + id);
+                if (el) el.textContent = v;
+            };
+
+            set('va-status', s.status || '检测中');
+            set('va-type', s.playerLabel || s.playerType || '-');
+            set('va-buf-time', (s.buffer || 0).toFixed(1) + 's');
+            set('va-rec', s.recoveries || 0);
+            set('va-count', s.videos || 0);
+            set('va-res', s.videoWidth && s.videoHeight ? s.videoWidth + '×' + s.videoHeight : '-');
+            set('va-progress', this._fmtTime(s.currentTime) + ' / ' + this._fmtTime(s.duration));
+            set('va-net', s.networkType || '-');
+            set('va-bw', this._fmtBw(s.bandwidth));
+
+            const readyLabels = ['未加载', '元数据', '有帧', '加载中', '可播放'];
+            set('va-ready', readyLabels[s.readyState] || '-');
+
+            const health = this._healthScore(s);
+            const healthEl = this._panel.querySelector('#va-health');
+            if (healthEl) {
+                healthEl.textContent = health + ' 分';
+                healthEl.style.color = health >= 70 ? '#30d158' : (health >= 40 ? '#ff9f0a' : '#ff453a');
+            }
+
+            const q = s.quality || {};
+            let qText = '-';
+            if (q.level >= 0 && q.total > 0) {
+                qText = (q.level + 1) + '/' + q.total + (q.height ? ' ' + q.height + 'p' : '');
+            } else if (q.height > 0) {
+                qText = q.height + 'p';
+            }
+            set('va-quality', qText);
+
+            const canQ = s.canChangeQuality === true;
+            const upBtn = this._panel.querySelector('#va-up');
+            const downBtn = this._panel.querySelector('#va-down');
+            if (upBtn) upBtn.disabled = !canQ;
+            if (downBtn) downBtn.disabled = !canQ;
+
+            const fill = this._panel.querySelector('#va-buf-fill');
+            if (fill) fill.style.width = Math.min(100, ((s.buffer || 0) / 60) * 100) + '%';
+
+            const dot = this._panel.querySelector('#va-dot');
+            if (dot) {
+                let cls = 'dot';
+                if (s.seeking) cls += ' seek';
+                else if (s.statusKey === 'play') cls += ' live';
+                else if (s.statusKey === 'pause') cls += ' pause';
+                else if (s.statusKey === 'stop') cls += ' stop';
+                dot.className = cls;
+            }
+
+            const stallEl = this._panel.querySelector('#va-stall');
+            if (stallEl) {
+                if (s.stallLevel >= 3) stallEl.innerHTML = '<span class="stall-badge s3">重载中</span>';
+                else if (s.stallLevel === 2) stallEl.innerHTML = '<span class="stall-badge s2">恢复中</span>';
+                else if (s.stallLevel === 1) stallEl.innerHTML = '<span class="stall-badge s1">轻推</span>';
+                else stallEl.innerHTML = '';
+            }
+
+            const now = NOW();
+            if (now - this._lastTimelineRender > 1000) {
+                this._lastTimelineRender = now;
+                this._renderTimeline();
+            }
+        }
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       启动
+    ═══════════════════════════════════════════════════════════ */
+
+    // 尽早安装钩子，保证 document-start 阶段开始嗅探
+    HookManager.installAll(PW, DOC);
+
+    let ui = null;
+    if (IS_TOP) {
+        ui = new UIManager(Bus);
+    }
+
+    Detector.start();
+
+    if (IS_TOP) {
+        try {
+            if (typeof GM_registerMenuCommand === 'function') {
+                GM_registerMenuCommand('⚙ 视频控制台', function () { Bus.emit('UI_TOGGLE', {}); });
+                GM_registerMenuCommand('🔧 恢复播放', function () { Bus.emit('CMD', { cmd: 'recover', remote: false }); });
+                GM_registerMenuCommand('⚡ 重新加载', function () { Bus.emit('CMD', { cmd: 'reload', remote: false }); });
+                GM_registerMenuCommand('📈 提升画质', function () { Bus.emit('CMD', { cmd: 'upgrade', remote: false }); });
+                GM_registerMenuCommand('📉 降低画质', function () { Bus.emit('CMD', { cmd: 'downgrade', remote: false }); });
+            }
+        } catch (e) { }
+    }
+
+    try {
+        PW.__VA__ = Object.assign(PW.__VA__ || {}, {
+            version: VERSION,
+            IS_TOP: IS_TOP,
+            bus: Bus,
+            config: ConfigManager,
+            sessions: function () { return SessionManager.sessions.size; }
+        });
+    } catch (e) { }
+
+    Logger.info('Boot', '微内核视频加速引擎已启动', { version: VERSION, top: IS_TOP });
+
 })();
