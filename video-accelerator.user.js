@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         视频快速检测与稳定播放 (微内核事件驱动版)
+// @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      18.1.0
-// @description  v18.1：微内核 + EventBus 架构；原型嗅探、pointerdown 预启动、RVFC 帧级监控、DNS/preconnect 预热、批量 DOM 扫描、iframe 穿透、HLS 优化、Seek 保护、卡死恢复、日志流、网络健康评分与卡顿时间轴。修复配置持久化（GM 存储 + localStorage 兜底 + pagehide 刷新前保存）。
+// @version      19.0.0
+// @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
 // @match        https://*/*
@@ -12,14 +12,12 @@
 // @grant        unsafeWindow
 // @run-at       document-start
 // @license      MIT
-// @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
-// @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const VERSION = '18.1.0';
+    const VERSION = '19.0.0';
     const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const DOC = PW.document || document;
     const LOC = PW.location || location;
@@ -77,6 +75,13 @@
         } catch (e) { return ''; }
     };
 
+    const raf = function (cb) {
+        try {
+            if (PW.requestAnimationFrame) return PW.requestAnimationFrame.call(PW, cb);
+        } catch (e) { }
+        return PW.setTimeout(cb, 50);
+    };
+
     function estimateBandwidth() {
         try {
             const perf = PW.performance || performance;
@@ -129,8 +134,60 @@
         return null;
     }
 
+    const CandidateState = {
+        DETECTED: 'detected',
+        STANDBY: 'standby',
+        ACTIVE: 'active',
+        IGNORED: 'ignored',
+        EXPIRED: 'expired'
+    };
+
+    const SessionState = {
+        ATTACHED: 'attached',
+        ACTIVE: 'active',
+        USER_PAUSED: 'user_paused',
+        DEGRADED: 'degraded',
+        RECOVERING: 'recovering',
+        FAILED: 'failed',
+        DORMANT: 'dormant',
+        DESTROYED: 'destroyed'
+    };
+
+    const AD_SELECTOR_STRONG = [
+        '[data-ad]',
+        '[data-ad-unit]',
+        '[id^="ad_"]',
+        '[id^="ad-"]',
+        '[class^="ad-container"]',
+        '[class*="advert"]',
+        '[aria-label*="advertisement"]'
+    ].join(',');
+
+    const SITE_PROFILES = [
+        // 示例：
+        // {
+        //     host: 'example.com',
+        //     primarySelector: '.main-player video',
+        //     ignoreSelectors: ['.ad video', '.recommend video'],
+        //     minVideoArea: 120000
+        // }
+    ];
+
+    function getSiteProfile() {
+        try {
+            const host = LOC.hostname || '';
+            for (let i = 0; i < SITE_PROFILES.length; i++) {
+                const p = SITE_PROFILES[i];
+                if (p && p.host && host.indexOf(p.host) >= 0) return p;
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    let LAST_SIGNAL_AT = NOW();
+
     /* ═══════════════════════════════════════════════════════════
-       EventBus 事件总线
+       EventBus
     ═══════════════════════════════════════════════════════════ */
 
     class EventBus {
@@ -159,9 +216,10 @@
     }
 
     const Bus = new EventBus();
+    Bus.on('SIGNAL_RAW', function () { LAST_SIGNAL_AT = NOW(); });
 
     /* ═══════════════════════════════════════════════════════════
-       Storage 持久化存储（GM 优先，localStorage 兜底）
+       Storage
     ═══════════════════════════════════════════════════════════ */
 
     const Storage = {
@@ -170,7 +228,6 @@
         _ls: (function () {
             try { return (typeof localStorage !== 'undefined') ? localStorage : null; } catch (e) { return null; }
         })(),
-
         get(key, def) {
             if (this._gmGet) {
                 try { return this._gmGet(key, def); } catch (e) { }
@@ -183,7 +240,6 @@
             }
             return def;
         },
-
         set(key, value) {
             if (this._gmSet) {
                 try { this._gmSet(key, value); return; } catch (e) { }
@@ -195,17 +251,17 @@
     };
 
     /* ═══════════════════════════════════════════════════════════
-       ConfigManager 配置中心
+       ConfigManager
     ═══════════════════════════════════════════════════════════ */
 
-    const STORAGE_KEY = 'va_config_v18_0';
+    const STORAGE_KEY = 'va_config_v19_0';
+    const STORAGE_KEY_V18 = 'va_config_v18_0';
 
     class ConfigManagerClass {
         constructor(bus) {
             this.bus = bus;
             this._cache = null;
             this.defaults = {
-                // 稳定播放
                 autoPlay: true,
                 bigBuffer: true,
                 seekGuard: true,
@@ -214,35 +270,50 @@
                 bufferTarget: 60,
                 seekTimeout: 5000,
 
-                // UI / 日志
                 showToast: true,
                 showDetect: true,
-                logLevel: 'info', // debug / info / warn / error
+                logLevel: 'info',
 
-                // 识别与网络
                 minPreBuffer: 2,
                 fastDetect: true,
                 fetchPriority: true,
                 visibleOnly: true,
                 minVideoArea: 8000,
 
-                // 极速接管
                 protoHook: true,
                 earlyPointer: true,
                 preconnect: true,
                 rvfcMonitor: true,
                 instantPlay: true,
 
-                // 画质管理
-                qualityManage: true
+                qualityManage: true,
+
+                userIntentFirst: true,
+                standbyMode: true,
+                adGuard: true,
+                recoveryBudget: 8,
+                frameMesh: true
             };
             this._installRequests();
         }
 
         load() {
             if (this._cache) return this._cache;
+
             let raw = null;
+            let migrated = false;
+
             try { raw = Storage.get(STORAGE_KEY, null); } catch (e) { }
+
+            if (raw === null || raw === undefined || raw === '') {
+                try {
+                    const old = Storage.get(STORAGE_KEY_V18, null);
+                    if (old !== null && old !== undefined) {
+                        raw = old;
+                        migrated = true;
+                    }
+                } catch (e) { }
+            }
 
             let obj = null;
             if (typeof raw === 'string') {
@@ -253,16 +324,21 @@
 
             this._cache = Object.assign({}, this.defaults, obj || {});
             this._normalize();
+
+            if (migrated) {
+                try { this.save(); } catch (e) { }
+            }
+
             return this._cache;
         }
 
         _normalize() {
             const c = this._cache;
-            delete c.siteProfiles;
 
             c.bufferTarget = clamp(parseInt(c.bufferTarget, 10) || 60, 10, 300);
             c.minPreBuffer = clamp(parseInt(c.minPreBuffer, 10) || 2, 1, 30);
             c.seekTimeout = clamp(parseInt(c.seekTimeout, 10) || 5000, 2000, 15000);
+            c.recoveryBudget = clamp(parseInt(c.recoveryBudget, 10) || 8, 1, 20);
 
             const mva = parseInt(c.minVideoArea, 10);
             c.minVideoArea = isNaN(mva) ? 8000 : Math.max(0, mva);
@@ -274,7 +350,7 @@
                 'autoPlay', 'bigBuffer', 'seekGuard', 'watchdog', 'autoDowngrade',
                 'showToast', 'showDetect', 'fastDetect', 'fetchPriority', 'visibleOnly',
                 'protoHook', 'earlyPointer', 'preconnect', 'rvfcMonitor', 'instantPlay',
-                'qualityManage'
+                'qualityManage', 'userIntentFirst', 'standbyMode', 'adGuard', 'frameMesh'
             ];
             boolKeys.forEach(function (k) { c[k] = !!c[k]; });
         }
@@ -348,22 +424,18 @@
             this.bus.on('CONFIG_EXPORT_REQUEST', () => {
                 this.bus.emit('CONFIG_EXPORT_RESULT', { json: this.exportJSON() });
             });
-
             this.bus.on('CONFIG_IMPORT_REQUEST', (payload) => {
                 const json = payload && payload.json;
                 const ok = this.importJSON(json);
                 this.bus.emit('CONFIG_IMPORT_RESULT', { ok: ok });
             });
-
             this.bus.on('CONFIG_RESET_REQUEST', () => {
                 this.reset();
             });
-
             this.bus.on('CONFIG_SET', (payload) => {
                 if (!payload || !payload.key) return;
                 this.set(payload.key, payload.value);
             });
-
             this.bus.on('CONFIG_UPDATE', (payload) => {
                 this.update(payload);
             });
@@ -373,7 +445,7 @@
     const ConfigManager = new ConfigManagerClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       Logger 日志系统
+       Logger / Metrics
     ═══════════════════════════════════════════════════════════ */
 
     const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -407,8 +479,116 @@
 
     const Logger = new LoggerClass(Bus);
 
+    const Metrics = {
+        counters: Object.create(null),
+        inc(name, value) {
+            value = value || 1;
+            this.counters[name] = (this.counters[name] || 0) + value;
+            Bus.emit('METRIC_EMIT', { type: 'counter', name: name, value: value });
+        }
+    };
+
     /* ═══════════════════════════════════════════════════════════
-       StateStore 状态聚合器
+       GlobalScheduler / ListenerBag / UserGesture
+    ═══════════════════════════════════════════════════════════ */
+
+    class GlobalSchedulerClass {
+        constructor(bus) {
+            this.bus = bus;
+            this.tasks = new Map();
+            this.last = { fast: 0, normal: 0, slow: 0, ui: 0 };
+            this.intervals = { fast: 250, normal: 800, slow: 3000, ui: 500 };
+            this.hidden = false;
+            this._timer = null;
+        }
+
+        register(id, handlers) {
+            this.tasks.set(id, handlers || {});
+        }
+
+        unregister(id) {
+            this.tasks.delete(id);
+        }
+
+        setHidden(hidden) {
+            this.hidden = !!hidden;
+        }
+
+        start() {
+            if (this._timer) return;
+
+            const loop = () => {
+                const now = NOW();
+                const tiers = ['fast', 'normal', 'slow', 'ui'];
+
+                for (const tier of tiers) {
+                    let interval = this.intervals[tier];
+
+                    if (this.hidden) {
+                        if (tier === 'fast') interval *= 4;
+                        else if (tier === 'normal') interval *= 3;
+                        else if (tier === 'ui') interval *= 2;
+                    }
+
+                    if (now - this.last[tier] >= interval) {
+                        this.last[tier] = now;
+                        this.tasks.forEach((handlers) => {
+                            try {
+                                if (typeof handlers[tier] === 'function') handlers[tier]();
+                            } catch (e) { }
+                        });
+                    }
+                }
+
+                this._timer = PW.setTimeout(loop, 120);
+            };
+
+            loop();
+        }
+    }
+
+    const Scheduler = new GlobalSchedulerClass(Bus);
+
+    try {
+        DOC.addEventListener('visibilitychange', function () {
+            Scheduler.setHidden(DOC.hidden);
+        }, true);
+    } catch (e) { }
+
+    class ListenerBag {
+        constructor() {
+            this.items = [];
+        }
+
+        add(target, type, fn, opts) {
+            if (!target || typeof target.addEventListener !== 'function') return;
+            target.addEventListener(type, fn, opts);
+            this.items.push({ target: target, type: type, fn: fn, opts: opts });
+        }
+
+        removeAll() {
+            for (const item of this.items) {
+                try {
+                    item.target.removeEventListener(item.type, item.fn, item.opts);
+                } catch (e) { }
+            }
+            this.items = [];
+        }
+    }
+
+    const UserGesture = {
+        lastGestureAt: 0,
+        mark() {
+            this.lastGestureAt = NOW();
+        },
+        recent(windowMs) {
+            windowMs = windowMs || 3000;
+            return NOW() - this.lastGestureAt < windowMs;
+        }
+    };
+
+    /* ═══════════════════════════════════════════════════════════
+       StateStore
     ═══════════════════════════════════════════════════════════ */
 
     class StateStoreClass {
@@ -437,6 +617,7 @@
             return {
                 status: '未检测到视频',
                 statusKey: 'idle',
+                sessionState: 'idle',
                 playerType: 'unknown',
                 playerLabel: '-',
                 buffer: 0,
@@ -452,7 +633,8 @@
                 canChangeQuality: false,
                 bandwidth: 0,
                 seeking: false,
-                stallLevel: 0
+                stallLevel: 0,
+                userPaused: false
             };
         }
 
@@ -498,12 +680,14 @@
     const StateStore = new StateStoreClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       CrossWindowBridge 跨窗口通信桥
+       FrameMesh
     ═══════════════════════════════════════════════════════════ */
 
-    class CrossWindowBridge {
+    class FrameMeshClass {
         constructor(bus) {
             this.bus = bus;
+            this.frames = new Map();
+            this.rate = new Map();
             this._initListener();
             this._install();
         }
@@ -513,8 +697,10 @@
                 try {
                     PW.top.postMessage(Object.assign({
                         __va_msg: true,
+                        ver: 19,
                         type: type,
-                        iframeId: IFRAME_ID
+                        frameId: IFRAME_ID,
+                        ts: NOW()
                     }, payload || {}), '*');
                 } catch (e) { }
             }
@@ -522,7 +708,13 @@
 
         broadcastToFrames(type, payload) {
             try {
-                const msg = Object.assign({ __va_msg: true, type: type }, payload || {});
+                const msg = Object.assign({
+                    __va_msg: true,
+                    ver: 19,
+                    type: type,
+                    ts: NOW()
+                }, payload || {});
+
                 HOOKED_DOCS.forEach(function (doc) {
                     try {
                         if (!doc || typeof doc.querySelectorAll !== 'function') return;
@@ -537,10 +729,27 @@
             } catch (e) { }
         }
 
+        _allowed(frameId) {
+            if (!frameId) return false;
+            const now = NOW();
+            let r = this.rate.get(frameId);
+            if (!r) {
+                r = { count: 0, ts: now };
+                this.rate.set(frameId, r);
+            }
+            if (now - r.ts > 1000) {
+                r.count = 0;
+                r.ts = now;
+            }
+            r.count++;
+            return r.count <= 30;
+        }
+
         _initListener() {
             PW.addEventListener('message', (e) => {
                 const d = e.data;
-                if (!d || typeof d !== 'object' || !d.__va_msg) return;
+                if (!d || typeof d !== 'object' || !d.__va_msg || d.ver !== 19) return;
+                if (IS_TOP && d.frameId && !this._allowed(d.frameId)) return;
                 this._handle(d, e.source);
             });
         }
@@ -548,7 +757,8 @@
         _handle(d, source) {
             if (IS_TOP) {
                 if (d.type === 'VA_STATE_UPDATE') {
-                    this.bus.emit('REMOTE_STATE', { iframeId: d.iframeId, state: d.state });
+                    this.frames.set(d.frameId, { lastSeen: NOW() });
+                    this.bus.emit('REMOTE_STATE', { iframeId: d.frameId, state: d.state });
                 } else if (d.type === 'VA_LOG') {
                     const entry = Object.assign({
                         ts: NOW(),
@@ -565,10 +775,15 @@
                     try {
                         source.postMessage({
                             __va_msg: true,
+                            ver: 19,
                             type: 'VA_CFG_SYNC',
                             config: ConfigManager.load()
                         }, '*');
                     } catch (e) { }
+                } else if (d.type === 'VA_HELLO_ACK') {
+                    this.frames.set(d.frameId, { lastSeen: NOW() });
+                } else if (d.type === 'VA_BYE') {
+                    this.frames.delete(d.frameId);
                 }
             } else {
                 if (d.type === 'VA_CFG_SYNC') {
@@ -580,46 +795,52 @@
         }
 
         _install() {
-            // 子 iframe 上报本地状态
             this.bus.on('LOCAL_STATE', (state) => {
                 if (!IS_TOP) this._postTop('VA_STATE_UPDATE', { state: state });
             });
 
-            // 子 iframe 上报日志
             this.bus.on('LOG_EMIT', (entry) => {
                 if (!IS_TOP && entry && !entry.remote) this._postTop('VA_LOG', { entry: entry });
             });
 
-            // 子 iframe 请求 Toast
             this.bus.on('TOAST', (payload) => {
                 if (!IS_TOP && payload && !payload.remote) this._postTop('VA_TOAST', payload);
             });
 
-            // 顶层配置变化同步到子 iframe
             this.bus.on('CONFIG_CHANGE', (payload) => {
                 if (IS_TOP && !(payload && payload.remote)) {
                     this.broadcastToFrames('VA_CFG_SYNC', { config: ConfigManager.load() });
                 }
             });
 
-            // 顶层命令下发到子 iframe
             this.bus.on('CMD', (payload) => {
                 if (IS_TOP && !(payload && payload.remote)) {
                     this.broadcastToFrames('VA_CMD', { cmd: payload && payload.cmd });
                 }
             });
 
-            // 子 iframe 启动时请求配置
             if (!IS_TOP) {
+                this._postTop('VA_HELLO_ACK', {});
                 this._postTop('VA_REQ_CFG', {});
+            }
+
+            if (IS_TOP) {
+                Scheduler.register('frame-mesh', {
+                    slow: () => {
+                        const now = NOW();
+                        this.frames.forEach((f, id) => {
+                            if (now - f.lastSeen > 30000) this.frames.delete(id);
+                        });
+                    }
+                });
             }
         }
     }
 
-    const Bridge = new CrossWindowBridge(Bus);
+    const FrameMesh = new FrameMeshClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       preconnect / fetch 工具
+       preconnect
     ═══════════════════════════════════════════════════════════ */
 
     const preconnectedHosts = new Set();
@@ -628,6 +849,7 @@
         try {
             if (!ConfigManager.get('preconnect')) return;
             if (!url || url.indexOf('blob:') === 0 || url.indexOf('data:') === 0) return;
+
             const host = getHost(url);
             if (!host || host === LOC.host || preconnectedHosts.has(host)) return;
             preconnectedHosts.add(host);
@@ -658,7 +880,7 @@
     }
 
     /* ═══════════════════════════════════════════════════════════
-       HookManager：原型 / fetch / 手势
+       HookManager
     ═══════════════════════════════════════════════════════════ */
 
     class HookManagerClass {
@@ -722,7 +944,14 @@
                             try {
                                 addPreconnect(v, this.ownerDocument);
                                 if (ConfigManager.get('protoHook')) {
-                                    bus.emit('VIDEO_FOUND', { video: this, reason: 'src', force: true });
+                                    bus.emit('SIGNAL_RAW', {
+                                        video: this,
+                                        source: 'proto-src',
+                                        userGesture: UserGesture.recent(),
+                                        forceHint: true,
+                                        ts: NOW(),
+                                        context: { reason: 'src' }
+                                    });
                                 }
                             } catch (e) { }
                         }
@@ -734,10 +963,17 @@
                     Proto.play = function () {
                         try {
                             if (ConfigManager.get('protoHook')) {
-                                bus.emit('VIDEO_FOUND', { video: this, reason: 'play', force: true });
+                                bus.emit('SIGNAL_RAW', {
+                                    video: this,
+                                    source: 'proto-play',
+                                    userGesture: UserGesture.recent(),
+                                    forceHint: true,
+                                    ts: NOW(),
+                                    context: { reason: 'play' }
+                                });
                             }
                             if (ConfigManager.get('instantPlay')) {
-                                bus.emit('VIDEO_BOOST', { video: this, reason: 'play' });
+                                bus.emit('SIGNAL_BOOST', { video: this, reason: 'play' });
                             }
                             addPreconnect(this.currentSrc || this.src, this.ownerDocument);
                         } catch (e) { }
@@ -751,9 +987,16 @@
                     Proto.load = function () {
                         try {
                             if (ConfigManager.get('protoHook')) {
-                                bus.emit('VIDEO_FOUND', { video: this, reason: 'load', force: false });
+                                bus.emit('SIGNAL_RAW', {
+                                    video: this,
+                                    source: 'proto-load',
+                                    userGesture: UserGesture.recent(),
+                                    forceHint: false,
+                                    ts: NOW(),
+                                    context: { reason: 'load' }
+                                });
                             }
-                            bus.emit('VIDEO_BOOST', { video: this, reason: 'load' });
+                            bus.emit('SIGNAL_BOOST', { video: this, reason: 'load' });
                         } catch (e) { }
                         return origLoad.apply(this, arguments);
                     };
@@ -766,12 +1009,15 @@
 
         addGesture(doc) {
             if (!doc || doc.__vaGesture) return;
+
             try {
                 doc.__vaGesture = true;
                 const bus = this.bus;
 
                 const handler = function (e) {
                     try {
+                        UserGesture.mark();
+
                         if (!ConfigManager.get('earlyPointer')) return;
 
                         const t = e.target;
@@ -787,8 +1033,16 @@
                         const video = videoFromEvent(e);
                         if (!video) return;
 
-                        bus.emit('VIDEO_FOUND', { video: video, reason: 'pointer', force: true });
-                        bus.emit('VIDEO_BOOST', { video: video, reason: 'pointer' });
+                        bus.emit('SIGNAL_RAW', {
+                            video: video,
+                            source: 'gesture-pointer',
+                            userGesture: true,
+                            forceHint: true,
+                            ts: NOW(),
+                            context: { reason: e.type || 'gesture' }
+                        });
+
+                        bus.emit('SIGNAL_BOOST', { video: video, reason: 'gesture' });
 
                         if (ConfigManager.get('autoPlay') && video.paused && !video.ended) {
                             const s = video.__vaSession;
@@ -799,7 +1053,7 @@
                     } catch (err) { }
                 };
 
-                ['pointerdown', 'mousedown', 'touchstart'].forEach(function (ev) {
+                ['pointerdown', 'mousedown', 'touchstart', 'keydown'].forEach(function (ev) {
                     doc.addEventListener(ev, handler, { capture: true, passive: true });
                 });
             } catch (e) { }
@@ -809,7 +1063,7 @@
     const HookManager = new HookManagerClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       Detector：DOM / iframe / 可见性检测
+       Detector
     ═══════════════════════════════════════════════════════════ */
 
     class DetectorClass {
@@ -821,12 +1075,13 @@
             this._scanScheduled = false;
             this._viewportObs = null;
             this._viewportTargets = new WeakSet();
-            this._patrolIv = null;
+            this._spaInstalled = false;
             this._initViewportObserver();
         }
 
         start() {
             this._setupDoc(DOC, PW);
+            this._installSpa();
 
             try {
                 DOC.addEventListener('load', (e) => {
@@ -835,7 +1090,44 @@
                 }, true);
             } catch (e) { }
 
-            this._patrolIv = setInterval(() => this._patrol(), 2500);
+            Scheduler.register('detector', {
+                slow: () => this._patrol()
+            });
+        }
+
+        _installSpa() {
+            if (this._spaInstalled) return;
+            this._spaInstalled = true;
+
+            const emitRoute = () => {
+                this.bus.emit('SPA_ROUTE_CHANGED', {});
+                this._scheduleScan();
+                PW.setTimeout(() => this.refresh(), 800);
+                PW.setTimeout(() => this.refresh(), 2000);
+            };
+
+            try {
+                const origPush = PW.history && PW.history.pushState;
+                if (typeof origPush === 'function') {
+                    PW.history.pushState = function () {
+                        const r = origPush.apply(this, arguments);
+                        emitRoute();
+                        return r;
+                    };
+                }
+
+                const origReplace = PW.history && PW.history.replaceState;
+                if (typeof origReplace === 'function') {
+                    PW.history.replaceState = function () {
+                        const r = origReplace.apply(this, arguments);
+                        emitRoute();
+                        return r;
+                    };
+                }
+
+                PW.addEventListener('popstate', emitRoute);
+                PW.addEventListener('hashchange', emitRoute);
+            } catch (e) { }
         }
 
         _setupDoc(doc, win) {
@@ -860,6 +1152,7 @@
 
         _observeDoc(doc, win) {
             if (!doc || this._observedDocs.has(doc)) return;
+
             const MO = (win && win.MutationObserver) || PW.MutationObserver;
             if (!MO || !doc.documentElement) return;
 
@@ -877,14 +1170,23 @@
             this._viewportObs = new PW.IntersectionObserver((entries) => {
                 for (const entry of entries) {
                     if (entry.isIntersecting && entry.target.nodeName === 'VIDEO') {
-                        this.bus.emit('VIDEO_FOUND', { video: entry.target, reason: 'viewport', force: true });
+                        this.bus.emit('SIGNAL_RAW', {
+                            video: entry.target,
+                            source: 'viewport',
+                            userGesture: UserGesture.recent(),
+                            forceHint: true,
+                            ts: NOW(),
+                            context: { reason: 'viewport' }
+                        });
+                        this.bus.emit('SIGNAL_BOOST', { video: entry.target, reason: 'viewport' });
+
                         try {
                             this._viewportObs.unobserve(entry.target);
                             this._viewportTargets.delete(entry.target);
                         } catch (e) { }
                     }
                 }
-            }, { rootMargin: '300px' });
+            }, { rootMargin: '400px' });
         }
 
         watchViewport(video) {
@@ -895,7 +1197,14 @@
                 this._viewportTargets.add(video);
                 try { this._viewportObs.observe(video); } catch (e) { }
             } else {
-                this.bus.emit('VIDEO_FOUND', { video: video, reason: 'viewport-direct', force: false });
+                this.bus.emit('SIGNAL_RAW', {
+                    video: video,
+                    source: 'viewport-direct',
+                    userGesture: UserGesture.recent(),
+                    forceHint: false,
+                    ts: NOW(),
+                    context: { reason: 'viewport-direct' }
+                });
             }
         }
 
@@ -909,7 +1218,14 @@
                     if (node.nodeType !== 1) continue;
 
                     if (node.nodeName === 'VIDEO') {
-                        this.bus.emit('VIDEO_FOUND', { video: node, reason: 'mutation', force: false });
+                        this.bus.emit('SIGNAL_RAW', {
+                            video: node,
+                            source: 'mutation',
+                            userGesture: UserGesture.recent(),
+                            forceHint: false,
+                            ts: NOW(),
+                            context: { reason: 'mutation' }
+                        });
                         need = true;
                     } else if (node.nodeName === 'IFRAME') {
                         this._hookIframe(node);
@@ -940,14 +1256,7 @@
                 }
             };
 
-            try {
-                const raf = PW.requestAnimationFrame
-                    ? PW.requestAnimationFrame.bind(PW)
-                    : function (cb) { return PW.setTimeout(cb, 50); };
-                raf(flush);
-            } catch (e) {
-                PW.setTimeout(flush, 50);
-            }
+            raf(flush);
         }
 
         _hookIframe(f) {
@@ -984,8 +1293,16 @@
 
             try {
                 const name = root.nodeName || '';
+
                 if (name === 'VIDEO') {
-                    this.bus.emit('VIDEO_FOUND', { video: root, reason: 'scan', force: false });
+                    this.bus.emit('SIGNAL_RAW', {
+                        video: root,
+                        source: 'scan',
+                        userGesture: UserGesture.recent(),
+                        forceHint: false,
+                        ts: NOW(),
+                        context: { reason: 'scan' }
+                    });
                 } else if (name === 'IFRAME') {
                     this._hookIframe(root);
                 }
@@ -993,10 +1310,18 @@
                 if (root.querySelectorAll) {
                     const els = root.querySelectorAll('video,iframe');
                     const limit = Math.min(els.length, 800);
+
                     for (let i = 0; i < limit; i++) {
                         const el = els[i];
                         if (el.nodeName === 'VIDEO') {
-                            this.bus.emit('VIDEO_FOUND', { video: el, reason: 'scan', force: false });
+                            this.bus.emit('SIGNAL_RAW', {
+                                video: el,
+                                source: 'scan',
+                                userGesture: UserGesture.recent(),
+                                forceHint: false,
+                                ts: NOW(),
+                                context: { reason: 'scan' }
+                            });
                         } else if (el.nodeName === 'IFRAME') {
                             this._hookIframe(el);
                         }
@@ -1008,6 +1333,7 @@
                 if (root.querySelectorAll) {
                     const all = root.querySelectorAll('*');
                     const limit = Math.min(all.length, 250);
+
                     for (let i = 0; i < limit; i++) {
                         const sr = all[i].shadowRoot;
                         if (sr) this._scanWithin(sr);
@@ -1024,6 +1350,17 @@
 
         _patrol() {
             if (DOC.hidden) return;
+
+            try {
+                if (
+                    typeof SessionManager !== 'undefined' &&
+                    SessionManager.sessions.size > 0 &&
+                    NOW() - LAST_SIGNAL_AT < 10000
+                ) {
+                    return;
+                }
+            } catch (e) { }
+
             try { this.refresh(); } catch (e) { }
             this.bus.emit('PATROL', {});
         }
@@ -1032,7 +1369,7 @@
     const Detector = new DetectorClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       播放器适配器
+       Player Adapter
     ═══════════════════════════════════════════════════════════ */
 
     const PLAYER_LABEL = {
@@ -1074,15 +1411,16 @@
 
     function applyHlsConfig(hls) {
         if (!hls || !hls.config) return;
+
         try {
             const big = ConfigManager.get('bigBuffer');
             const target = clamp(parseInt(ConfigManager.get('bufferTarget'), 10) || 60, 10, 300);
 
-            hls.config.maxBufferLength = big ? 120 : Math.max(30, target);
-            hls.config.maxMaxBufferLength = big ? 600 : 300;
+            hls.config.maxBufferLength = big ? 90 : Math.max(30, target);
+            hls.config.maxMaxBufferLength = big ? 360 : 180;
             hls.config.maxBufferHole = 0.2;
             hls.config.startFragPrefetch = true;
-            hls.config.backBufferLength = big ? 90 : 30;
+            hls.config.backBufferLength = big ? 60 : 30;
             hls.config.nudgeOffset = 0.1;
             hls.config.nudgeMaxRetry = 5;
             hls.config.fragLoadingMaxRetry = 6;
@@ -1144,8 +1482,10 @@
 
         canChangeQuality(video) {
             if (!ConfigManager.get('qualityManage')) return false;
+
             const info = PlayerRegistry.get(video);
             if (!info || info.type !== 'hls' || !info.player) return false;
+
             try {
                 return Array.isArray(info.player.levels) && info.player.levels.length > 1;
             } catch (e) {
@@ -1155,6 +1495,7 @@
 
         switchLevel(video, delta) {
             if (!this.canChangeQuality(video)) return false;
+
             const info = PlayerRegistry.get(video);
             const hls = info.player;
 
@@ -1208,6 +1549,7 @@
         boost(video) {
             try {
                 if (!video || video.nodeName !== 'VIDEO') return;
+
                 video.preload = 'auto';
 
                 const lazy = video.getAttribute && (video.getAttribute('data-src') || video.getAttribute('data-lazy-src'));
@@ -1219,6 +1561,7 @@
 
         startLoad(video) {
             const info = PlayerRegistry.get(video);
+
             if (info && info.type === 'hls' && info.player) {
                 try { info.player.startLoad(video.currentTime); } catch (e) { }
             } else {
@@ -1228,6 +1571,7 @@
 
         reloadSegment(video) {
             const info = PlayerRegistry.get(video);
+
             if (info && info.type === 'hls' && info.player) {
                 try { info.player.startLoad(video.currentTime); } catch (e) { }
             } else {
@@ -1250,7 +1594,255 @@
     };
 
     /* ═══════════════════════════════════════════════════════════
-       VideoSession 单视频会话
+       CandidateArbiter
+    ═══════════════════════════════════════════════════════════ */
+
+    class CandidateArbiterClass {
+        constructor(bus) {
+            this.bus = bus;
+            this.pool = new WeakMap();
+            this.queue = new Set();
+            this.scheduled = false;
+
+            this.bus.on('SIGNAL_RAW', (sig) => this.onSignal(sig));
+            this.bus.on('PATROL', () => this._evaluateStale());
+        }
+
+        onSignal(sig) {
+            if (!sig || !sig.video || sig.video.nodeName !== 'VIDEO') return;
+
+            let candidate = this.pool.get(sig.video);
+            if (!candidate) {
+                candidate = this._createCandidate(sig.video);
+                this.pool.set(sig.video, candidate);
+            }
+
+            this._mergeSignal(candidate, sig);
+            this.queue.add(candidate);
+            this._scheduleEvaluate();
+        }
+
+        _createCandidate(video) {
+            return {
+                video: video,
+                state: CandidateState.DETECTED,
+                score: 0,
+                firstSeenAt: NOW(),
+                lastSeenAt: NOW(),
+                userGestureAt: 0,
+                cooldownUntil: 0,
+                lastEvaluatedAt: 0,
+                signals: {
+                    protoSrc: false,
+                    protoPlay: false,
+                    protoLoad: false,
+                    gesture: false,
+                    mutation: false,
+                    viewport: false,
+                    scan: false,
+                    iframe: false
+                },
+                context: {
+                    area: 0,
+                    visible: false,
+                    inViewport: false,
+                    hasSrc: false,
+                    mediaUrl: false,
+                    blob: false,
+                    playing: false,
+                    duration: 0,
+                    live: false,
+                    muted: false,
+                    loop: false,
+                    adLike: false
+                }
+            };
+        }
+
+        _mergeSignal(candidate, sig) {
+            candidate.lastSeenAt = sig.ts || NOW();
+
+            if (sig.userGesture) {
+                candidate.userGestureAt = NOW();
+                UserGesture.mark();
+            }
+
+            const s = candidate.signals;
+
+            if (sig.source === 'proto-src') s.protoSrc = true;
+            else if (sig.source === 'proto-play') s.protoPlay = true;
+            else if (sig.source === 'proto-load') s.protoLoad = true;
+            else if (sig.source === 'gesture-pointer') s.gesture = true;
+            else if (sig.source === 'mutation') s.mutation = true;
+            else if (sig.source === 'viewport' || sig.source === 'viewport-direct') {
+                s.viewport = true;
+                candidate.context.inViewport = true;
+            }
+            else if (sig.source === 'scan') s.scan = true;
+            else if (sig.source === 'iframe') s.iframe = true;
+        }
+
+        _refreshContext(candidate) {
+            try {
+                const v = candidate.video;
+                const ctx = candidate.context;
+
+                ctx.area = videoArea(v);
+                ctx.visible = isVisible(v);
+                ctx.playing = !v.paused && !v.ended;
+                ctx.duration = isFinite(v.duration) ? v.duration : 0;
+                ctx.live = isLive(v);
+                ctx.muted = !!v.muted;
+                ctx.loop = !!v.loop;
+
+                const src = v.currentSrc || v.src || '';
+                ctx.hasSrc = !!src;
+                ctx.mediaUrl = isVideoResource(src);
+                ctx.blob = src.indexOf('blob:') === 0;
+
+                ctx.adLike = false;
+                if (ConfigManager.get('adGuard') && v.closest) {
+                    try {
+                        ctx.adLike = !!v.closest(AD_SELECTOR_STRONG);
+                    } catch (e) { }
+                }
+            } catch (e) { }
+        }
+
+        _scheduleEvaluate() {
+            if (this.scheduled) return;
+            this.scheduled = true;
+
+            const run = () => {
+                this.scheduled = false;
+                this._evaluate();
+            };
+
+            raf(run);
+        }
+
+        _evaluate() {
+            const now = NOW();
+
+            this.queue.forEach((candidate) => {
+                try {
+                    if (!candidate.video.isConnected) {
+                        this.pool.delete(candidate.video);
+                        return;
+                    }
+
+                    this._refreshContext(candidate);
+                    candidate.score = this.score(candidate);
+                    candidate.lastEvaluatedAt = now;
+
+                    if (candidate.context.adLike) {
+                        candidate.state = CandidateState.IGNORED;
+                        this.bus.emit('CANDIDATE_IGNORED', { candidate: candidate });
+                        return;
+                    }
+
+                    if (candidate.score >= 70) {
+                        if (candidate.cooldownUntil > now) return;
+                        if (candidate.video.__vaSession) return;
+
+                        candidate.cooldownUntil = now + 2000;
+                        candidate.state = CandidateState.ACTIVE;
+
+                        this.bus.emit('TAKEOVER_DECIDED', {
+                            video: candidate.video,
+                            candidate: candidate,
+                            score: candidate.score,
+                            ts: now
+                        });
+
+                        Logger.debug('Arbiter', '接管决策 score=' + candidate.score, {
+                            src: candidate.video.currentSrc || candidate.video.src || ''
+                        });
+                    } else if (candidate.score >= 40) {
+                        candidate.state = CandidateState.STANDBY;
+
+                        if (ConfigManager.get('standbyMode')) {
+                            this.bus.emit('SIGNAL_BOOST', { video: candidate.video, reason: 'standby' });
+                        }
+
+                        this.bus.emit('CANDIDATE_UPDATED', { candidate: candidate });
+                    } else {
+                        candidate.state = CandidateState.DETECTED;
+                    }
+                } catch (e) { }
+            });
+
+            this.queue.clear();
+        }
+
+        _evaluateStale() {
+            // 当前保持轻量：patrol 时不强制清理 WeakMap 候选。
+        }
+
+        score(c) {
+            const v = c.video;
+            const ctx = c.context;
+            const sig = c.signals;
+
+            let score = 0;
+
+            let minArea = ConfigManager.get('minVideoArea') || 0;
+            const profile = getSiteProfile();
+            if (profile && profile.minVideoArea) minArea = profile.minVideoArea;
+
+            if (v.isConnected) score += 20;
+            if (ctx.visible) score += 12;
+            if (ctx.inViewport) score += 18;
+            if (ctx.area >= minArea) score += 15;
+            if (ctx.area > 200000) score += 6;
+
+            if (ctx.hasSrc) score += 10;
+            if (ctx.mediaUrl) score += 12;
+            if (ctx.blob) score += 8;
+
+            if (sig.protoSrc) score += 8;
+            if (sig.protoLoad) score += 5;
+            if (sig.protoPlay) score += 14;
+            if (sig.gesture) score += 25;
+
+            if (ctx.playing) score += 20;
+            if (ctx.duration > 60 || ctx.live) score += 10;
+            if (ctx.duration > 0 && ctx.duration < 8 && ctx.muted && ctx.loop) score -= 18;
+            if (ctx.adLike) score -= 80;
+
+            try {
+                if (
+                    typeof SessionManager !== 'undefined' &&
+                    SessionManager.sessions.size > 0 &&
+                    !v.__vaSession &&
+                    !sig.gesture
+                ) {
+                    score -= 25;
+                }
+            } catch (e) { }
+
+            if (profile) {
+                if (profile.primarySelector && v.closest) {
+                    try {
+                        if (v.closest(profile.primarySelector)) score += 30;
+                    } catch (e) { }
+                }
+
+                if (profile.ignoreSelectors && profile.ignoreSelectors.length && v.closest) {
+                    try {
+                        if (v.closest(profile.ignoreSelectors.join(','))) score -= 80;
+                    } catch (e) { }
+                }
+            }
+
+            return score;
+        }
+    }
+
+    const CandidateArbiter = new CandidateArbiterClass(Bus);
+
+    /* ═══════════════════════════════════════════════════════════
+       VideoSession
     ═══════════════════════════════════════════════════════════ */
 
     let sessionCounter = 0;
@@ -1266,13 +1858,12 @@
             this.recoveries = 0;
 
             this._dead = false;
+            this.state = SessionState.ATTACHED;
+
             this.isSeeking = false;
             this.seekTarget = 0;
             this._seekStartTime = 0;
             this._wasPlayingBeforeSeek = false;
-
-            this._bufferIv = null;
-            this._stallIv = null;
 
             this._lastTime = -1;
             this._stallStart = 0;
@@ -1291,34 +1882,102 @@
             this._rvfcRunning = false;
             this._rvfcId = 0;
 
+            this._lastPublishAt = 0;
+            this._lastUserGestureAt = opts.userGesture ? NOW() : 0;
+            this._programmaticPause = false;
+
+            this._recoveryLevel = 0;
+            this._recoveryStartedAt = 0;
+
+            this.listeners = new ListenerBag();
+
             video.__vaSession = this;
 
-            try {
-                Adaptor.boost(video);
-            } catch (e) { }
+            try { Adaptor.boost(video); } catch (e) { }
 
             this._bindEvents();
 
-            this._bufferIv = setInterval(() => this._bufferCheck(), 700);
-            this._stallIv = setInterval(() => this._stallCheck(), 450);
+            Scheduler.register('session:' + this.id, {
+                fast: () => this._fastTick(),
+                normal: () => this._normalTick(),
+                slow: () => this._slowTick(),
+                ui: () => this._uiTick()
+            });
 
-            if (opts.force) {
-                this._userPaused = false;
-                this._boostLoad();
-            }
-
-            this._startRvfc();
+            if (opts.userGesture) this.markUserGesture();
 
             if (ConfigManager.get('showDetect') && ConfigManager.get('showToast')) {
                 Bus.emit('TOAST', { msg: '已接管视频 #' + this.id, kind: 'ok', remote: false });
             }
 
-            Logger.info('Session', '接管视频 #' + this.id, { type: this.type, reason: opts.reason || 'unknown' });
+            Logger.info('Session', '接管视频 #' + this.id, {
+                type: this.type,
+                reason: opts.reason || 'unknown'
+            });
+
             Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+        }
+
+        _setState(nextState, reason) {
+            if (this._dead || this.state === nextState) return;
+
+            const prev = this.state;
+            this.state = nextState;
+
+            Bus.emit('SESSION_STATE_CHANGED', {
+                session: this,
+                prev: prev,
+                next: nextState,
+                reason: reason || ''
+            });
+
+            Logger.debug('Session', '状态变化 #' + this.id + ' ' + prev + ' -> ' + nextState, {
+                reason: reason || ''
+            });
+        }
+
+        markUserGesture() {
+            this._lastUserGestureAt = NOW();
+            this._userPaused = false;
+
+            if (this.state === SessionState.USER_PAUSED) {
+                this._setState(SessionState.ACTIVE, 'user-gesture');
+            }
+        }
+
+        canAutoPlay() {
+            return ConfigManager.get('autoPlay') &&
+                !this._userPaused &&
+                !this.video.ended &&
+                (
+                    UserGesture.recent(5000) ||
+                    this.video.muted ||
+                    this._playedOnce
+                );
+        }
+
+        tryPlayByUser() {
+            this._programmaticPause = false;
+            tryPlay(this.video);
+        }
+
+        boostOnly() {
+            try { Adaptor.startLoad(this.video); } catch (e) { }
+        }
+
+        commandRecover() {
+            this._userPaused = false;
+            this.engineRecover(true);
+        }
+
+        commandReload() {
+            this._userPaused = false;
+            this.softReload(true);
         }
 
         _bindEvents() {
             const v = this.video;
+            const L = this.listeners;
 
             this._onSeeking = () => {
                 if (!ConfigManager.get('seekGuard')) return;
@@ -1347,18 +2006,47 @@
 
             this._onLoaded = () => this._maybeAutoPlay();
             this._onCanPlay = () => this._maybeAutoPlay();
-            this._onWaiting = () => { this._stallLevel = Math.max(this._stallLevel, 1); };
+
+            this._onWaiting = () => {
+                this._stallLevel = Math.max(this._stallLevel, 1);
+                if (this.state === SessionState.ACTIVE) {
+                    this._setState(SessionState.DEGRADED, 'waiting');
+                }
+            };
 
             this._onPause = () => {
-                if (this._playedOnce && !v.ended) this._userPaused = true;
+                if (this._programmaticPause) {
+                    this._programmaticPause = false;
+                } else if (this._playedOnce && !v.ended) {
+                    let user = true;
+
+                    if (ConfigManager.get('userIntentFirst')) {
+                        user = UserGesture.recent(3000) || (NOW() - this._lastUserGestureAt < 3000);
+                    }
+
+                    if (user) {
+                        this._userPaused = true;
+                        this._setState(SessionState.USER_PAUSED, 'user-pause');
+                        Bus.emit('USER_PAUSE', { session: this });
+                    } else {
+                        this._setState(SessionState.DORMANT, 'pause-no-gesture');
+                    }
+                }
+
                 this._stopRvfc();
             };
 
             this._onPlay = () => {
                 this._playedOnce = true;
                 this._userPaused = false;
+
+                if (this.state !== SessionState.RECOVERING) {
+                    this._setState(SessionState.ACTIVE, 'play');
+                }
+
                 this._boostLoad();
                 this._startRvfc();
+
                 Bus.emit('SESSION_UPDATE', { sessionId: this.id });
             };
 
@@ -1377,10 +2065,10 @@
                     }
                 } catch (err) { }
 
-                this._userPaused = false;
+                this.markUserGesture();
                 this._autoTried = 0;
                 this._boostLoad();
-                tryPlay(v);
+                this.tryPlayByUser();
             };
 
             this._onError = () => {
@@ -1398,29 +2086,41 @@
                 } catch (e) { }
             };
 
-            v.addEventListener('seeking', this._onSeeking);
-            v.addEventListener('seeked', this._onSeeked);
-            v.addEventListener('loadedmetadata', this._onLoaded);
-            v.addEventListener('canplay', this._onCanPlay);
-            v.addEventListener('waiting', this._onWaiting);
-            v.addEventListener('pause', this._onPause);
-            v.addEventListener('play', this._onPlay);
-            v.addEventListener('click', this._onClick, true);
-            v.addEventListener('error', this._onError, true);
+            L.add(v, 'seeking', this._onSeeking);
+            L.add(v, 'seeked', this._onSeeked);
+            L.add(v, 'loadedmetadata', this._onLoaded);
+            L.add(v, 'canplay', this._onCanPlay);
+            L.add(v, 'waiting', this._onWaiting);
+            L.add(v, 'pause', this._onPause);
+            L.add(v, 'play', this._onPlay);
+            L.add(v, 'click', this._onClick, true);
+            L.add(v, 'error', this._onError, true);
         }
 
         _maybeAutoPlay() {
-            if (!ConfigManager.get('autoPlay') || this._userPaused || this._playedOnce || this._autoTried >= 3) return;
+            if (
+                !ConfigManager.get('autoPlay') ||
+                this._userPaused ||
+                this._playedOnce ||
+                this._autoTried >= 3
+            ) return;
 
             const v = this.video;
             const doc = v.ownerDocument || DOC;
+
             if (doc.hidden || !v.paused || v.ended) return;
 
             const ahead = this._bufferAhead();
             const minPre = ConfigManager.get('minPreBuffer') || 2;
 
-            if (ahead >= minPre || isLive(v) || v.readyState >= 3 || (this._autoTried === 0 && v.readyState >= 2)) {
+            if (
+                ahead >= minPre ||
+                isLive(v) ||
+                v.readyState >= 3 ||
+                (this._autoTried === 0 && v.readyState >= 2)
+            ) {
                 this._autoTried++;
+                this._programmaticPause = false;
                 tryPlay(v);
             }
         }
@@ -1443,7 +2143,6 @@
                     if (!v.paused && !v.ended) {
                         this._lastFrameTs = NOW();
                         this._lastTime = v.currentTime;
-                        Bus.emit('SESSION_UPDATE', { sessionId: this.id });
                         this._rvfcId = v.requestVideoFrameCallback(step);
                     } else {
                         this._rvfcRunning = false;
@@ -1466,8 +2165,81 @@
                     this.video.cancelVideoFrameCallback(this._rvfcId);
                 }
             } catch (e) { }
+
             this._rvfcRunning = false;
             this._rvfcId = 0;
+        }
+
+        _fastTick() {
+            if (this._dead) return;
+
+            if (this.state === SessionState.RECOVERING || this.state === SessionState.DEGRADED) {
+                this._stallCheck();
+                this._seekGuardCheck();
+            }
+        }
+
+        _normalTick() {
+            if (this._dead) return;
+
+            if (
+                this.state === SessionState.ACTIVE ||
+                this.state === SessionState.DEGRADED ||
+                this.state === SessionState.RECOVERING
+            ) {
+                this._bufferCheck();
+                this._stallCheck();
+                this._seekGuardCheck();
+            }
+        }
+
+        _slowTick() {
+            if (this._dead) return;
+
+            const v = this.video;
+
+            if (!v || !v.isConnected) {
+                this.destroy('video-removed');
+                return;
+            }
+
+            if (DOC.hidden) {
+                if (this.state === SessionState.ACTIVE) {
+                    this._setState(SessionState.DORMANT, 'page-hidden');
+                }
+                this._stopRvfc();
+                return;
+            }
+
+            if (this.state === SessionState.DORMANT && isVisible(v) && !v.paused) {
+                this._setState(SessionState.ACTIVE, 'visible-again');
+                this._startRvfc();
+            }
+
+            if (this.type === 'unknown' || this.type === 'mse') {
+                const newInfo = Adaptor.detect(v);
+                if (newInfo.type !== this.type && newInfo.type !== 'unknown') {
+                    this.info = newInfo;
+                    this.type = newInfo.type;
+                }
+            }
+        }
+
+        _uiTick() {
+            if (this._dead) return;
+
+            const now = NOW();
+            if (now - this._lastPublishAt >= 500) {
+                this._lastPublishAt = now;
+                Bus.emit('SESSION_UPDATE', { sessionId: this.id });
+            }
+        }
+
+        _seekGuardCheck() {
+            if (this.isSeeking && ConfigManager.get('seekGuard')) {
+                const timeout = ConfigManager.get('seekTimeout') || 5000;
+                if (NOW() - this._seekStartTime > timeout) this._forceSeekRecover();
+            }
         }
 
         _bufferCheck() {
@@ -1478,6 +2250,12 @@
             const now = NOW();
 
             if (ahead < 1 && v.readyState < 3 && !v.paused && !this.isSeeking) {
+                if (this.state === SessionState.ACTIVE) {
+                    this._setState(SessionState.DEGRADED, 'buffer-low');
+                }
+
+                Bus.emit('BUFFER_LOW', { session: this, level: 2, ahead: ahead });
+
                 if (now - this._lastEmergency > 3000) {
                     this._lastEmergency = now;
                     this._emergencyLoad();
@@ -1490,30 +2268,30 @@
                     ) {
                         if (Adaptor.switchLevel(v, -1)) {
                             Bus.emit('TOAST', { msg: '网络不佳，已降画质', kind: 'warn', remote: false });
+                            Bus.emit('QUALITY_CHANGED', { sessionId: this.id, direction: 'down' });
                             Logger.warn('Session', '自动降低画质 #' + this.id);
                         }
                         this._lowCount = 0;
                     }
                 }
             } else if (ahead < 8 && !v.paused && !this.isSeeking) {
+                Bus.emit('BUFFER_LOW', { session: this, level: 1, ahead: ahead });
+
                 if (now - this._lastBoost > 8000) {
                     this._lastBoost = now;
                     this._boostLoad();
                 }
+
                 if (ahead > 5) this._lowCount = 0;
             } else {
                 this._lowCount = 0;
+                if (this.state === SessionState.DEGRADED && ahead > 8) {
+                    this._setState(SessionState.ACTIVE, 'buffer-ok');
+                }
             }
 
             const back = this._backBuffer();
             if (back > 120) Adaptor.trimBack(v, 30);
-
-            if (this.isSeeking && ConfigManager.get('seekGuard')) {
-                const timeout = ConfigManager.get('seekTimeout') || 5000;
-                if (NOW() - this._seekStartTime > timeout) this._forceSeekRecover();
-            }
-
-            Bus.emit('SESSION_UPDATE', { sessionId: this.id });
         }
 
         _stallCheck() {
@@ -1529,6 +2307,12 @@
                 this._lastTime = v.currentTime;
                 this._stallStart = 0;
                 this._stallLevel = 0;
+
+                if (this.state === SessionState.RECOVERING) {
+                    this._setState(SessionState.ACTIVE, 'recovered');
+                    Bus.emit('RECOVERY_SUCCESS', { sessionId: this.id, level: this._recoveryLevel });
+                }
+
                 return;
             }
 
@@ -1546,6 +2330,7 @@
 
                 if (stalled >= 1800 && this._stallLevel === 0) {
                     this._stallLevel = 1;
+                    if (this.state === SessionState.ACTIVE) this._setState(SessionState.DEGRADED, 'stall-1');
                     Bus.emit('STALL_DETECTED', { session: this, level: 1 });
                 } else if (stalled >= 3800 && this._stallLevel === 1) {
                     this._stallLevel = 2;
@@ -1555,10 +2340,20 @@
                     this._stallStart = 0;
                     Bus.emit('STALL_DETECTED', { session: this, level: 3 });
                 }
+
+                if (this.state === SessionState.RECOVERING && now - this._recoveryStartedAt > 9000) {
+                    this._setState(SessionState.FAILED, 'recovery-timeout');
+                    Bus.emit('RECOVERY_FAIL', { sessionId: this.id, level: this._recoveryLevel });
+                }
             } else {
                 this._stallStart = 0;
                 this._stallLevel = 0;
                 this._lastTime = t;
+
+                if (this.state === SessionState.RECOVERING) {
+                    this._setState(SessionState.ACTIVE, 'recovered');
+                    Bus.emit('RECOVERY_SUCCESS', { sessionId: this.id, level: this._recoveryLevel });
+                }
             }
         }
 
@@ -1614,6 +2409,7 @@
 
         _boostAfterSeek() {
             const info = PlayerRegistry.get(this.video) || this.info;
+
             if (info && info.type === 'hls' && info.player) {
                 try { info.player.startLoad(this.video.currentTime); } catch (e) { }
             } else {
@@ -1623,27 +2419,33 @@
 
         _bufferAhead() {
             const v = this.video;
+
             try {
                 const t = v.currentTime;
+
                 for (let i = 0; i < v.buffered.length; i++) {
                     const start = v.buffered.start(i);
                     const end = v.buffered.end(i);
                     if (t >= start - 0.3 && t <= end) return Math.max(0, end - t);
                 }
             } catch (e) { }
+
             return 0;
         }
 
         _backBuffer() {
             const v = this.video;
+
             try {
                 const t = v.currentTime;
+
                 for (let i = 0; i < v.buffered.length; i++) {
                     const start = v.buffered.start(i);
                     const end = v.buffered.end(i);
                     if (t >= start && t <= end) return Math.max(0, t - start);
                 }
             } catch (e) { }
+
             return 0;
         }
 
@@ -1692,7 +2494,7 @@
             } catch (e) { }
         }
 
-        softReload() {
+        softReload(userCommand) {
             const v = this.video;
             const info = PlayerRegistry.get(v) || this.info;
             const src = v.currentSrc || v.src || '';
@@ -1711,8 +2513,8 @@
                     this._nudge();
                 }
 
-                if (ConfigManager.get('autoPlay') && !v.ended) {
-                    this._userPaused = false;
+                if (ConfigManager.get('autoPlay') && !v.ended && (userCommand || !this._userPaused)) {
+                    if (userCommand) this._userPaused = false;
                     tryPlay(v);
                 }
             } catch (e) { }
@@ -1722,7 +2524,7 @@
             Bus.emit('SESSION_UPDATE', { sessionId: this.id });
         }
 
-        engineRecover() {
+        engineRecover(userCommand) {
             const now = NOW();
             if (now - this._lastRecoverAt < 2000) return;
 
@@ -1743,8 +2545,8 @@
                     this._safeSeek(target + 0.05);
                 }
 
-                if (ConfigManager.get('autoPlay') && !v.ended) {
-                    this._userPaused = false;
+                if (ConfigManager.get('autoPlay') && !v.ended && (userCommand || !this._userPaused)) {
+                    if (userCommand) this._userPaused = false;
                     tryPlay(v);
                 }
             } catch (e) { }
@@ -1761,6 +2563,7 @@
             return {
                 status: v.paused ? (v.ended ? '已停止' : '已暂停') : '播放中',
                 statusKey: v.paused ? (v.ended ? 'stop' : 'pause') : 'play',
+                sessionState: this.state,
                 playerType: this.type,
                 playerLabel: PLAYER_LABEL[this.type] || this.type,
                 buffer: this._bufferAhead(),
@@ -1774,39 +2577,31 @@
                 canChangeQuality: Adaptor.canChangeQuality(v),
                 bandwidth: q.bandwidth || estimateBandwidth(),
                 seeking: this.isSeeking,
-                stallLevel: this._stallLevel
+                stallLevel: this._stallLevel,
+                userPaused: this._userPaused
             };
         }
 
-        destroy() {
+        destroy(reason) {
+            if (this._dead) return;
+
             this._dead = true;
 
-            if (this._bufferIv) { clearInterval(this._bufferIv); this._bufferIv = null; }
-            if (this._stallIv) { clearInterval(this._stallIv); this._stallIv = null; }
-
+            Scheduler.unregister('session:' + this.id);
             this._stopRvfc();
-
-            try {
-                this.video.removeEventListener('seeking', this._onSeeking);
-                this.video.removeEventListener('seeked', this._onSeeked);
-                this.video.removeEventListener('loadedmetadata', this._onLoaded);
-                this.video.removeEventListener('canplay', this._onCanPlay);
-                this.video.removeEventListener('waiting', this._onWaiting);
-                this.video.removeEventListener('pause', this._onPause);
-                this.video.removeEventListener('play', this._onPlay);
-                this.video.removeEventListener('click', this._onClick, true);
-                this.video.removeEventListener('error', this._onError, true);
-            } catch (e) { }
+            this.listeners.removeAll();
 
             try { delete this.video.__vaSession; } catch (e) { }
 
-            Bus.emit('SESSION_DESTROY', { session: this });
+            this._setState(SessionState.DESTROYED, reason || 'destroy');
+
+            Bus.emit('SESSION_DESTROY', { session: this, reason: reason || 'destroy' });
             Bus.emit('SESSION_UPDATE', { sessionId: this.id });
         }
     }
 
     /* ═══════════════════════════════════════════════════════════
-       SessionManager 会话管理器
+       SessionManager
     ═══════════════════════════════════════════════════════════ */
 
     class SessionManagerClass {
@@ -1814,20 +2609,18 @@
             this.bus = bus;
             this.sessions = new Set();
             this.seen = new WeakSet();
-
             this._lastPublish = 0;
             this._publishTimer = null;
-
             this._install();
         }
 
         _install() {
-            this.bus.on('VIDEO_FOUND', (payload) => {
+            this.bus.on('TAKEOVER_DECIDED', (payload) => {
                 if (!payload || !payload.video) return;
-                this._queueTakeOver(payload.video, payload);
+                this._takeOverFromArbiter(payload.video, payload);
             });
 
-            this.bus.on('VIDEO_BOOST', (payload) => {
+            this.bus.on('SIGNAL_BOOST', (payload) => {
                 if (!payload || !payload.video) return;
                 this.boostVideo(payload.video, payload.reason);
             });
@@ -1857,57 +2650,59 @@
             });
         }
 
-        _queueTakeOver(video, opts) {
-            opts = opts || {};
+        _takeOverFromArbiter(video, payload) {
             if (!video || video.nodeName !== 'VIDEO') return;
 
-            const s = video.__vaSession;
-            if (s) {
-                if (opts.force) {
-                    s._userPaused = false;
-                    s._boostLoad();
+            const existing = video.__vaSession;
+            if (existing) {
+                const gestureRecent = payload.candidate &&
+                    payload.candidate.userGestureAt &&
+                    NOW() - payload.candidate.userGestureAt < 3000;
+
+                if (gestureRecent) {
+                    existing.markUserGesture();
                     if (ConfigManager.get('autoPlay') && video.paused && !video.ended) {
-                        tryPlay(video);
+                        existing.tryPlayByUser();
                     }
+                } else {
+                    existing.boostOnly();
                 }
                 return;
             }
 
             if (this.seen.has(video)) return;
-            if (!video.isConnected && !opts.force) return;
+            if (!video.isConnected) return;
 
-            if (
-                ConfigManager.get('visibleOnly') &&
-                !opts.force &&
-                video.ownerDocument === DOC &&
-                Detector._viewportObs
-            ) {
-                Detector.watchViewport(video);
-                return;
-            }
+            const userGesture = !!(
+                payload.candidate &&
+                payload.candidate.userGestureAt &&
+                NOW() - payload.candidate.userGestureAt < 3000
+            );
 
-            this._takeOver(video, opts);
-        }
-
-        _takeOver(video, opts) {
-            opts = opts || {};
-
-            if (this.seen.has(video) || video.__vaSession) return;
-            if (!video || (!video.isConnected && !opts.force)) return;
-
-            if (ConfigManager.get('visibleOnly') && !opts.force) {
-                if (!isVisible(video) || videoArea(video) < (ConfigManager.get('minVideoArea') || 0)) return;
+            if (ConfigManager.get('visibleOnly') && !userGesture) {
+                if (!isVisible(video) || videoArea(video) < (ConfigManager.get('minVideoArea') || 0)) {
+                    if (video.ownerDocument === DOC && Detector._viewportObs) {
+                        Detector.watchViewport(video);
+                    }
+                    return;
+                }
             }
 
             this.seen.add(video);
 
             try {
-                const session = new VideoSession(video, opts);
+                const session = new VideoSession(video, {
+                    reason: 'arbiter',
+                    candidate: payload.candidate || null,
+                    userGesture: userGesture
+                });
+
                 this.sessions.add(session);
                 this.bus.emit('SESSION_CREATED', { session: session });
                 this._schedulePublish();
             } catch (e) {
                 Logger.error('SessionManager', '接管视频失败', e);
+                try { this.seen.delete(video); } catch (e2) { }
             }
         }
 
@@ -1923,22 +2718,19 @@
                 addPreconnect(video.currentSrc || video.src, video.ownerDocument);
 
                 const s = video.__vaSession;
-                if (s) {
-                    s._userPaused = false;
-                    s._boostLoad();
-                }
+                if (s) s.boostOnly();
             } catch (e) { }
         }
 
         command(cmd, remote) {
             if (cmd === 'recover') {
                 this.sessions.forEach(function (s) {
-                    try { s._userPaused = false; s.engineRecover(); } catch (e) { }
+                    try { s.commandRecover(); } catch (e) { }
                 });
                 Logger.info('Command', '执行恢复播放', { remote: !!remote });
             } else if (cmd === 'reload') {
                 this.sessions.forEach(function (s) {
-                    try { s._userPaused = false; s.softReload(); } catch (e) { }
+                    try { s.commandReload(); } catch (e) { }
                 });
                 Logger.info('Command', '执行重新加载', { remote: !!remote });
             } else if (cmd === 'upgrade' || cmd === 'downgrade') {
@@ -1977,6 +2769,7 @@
 
         _schedulePublish() {
             if (this._publishTimer) return;
+
             this._publishTimer = setTimeout(() => {
                 this._publishTimer = null;
                 this._publishLocal(true);
@@ -1986,8 +2779,8 @@
         _publishLocal(force) {
             const now = NOW();
             if (!force && now - this._lastPublish < 600) return;
-            this._lastPublish = now;
 
+            this._lastPublish = now;
             const state = this._collectLocalState();
             this.bus.emit('LOCAL_STATE', state);
         }
@@ -2008,6 +2801,7 @@
                 if (!v.paused) score += 10000;
                 if (!v.ended) score += 1000;
                 if (v.readyState >= 3) score += 100;
+                if (s.state === SessionState.ACTIVE) score += 500;
                 score += videoArea(v);
 
                 if (score > bestScore) {
@@ -2020,6 +2814,7 @@
                 return {
                     status: '未检测到视频',
                     statusKey: 'idle',
+                    sessionState: 'idle',
                     playerType: 'unknown',
                     playerLabel: '-',
                     buffer: 0,
@@ -2035,7 +2830,8 @@
                     canChangeQuality: false,
                     bandwidth: 0,
                     seeking: false,
-                    stallLevel: 0
+                    stallLevel: 0,
+                    userPaused: false
                 };
             }
 
@@ -2071,7 +2867,7 @@
             });
 
             toDestroy.forEach(function (s) {
-                try { s.destroy(); } catch (e) { }
+                try { s.destroy('patrol-cleanup'); } catch (e) { }
             });
         }
     }
@@ -2079,39 +2875,155 @@
     const SessionManager = new SessionManagerClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       RecoveryStrategy 分级恢复策略
+       RecoveryOrchestrator
     ═══════════════════════════════════════════════════════════ */
 
-    const RecoveryStrategy = {
-        init() {
-            Bus.on('STALL_DETECTED', (payload) => {
-                if (!payload || !payload.session || payload.session._dead) return;
+    class RecoveryOrchestratorClass {
+        constructor(bus) {
+            this.bus = bus;
+            this.budget = new WeakMap();
 
-                const session = payload.session;
-                const level = payload.level;
-
-                try {
-                    if (level === 1) {
-                        session._nudge();
-                        Logger.info('Recovery', 'L1 轻推 #' + session.id);
-                    } else if (level === 2) {
-                        session._reloadSegment();
-                        Logger.warn('Recovery', 'L2 重载切片 #' + session.id);
-                    } else if (level === 3) {
-                        session.engineRecover();
-                        Logger.warn('Recovery', 'L3 引擎恢复 #' + session.id);
-                    }
-                } catch (e) {
-                    Logger.error('Recovery', '恢复执行失败 #' + session.id, e);
-                }
-            });
+            this.bus.on('STALL_DETECTED', (payload) => this._onStall(payload));
+            this.bus.on('BUFFER_LOW', (payload) => this._onBufferLow(payload));
         }
-    };
 
-    RecoveryStrategy.init();
+        _getBudget(session) {
+            let b = this.budget.get(session);
+
+            if (!b) {
+                b = {
+                    count: 0,
+                    timestamps: [],
+                    cooldownUntil: 0
+                };
+                this.budget.set(session, b);
+            }
+
+            return b;
+        }
+
+        _canAttempt(session, level) {
+            if (!session || session._dead) return false;
+            if (!ConfigManager.get('watchdog')) return false;
+            if (session._userPaused) return false;
+            if (session.isSeeking) return false;
+            if (session.state === SessionState.RECOVERING || session.state === SessionState.FAILED) return false;
+
+            const v = session.video;
+            if (!v || v.paused || v.ended) return false;
+            if (DOC.hidden) return false;
+
+            const b = this._getBudget(session);
+            const now = NOW();
+
+            if (b.count >= (ConfigManager.get('recoveryBudget') || 8)) return false;
+            if (now < b.cooldownUntil) return false;
+
+            b.timestamps = b.timestamps.filter(function (t) { return now - t < 60000; });
+            if (b.timestamps.length >= 3) return false;
+
+            return true;
+        }
+
+        _record(session, level) {
+            const b = this._getBudget(session);
+            const now = NOW();
+
+            b.count++;
+            b.timestamps.push(now);
+
+            const cooldowns = {
+                1: 2000,
+                2: 5000,
+                3: 10000,
+                4: 20000
+            };
+
+            b.cooldownUntil = now + (cooldowns[level] || 5000);
+
+            session._recoveryLevel = level;
+            session._recoveryStartedAt = now;
+        }
+
+        _onBufferLow(payload) {
+            if (!payload || !payload.session) return;
+
+            const session = payload.session;
+
+            if (payload.level === 1) {
+                if (NOW() - session._lastBoost > 8000) {
+                    session._lastBoost = NOW();
+                    session._boostLoad();
+                }
+                return;
+            }
+
+            if (payload.level === 2) {
+                if (!this._canAttempt(session, 1)) {
+                    this.bus.emit('RECOVERY_BLOCKED', { sessionId: session.id, level: 1 });
+                    return;
+                }
+
+                this._record(session, 1);
+                session._setState(SessionState.DEGRADED, 'buffer-recover');
+                session._boostLoad();
+
+                this.bus.emit('RECOVERY_ATTEMPT', {
+                    sessionId: session.id,
+                    level: 0,
+                    reason: 'buffer-low'
+                });
+            }
+        }
+
+        _onStall(payload) {
+            if (!payload || !payload.session) return;
+
+            const session = payload.session;
+            const level = payload.level;
+
+            if (!this._canAttempt(session, level)) {
+                this.bus.emit('RECOVERY_BLOCKED', { sessionId: session.id, level: level });
+                return;
+            }
+
+            this._record(session, level);
+            session._setState(SessionState.RECOVERING, 'stall-recover');
+
+            this.bus.emit('RECOVERY_ATTEMPT', {
+                sessionId: session.id,
+                level: level,
+                reason: 'stall'
+            });
+
+            try {
+                if (level === 1) {
+                    if (isLive(session.video)) session._boostLoad();
+                    else session._nudge();
+
+                    Logger.info('Recovery', 'L1 轻推 #' + session.id);
+                } else if (level === 2) {
+                    session._reloadSegment();
+                    Logger.warn('Recovery', 'L2 重载切片 #' + session.id);
+                } else if (level === 3) {
+                    session.engineRecover(false);
+                    Logger.warn('Recovery', 'L3 引擎恢复 #' + session.id);
+                }
+            } catch (e) {
+                Logger.error('Recovery', '恢复执行失败 #' + session.id, e);
+                this.bus.emit('RECOVERY_FAIL', {
+                    sessionId: session.id,
+                    level: level,
+                    error: String(e)
+                });
+            }
+        }
+    }
+
+    const RecoveryOrchestrator = new RecoveryOrchestratorClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       UIManager 控制台
+       UIManager v2
     ═══════════════════════════════════════════════════════════ */
 
     class UIManager {
@@ -2119,10 +3031,8 @@
             this.bus = bus;
             this._state = {};
             this._visible = false;
-
             this._logs = [];
             this._logFilter = 'all';
-
             this._timeline = [];
             this._lastStallMarker = 0;
             this._lastRecoveries = 0;
@@ -2145,47 +3055,107 @@
 
             const style = DOC.createElement('style');
             style.textContent = `
-                :host{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:13px}
+                :host{
+                    --va-bg:rgba(12,12,18,.94);
+                    --va-card:rgba(255,255,255,.05);
+                    --va-border:rgba(255,255,255,.12);
+                    --va-text:#e8e8ec;
+                    --va-dim:#999;
+                    --va-accent:#0a84ff;
+                    --va-success:#30d158;
+                    --va-warning:#ff9f0a;
+                    --va-error:#ff453a;
+                    --va-radius:14px;
+                    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+                    font-size:13px;
+                }
                 *{box-sizing:border-box}
-                .panel{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-                    background:rgba(12,12,18,.94);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-                    border:1px solid rgba(255,255,255,.12);border-radius:14px;
+
+                .fab{
+                    position:fixed;bottom:18px;right:18px;width:42px;height:42px;border-radius:50%;
+                    color:#fff;display:flex;align-items:center;justify-content:center;
+                    font-size:18px;cursor:pointer;opacity:.72;transition:opacity .15s,transform .15s;
+                    z-index:9;user-select:none;background:rgba(120,120,120,.5);
+                    box-shadow:0 0 0 3px rgba(120,120,120,.35);
+                }
+                .fab:hover{opacity:1;transform:scale(1.06)}
+                .fab[data-state=active]{background:rgba(10,132,255,.78);box-shadow:0 0 0 3px rgba(48,209,88,.55)}
+                .fab[data-state=degraded]{background:rgba(255,159,10,.78);box-shadow:0 0 0 3px rgba(255,159,10,.5)}
+                .fab[data-state=recovering]{background:rgba(255,69,58,.78);box-shadow:0 0 0 3px rgba(255,69,58,.5)}
+                .fab[data-state=paused]{background:rgba(142,142,147,.78);box-shadow:0 0 0 3px rgba(142,142,147,.4)}
+                .fab[data-state=seek]{background:rgba(191,90,242,.78);box-shadow:0 0 0 3px rgba(191,90,242,.5)}
+                .fab[data-state=idle]{background:rgba(120,120,120,.5);box-shadow:0 0 0 3px rgba(120,120,120,.35)}
+
+                .panel{
+                    position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+                    background:var(--va-bg);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+                    border:1px solid var(--va-border);border-radius:var(--va-radius);
                     box-shadow:0 20px 60px rgba(0,0,0,.5);
-                    width:min(460px,calc(100vw - 24px));max-height:80vh;overflow:hidden;color:#e8e8ec;
-                    display:flex;flex-direction:column}
-                .hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 14px 8px;
-                    border-bottom:1px solid rgba(255,255,255,.08)}
+                    width:min(500px,calc(100vw - 24px));max-height:82vh;overflow:hidden;color:var(--va-text);
+                    display:flex;flex-direction:column;
+                }
+
+                .hdr{
+                    display:flex;align-items:center;justify-content:space-between;padding:12px 14px 10px;
+                    border-bottom:1px solid rgba(255,255,255,.08);
+                }
                 .hdr h3{margin:0;font-size:15px;font-weight:600;color:#fff}
-                .close-x{background:none;border:none;color:#666;font-size:18px;cursor:pointer;padding:2px 6px;border-radius:5px}
+                .close-x{
+                    background:none;border:none;color:#666;font-size:18px;cursor:pointer;
+                    padding:2px 6px;border-radius:6px;
+                }
                 .close-x:hover{color:#fff;background:rgba(255,255,255,.1)}
-                .tabs{display:flex;padding:0 12px;border-bottom:1px solid rgba(255,255,255,.08);gap:2px}
-                .tab{padding:9px 12px;cursor:pointer;font-size:12px;color:#777;border-bottom:2px solid transparent;user-select:none}
+
+                .tabs{
+                    display:flex;padding:0 12px;border-bottom:1px solid rgba(255,255,255,.08);gap:2px;
+                }
+                .tab{
+                    padding:10px 12px;cursor:pointer;font-size:12px;color:#777;
+                    border-bottom:2px solid transparent;user-select:none;
+                }
                 .tab:hover{color:#bbb}
-                .tab.active{color:#fff;border-bottom-color:#0a84ff}
-                .body{padding:10px 14px 12px;overflow-y:auto;flex:1;min-height:0}
+                .tab.active{color:#fff;border-bottom-color:var(--va-accent)}
+
+                .body{padding:12px 14px 14px;overflow-y:auto;flex:1;min-height:0}
                 .page{display:none}
                 .page.active{display:block}
-                .row{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#999;margin:3px 0;flex-wrap:wrap}
+
+                .card{
+                    background:var(--va-card);border:1px solid rgba(255,255,255,.06);
+                    border-radius:12px;padding:10px 12px;margin:8px 0;
+                }
+
+                .row{
+                    display:flex;justify-content:space-between;align-items:center;
+                    font-size:12px;color:var(--va-dim);margin:3px 0;flex-wrap:wrap;gap:8px;
+                }
                 .row b{color:#fff}
-                .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;background:#555}
-                .dot.live{background:#30d158;box-shadow:0 0 6px #30d158}
+
+                .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;background:#555}
+                .dot.live{background:var(--va-success);box-shadow:0 0 6px var(--va-success)}
                 .dot.pause{background:#8e8e93}
-                .dot.stop{background:#ff9f0a}
+                .dot.stop{background:var(--va-warning)}
                 .dot.seek{background:#bf5af2;box-shadow:0 0 6px #bf5af2}
+
                 .buf-wrap{margin:8px 0}
-                .buf-label{display:flex;justify-content:space-between;font-size:11px;color:#888;margin-bottom:4px}
-                .buf-bar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden}
-                .buf-fill{height:100%;background:linear-gradient(90deg,#0a84ff,#30d158);width:0%;transition:width .25s cubic-bezier(0.4,0,.2,1);border-radius:3px}
-                .info-box{background:rgba(255,255,255,.04);border-radius:8px;padding:6px 10px;margin:5px 0;font-size:12px;color:#999;line-height:1.6}
-                .info-box span{color:#ddd;font-weight:500}
-                .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin:8px 0}
-                .stat-card{background:rgba(255,255,255,.05);border-radius:8px;padding:6px 8px;text-align:center}
-                .stat-card .val{font-size:15px;font-weight:700;color:#fff}
-                .stat-card .lbl{font-size:10px;color:#777}
-                .btn-group{display:flex;gap:5px;flex-wrap:wrap;margin:6px 0}
-                button.act{padding:8px 10px;border:1px solid rgba(255,255,255,.12);border-radius:8px;cursor:pointer;
+                .buf-label{display:flex;justify-content:space-between;font-size:11px;color:#888;margin-bottom:5px}
+                .buf-bar{height:6px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden}
+                .buf-fill{
+                    height:100%;background:linear-gradient(90deg,var(--va-accent),var(--va-success));
+                    width:0%;transition:width .25s cubic-bezier(0.4,0,.2,1);border-radius:4px;
+                }
+
+                .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}
+                .stat-card{background:rgba(255,255,255,.05);border-radius:10px;padding:8px;text-align:center}
+                .stat-card .val{font-size:16px;font-weight:700;color:#fff}
+                .stat-card .lbl{font-size:10px;color:#777;margin-top:2px}
+
+                .btn-group{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+                button.act{
+                    padding:9px 10px;border:1px solid var(--va-border);border-radius:10px;cursor:pointer;
                     font-size:12px;font-weight:500;flex:1;display:flex;align-items:center;justify-content:center;
-                    background:rgba(255,255,255,.07);color:#fff;transition:all .15s}
+                    background:rgba(255,255,255,.07);color:#fff;transition:all .15s;
+                }
                 button.act:hover:not(:disabled){filter:brightness(1.2);transform:translateY(-1px)}
                 button.act:active:not(:disabled){transform:translateY(1px);filter:brightness(0.9)}
                 button.act:disabled{opacity:.3;cursor:not-allowed}
@@ -2193,46 +3163,79 @@
                 .btn-w{background:rgba(255,159,10,.6)}
                 .btn-g{background:rgba(48,209,88,.6)}
                 .btn-d{background:rgba(255,69,58,.6)}
-                .divider{height:1px;background:rgba(255,255,255,.08);margin:8px 0}
-                .sec-title{font-size:11px;color:#0a84ff;margin:8px 0 4px;font-weight:600}
-                label.opt{display:flex;align-items:center;gap:7px;font-size:12px;color:#bbb;margin:5px 0;cursor:pointer}
-                label.opt input[type=checkbox]{width:15px;height:15px;accent-color:#0a84ff;cursor:pointer}
-                label.opt input[type=number],label.opt select{width:88px;padding:4px 6px;margin-left:auto;border:1px solid rgba(255,255,255,.12);
-                    border-radius:6px;background:rgba(0,0,0,.3);color:#eee;font-size:12px}
+
+                .divider{height:1px;background:rgba(255,255,255,.08);margin:10px 0}
+                .sec-title{font-size:11px;color:var(--va-accent);margin:10px 0 6px;font-weight:600}
+
+                label.opt{
+                    display:flex;align-items:center;gap:8px;font-size:12px;color:#bbb;
+                    margin:6px 0;cursor:pointer;
+                }
+                label.opt input[type=checkbox]{width:15px;height:15px;accent-color:var(--va-accent);cursor:pointer}
+                label.opt input[type=number],label.opt select{
+                    width:92px;padding:5px 6px;margin-left:auto;
+                    border:1px solid var(--va-border);border-radius:8px;
+                    background:rgba(0,0,0,.3);color:#eee;font-size:12px;
+                }
+
                 .hint{font-size:11px;color:#666;line-height:1.5;margin-top:8px}
-                .toast{position:fixed;top:18px;right:18px;padding:8px 14px;border-radius:10px;
-                    background:rgba(28,28,35,.95);border:1px solid rgba(255,255,255,.12);color:#fff;font-size:13px;
-                    transform:translateX(120%);transition:transform .25s,opacity .25s;opacity:0;pointer-events:none;z-index:10}
+
+                .toast{
+                    position:fixed;top:18px;right:18px;padding:9px 14px;border-radius:12px;
+                    background:rgba(28,28,35,.95);border:1px solid var(--va-border);color:#fff;font-size:13px;
+                    transform:translateX(120%);transition:transform .25s,opacity .25s;opacity:0;pointer-events:none;z-index:10;
+                }
                 .toast.show{transform:translateX(0);opacity:1}
-                .toast.ok{border-left:3px solid #30d158}
-                .toast.warn{border-left:3px solid #ff9f0a}
-                .toast.err{border-left:3px solid #ff453a}
-                .stall-badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:6px}
-                .stall-badge.s1{background:rgba(255,159,10,.3);color:#ff9f0a}
-                .stall-badge.s2{background:rgba(255,69,58,.3);color:#ff453a}
+                .toast.ok{border-left:3px solid var(--va-success)}
+                .toast.warn{border-left:3px solid var(--va-warning)}
+                .toast.err{border-left:3px solid var(--va-error)}
+
+                .stall-badge{
+                    display:inline-block;padding:2px 6px;border-radius:6px;font-size:10px;margin-left:6px;
+                }
+                .stall-badge.s1{background:rgba(255,159,10,.3);color:var(--va-warning)}
+                .stall-badge.s2{background:rgba(255,69,58,.3);color:var(--va-error)}
                 .stall-badge.s3{background:rgba(255,0,0,.4);color:#fff}
-                .fab{position:fixed;bottom:18px;right:18px;width:38px;height:38px;border-radius:50%;
-                    background:rgba(10,132,255,.75);color:#fff;display:flex;align-items:center;justify-content:center;
-                    font-size:18px;cursor:pointer;opacity:.45;transition:opacity .15s,transform .15s;z-index:9;user-select:none}
-                .fab:hover{opacity:1;transform:scale(1.06)}
+
                 .timeline-wrap{margin:8px 0}
-                .timeline{position:relative;height:18px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
-                .tl-item{position:absolute;top:2px;bottom:2px;width:3px;border-radius:1px}
-                .tl-stall{background:#ff9f0a}
+                .timeline{
+                    position:relative;height:20px;background:rgba(255,255,255,.06);
+                    border-radius:6px;overflow:hidden;
+                }
+                .tl-item{position:absolute;top:3px;bottom:3px;width:3px;border-radius:1px}
+                .tl-stall{background:var(--va-warning)}
                 .tl-warn{background:#ffd60a}
-                .tl-error{background:#ff453a}
-                .tl-recover{background:#30d158}
+                .tl-error{background:var(--va-error)}
+                .tl-recover{background:var(--va-success)}
+
                 .log-toolbar{display:flex;align-items:center;gap:6px;margin:8px 0}
-                .log-toolbar span{font-size:11px;color:#0a84ff;font-weight:600}
-                .log-toolbar select{margin-left:auto;padding:3px 6px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(0,0,0,.3);color:#eee;font-size:11px}
-                .mini{padding:3px 8px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.07);color:#fff;cursor:pointer;font-size:11px}
-                .logs{height:160px;overflow:auto;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:6px;font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.45}
+                .log-toolbar span{font-size:11px;color:var(--va-accent);font-weight:600}
+                .log-toolbar select{
+                    margin-left:auto;padding:4px 6px;border:1px solid var(--va-border);
+                    border-radius:8px;background:rgba(0,0,0,.3);color:#eee;font-size:11px;
+                }
+
+                .mini{
+                    padding:4px 8px;border:1px solid var(--va-border);border-radius:8px;
+                    background:rgba(255,255,255,.07);color:#fff;cursor:pointer;font-size:11px;
+                }
+
+                .logs{
+                    height:180px;overflow:auto;background:rgba(0,0,0,.25);
+                    border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:7px;
+                    font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.45;
+                }
                 .log-line{white-space:pre-wrap;word-break:break-all}
                 .log-line.debug{color:#8e8e93}
                 .log-line.info{color:#d0d0d8}
                 .log-line.warn{color:#ffd60a}
-                .log-line.error{color:#ff453a}
-                .dep-hint{font-size:11px;color:#ff9f0a;background:rgba(255,159,10,.08);border:1px solid rgba(255,159,10,.25);border-radius:6px;padding:5px 8px;margin:4px 0}
+                .log-line.error{color:var(--va-error)}
+
+                .dep-hint{
+                    font-size:11px;color:var(--va-warning);
+                    background:rgba(255,159,10,.08);border:1px solid rgba(255,159,10,.25);
+                    border-radius:8px;padding:6px 8px;margin:6px 0;
+                }
             `;
             this.root.appendChild(style);
 
@@ -2242,6 +3245,7 @@
 
             this._fab = DOC.createElement('div');
             this._fab.className = 'fab';
+            this._fab.dataset.state = 'idle';
             this._fab.textContent = '🎬';
             this._fab.title = '视频加速控制台';
             this._fab.addEventListener('click', () => this.toggle());
@@ -2254,39 +3258,49 @@
             this._panel.innerHTML = `
                 <div class="hdr"><h3>🎬 视频加速控制台</h3><button class="close-x" data-act="close">✕</button></div>
                 <div class="tabs">
-                    <div class="tab active" data-tab="monitor">📊 实时监控</div>
-                    <div class="tab" data-tab="settings">⚙️ 功能设置</div>
-                    <div class="tab" data-tab="tools">📦 数据管理</div>
+                    <div class="tab active" data-tab="monitor">📊 监控</div>
+                    <div class="tab" data-tab="settings">⚙️ 策略</div>
+                    <div class="tab" data-tab="tools">📦 数据</div>
                 </div>
                 <div class="body">
                     <div class="page active" id="page-monitor">
-                        <div class="row">
-                            <span><span class="dot" id="va-dot"></span><b id="va-status">检测中</b><span id="va-stall"></span></span>
-                            <span>播放器: <b id="va-type">-</b></span>
-                            <span>视频数: <b id="va-count">0</b></span>
+                        <div class="card">
+                            <div class="row">
+                                <span><span class="dot" id="va-dot"></span><b id="va-status">检测中</b><span id="va-stall"></span></span>
+                                <span>播放器: <b id="va-type">-</b></span>
+                                <span>视频数: <b id="va-count">0</b></span>
+                            </div>
+                            <div class="row">
+                                <span>会话状态: <b id="va-session-state">-</b></span>
+                                <span>恢复次数: <b id="va-rec">0</b></span>
+                            </div>
                         </div>
 
-                        <div class="buf-wrap">
-                            <div class="buf-label"><span>前方缓冲</span><span id="va-buf-time">0s</span></div>
-                            <div class="buf-bar"><div class="buf-fill" id="va-buf-fill"></div></div>
+                        <div class="card">
+                            <div class="buf-wrap">
+                                <div class="buf-label"><span>前方缓冲</span><span id="va-buf-time">0s</span></div>
+                                <div class="buf-bar"><div class="buf-fill" id="va-buf-fill"></div></div>
+                            </div>
+                            <div class="row">
+                                <span>网络健康: <b id="va-health">-</b></span>
+                                <span>网络类型: <b id="va-net">-</b></span>
+                            </div>
+                            <div class="row">
+                                <span>画质: <b id="va-quality">-</b></span>
+                                <span>带宽: <b id="va-bw">-</b></span>
+                                <span>分辨率: <b id="va-res">-</b></span>
+                            </div>
                         </div>
 
-                        <div class="info-box">
-                            画质: <span id="va-quality">-</span> · 带宽: <span id="va-bw">-</span> · 分辨率: <span id="va-res">-</span><br>
-                            网络健康: <span id="va-health">-</span> · 网络类型: <span id="va-net">-</span>
-                        </div>
-
-                        <div class="timeline-wrap">
+                        <div class="card timeline-wrap">
                             <div class="buf-label"><span>近 60 秒卡顿 / 恢复时间轴</span></div>
                             <div class="timeline" id="va-timeline"></div>
                         </div>
 
                         <div class="stat-grid">
-                            <div class="stat-card"><div class="val" id="va-rec">0</div><div class="lbl">恢复次数</div></div>
                             <div class="stat-card"><div class="val" id="va-ready">-</div><div class="lbl">就绪状态</div></div>
+                            <div class="stat-card"><div class="val" id="va-progress">--/--</div><div class="lbl">播放进度</div></div>
                         </div>
-
-                        <div class="info-box">进度: <span id="va-progress">--/--</span></div>
 
                         <div class="btn-group">
                             <button class="act btn-p" data-act="recover">恢复播放</button>
@@ -2301,16 +3315,19 @@
                     </div>
 
                     <div class="page" id="page-settings">
-                        <div class="sec-title">注入与嗅探策略</div>
+                        <div class="sec-title">检测与接管</div>
                         <label class="opt"><input type="checkbox" id="va-proto"> 原型嗅探（src / play / load）</label>
                         <label class="opt"><input type="checkbox" id="va-pointer"> pointerdown 预启动</label>
                         <label class="opt"><input type="checkbox" id="va-fast"> DOM 动态扫描</label>
                         <label class="opt"><input type="checkbox" id="va-visible"> 仅接管可见视频</label>
+                        <label class="opt"><input type="checkbox" id="va-userintent"> 用户意图优先</label>
+                        <label class="opt"><input type="checkbox" id="va-standby"> 待机观察模式</label>
+                        <label class="opt"><input type="checkbox" id="va-adguard"> 广告/预览过滤</label>
                         <label class="opt">最小接管面积 <input type="number" id="va-area" min="0" step="1000"></label>
 
                         <div class="divider"></div>
 
-                        <div class="sec-title">网络与缓冲策略</div>
+                        <div class="sec-title">网络与缓冲</div>
                         <label class="opt"><input type="checkbox" id="va-fetch"> 视频请求高优先级</label>
                         <label class="opt"><input type="checkbox" id="va-preconnect"> DNS / preconnect 预热</label>
                         <label class="opt"><input type="checkbox" id="va-instant"> play() 即时增强</label>
@@ -2323,16 +3340,17 @@
 
                         <div class="divider"></div>
 
-                        <div class="sec-title">容错与自愈策略</div>
+                        <div class="sec-title">容错与自愈</div>
                         <label class="opt"><input type="checkbox" id="va-auto"> 自动播放 / 续播</label>
                         <label class="opt"><input type="checkbox" id="va-seek"> Seek 保护（超时恢复）</label>
                         <label class="opt">Seek 超时 <input type="number" id="va-seekto" min="2000" max="15000" step="500"> ms</label>
                         <label class="opt"><input type="checkbox" id="va-watchdog"> 卡死分级恢复</label>
                         <label class="opt"><input type="checkbox" id="va-rvfc"> RVFC 帧级卡顿监控</label>
+                        <label class="opt">恢复预算 <input type="number" id="va-budget" min="1" max="20"></label>
 
                         <div class="divider"></div>
 
-                        <div class="sec-title">检测与提示</div>
+                        <div class="sec-title">UI 与日志</div>
                         <label class="opt"><input type="checkbox" id="va-toast"> 显示操作提示</label>
                         <label class="opt"><input type="checkbox" id="va-detect"> 显示接管通知</label>
                         <label class="opt">日志级别
@@ -2343,8 +3361,7 @@
                                 <option value="error">Error</option>
                             </select>
                         </label>
-
-                        <div class="hint">v18 优先使用原型嗅探 + 手势预启动；缓冲 / 自动降画质主要对 HLS.js 生效。</div>
+                        <div class="hint">v19：候选评分接管、用户意图保护、恢复预算与冷却、统一调度器。</div>
                     </div>
 
                     <div class="page" id="page-tools">
@@ -2366,11 +3383,11 @@
                             </select>
                             <button class="mini" data-act="clearLogs">清空</button>
                         </div>
-                        <div class="logs" id="va-logs"></div>
 
+                        <div class="logs" id="va-logs"></div>
                         <div class="hint" id="va-hint"></div>
                         <div class="divider"></div>
-                        <div class="hint">v18.0：微内核架构、事件总线、日志流、网络健康评分、卡顿时间轴。</div>
+                        <div class="hint">v19.0：感知-裁决-会话-自愈-观测架构。</div>
                     </div>
                 </div>
             `;
@@ -2426,6 +3443,7 @@
             this.bus.on('STATE_AGGREGATED', (state) => {
                 this._maybeAddStateMarkers(state);
                 this.update(state);
+                this._updateFab(state);
             });
 
             this.bus.on('LOG_EMIT', (entry) => {
@@ -2442,12 +3460,14 @@
 
             this.bus.on('CONFIG_EXPORT_RESULT', (payload) => {
                 if (!payload || !payload.json) return;
+
                 const ta = this._ensureTextarea();
                 ta.value = payload.json;
                 ta.select();
 
                 let ok = false;
                 try { ok = DOC.execCommand('copy'); } catch (e) { }
+
                 if (ok) this.toast('已复制到剪贴板', 'ok');
                 else this.toast('请手动复制', 'warn');
             });
@@ -2474,6 +3494,7 @@
             const flushHandler = () => {
                 try { this._flushSettings(); } catch (e) { }
             };
+
             PW.addEventListener('pagehide', flushHandler);
             PW.addEventListener('beforeunload', flushHandler);
         }
@@ -2491,22 +3512,19 @@
                 };
 
                 const isNumeric = el.tagName === 'INPUT' && (el.type === 'number' || el.type === 'text');
-
-                if (isNumeric) {
-                    el.addEventListener('change', handler);
-                } else {
-                    el.addEventListener('input', handler);
-                }
+                if (isNumeric) el.addEventListener('change', handler);
+                else el.addEventListener('input', handler);
             };
 
-            // 注入与嗅探
             bind('va-proto', 'protoHook');
             bind('va-pointer', 'earlyPointer');
             bind('va-fast', 'fastDetect');
             bind('va-visible', 'visibleOnly');
+            bind('va-userintent', 'userIntentFirst');
+            bind('va-standby', 'standbyMode');
+            bind('va-adguard', 'adGuard');
             bind('va-area', 'minVideoArea', function (el) { return parseInt(el.value, 10) || 0; });
 
-            // 网络与缓冲
             bind('va-fetch', 'fetchPriority');
             bind('va-preconnect', 'preconnect');
             bind('va-instant', 'instantPlay');
@@ -2516,14 +3534,13 @@
             bind('va-quality', 'qualityManage');
             bind('va-autodown', 'autoDowngrade');
 
-            // 容错与自愈
             bind('va-auto', 'autoPlay');
             bind('va-seek', 'seekGuard');
             bind('va-seekto', 'seekTimeout', function (el) { return parseInt(el.value, 10) || 5000; });
             bind('va-watchdog', 'watchdog');
             bind('va-rvfc', 'rvfcMonitor');
+            bind('va-budget', 'recoveryBudget', function (el) { return parseInt(el.value, 10) || 8; });
 
-            // 检测与提示
             bind('va-toast', 'showToast');
             bind('va-detect', 'showDetect');
             bind('va-loglevel', 'logLevel', function (el) { return el.value; });
@@ -2531,6 +3548,7 @@
 
         _flushSettings() {
             const patch = {};
+
             const read = (id, key, transform) => {
                 const el = this._panel.querySelector('#' + id);
                 if (!el) return;
@@ -2541,6 +3559,9 @@
             read('va-pointer', 'earlyPointer');
             read('va-fast', 'fastDetect');
             read('va-visible', 'visibleOnly');
+            read('va-userintent', 'userIntentFirst');
+            read('va-standby', 'standbyMode');
+            read('va-adguard', 'adGuard');
             read('va-area', 'minVideoArea', function (el) { return parseInt(el.value, 10) || 0; });
 
             read('va-fetch', 'fetchPriority');
@@ -2557,6 +3578,7 @@
             read('va-seekto', 'seekTimeout', function (el) { return parseInt(el.value, 10) || 5000; });
             read('va-watchdog', 'watchdog');
             read('va-rvfc', 'rvfcMonitor');
+            read('va-budget', 'recoveryBudget', function (el) { return parseInt(el.value, 10) || 8; });
 
             read('va-toast', 'showToast');
             read('va-detect', 'showDetect');
@@ -2570,6 +3592,7 @@
                 const el = this._panel.querySelector('#' + id);
                 if (el) el.checked = !!v;
             };
+
             const set = (id, v) => {
                 const el = this._panel.querySelector('#' + id);
                 if (el) el.value = v;
@@ -2579,6 +3602,9 @@
             chk('va-pointer', ConfigManager.get('earlyPointer'));
             chk('va-fast', ConfigManager.get('fastDetect'));
             chk('va-visible', ConfigManager.get('visibleOnly'));
+            chk('va-userintent', ConfigManager.get('userIntentFirst'));
+            chk('va-standby', ConfigManager.get('standbyMode'));
+            chk('va-adguard', ConfigManager.get('adGuard'));
             set('va-area', ConfigManager.get('minVideoArea'));
 
             chk('va-fetch', ConfigManager.get('fetchPriority'));
@@ -2595,6 +3621,7 @@
             set('va-seekto', ConfigManager.get('seekTimeout'));
             chk('va-watchdog', ConfigManager.get('watchdog'));
             chk('va-rvfc', ConfigManager.get('rvfcMonitor'));
+            set('va-budget', ConfigManager.get('recoveryBudget'));
 
             chk('va-toast', ConfigManager.get('showToast'));
             chk('va-detect', ConfigManager.get('showDetect'));
@@ -2606,18 +3633,21 @@
         _updateDependency() {
             const el = this._panel.querySelector('#va-dep-down');
             if (!el) return;
+
             const show = ConfigManager.get('autoDowngrade') && !ConfigManager.get('qualityManage');
             el.style.display = show ? 'block' : 'none';
         }
 
         _ensureTextarea() {
             let ta = this._panel.querySelector('#va-cfg-ta');
+
             if (!ta) {
                 ta = DOC.createElement('textarea');
                 ta.id = 'va-cfg-ta';
-                ta.style.cssText = 'width:100%;height:80px;margin-top:8px;background:rgba(0,0,0,.3);color:#eee;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:8px;font-size:11px;font-family:ui-monospace,Consolas,monospace;';
+                ta.style.cssText = 'width:100%;height:84px;margin-top:8px;background:rgba(0,0,0,.3);color:#eee;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:8px;font-size:11px;font-family:ui-monospace,Consolas,monospace;';
                 this._panel.querySelector('#page-tools').appendChild(ta);
             }
+
             return ta;
         }
 
@@ -2649,11 +3679,8 @@
                 } catch (e) { }
             };
 
-            if (DOC.body) {
-                doMount();
-            } else {
-                DOC.addEventListener('DOMContentLoaded', doMount, { once: true });
-            }
+            if (DOC.body) doMount();
+            else DOC.addEventListener('DOMContentLoaded', doMount, { once: true });
         }
 
         _mount() {
@@ -2687,6 +3714,7 @@
             if (ConfigManager.get('showToast') === false) return;
 
             this._mount();
+
             this._toast.textContent = msg;
             this._toast.className = 'toast show ' + (kind || '');
 
@@ -2729,6 +3757,8 @@
             else if (s.stallLevel === 1) score -= 8;
 
             if (s.recoveries) score -= Math.min(15, s.recoveries * 2);
+            if (s.sessionState === SessionState.FAILED) score -= 20;
+            if (s.sessionState === SessionState.RECOVERING) score -= 10;
 
             return clamp(score, 0, 100);
         }
@@ -2745,7 +3775,7 @@
             if (!entry) return;
 
             this._logs.push(entry);
-            if (this._logs.length > 300) this._logs.shift();
+            if (this._logs.length > 250) this._logs.shift();
 
             if (this._visible && this._matchesFilter(entry)) {
                 this._renderLogLine(entry);
@@ -2767,11 +3797,12 @@
 
             const time = new Date(entry.ts).toLocaleTimeString();
             const scope = entry.remote ? (entry.scope + ':remote') : entry.scope;
+
             div.textContent = '[' + time + '] [' + entry.level.toUpperCase() + '] ' + scope + ': ' + entry.message;
 
             logsEl.appendChild(div);
 
-            while (logsEl.children.length > 300) {
+            while (logsEl.children.length > 200) {
                 logsEl.removeChild(logsEl.firstChild);
             }
 
@@ -2783,6 +3814,7 @@
             if (!logsEl) return;
 
             logsEl.innerHTML = '';
+
             for (const entry of this._logs) {
                 if (this._matchesFilter(entry)) this._renderLogLine(entry);
             }
@@ -2790,6 +3822,7 @@
 
         _addTimelineMarker(type, label) {
             const now = NOW();
+
             this._timeline.push({ ts: now, type: type, label: label || '' });
             if (this._timeline.length > 120) this._timeline.shift();
 
@@ -2801,6 +3834,7 @@
 
         _maybeAddStateMarkers(state) {
             if (!state) return;
+
             const now = NOW();
 
             if (state.stallLevel > 0 && now - this._lastStallMarker > 2000) {
@@ -2838,6 +3872,28 @@
             }
         }
 
+        _updateFab(state) {
+            if (!this._fab) return;
+
+            let st = 'idle';
+
+            if (!state || !state.videos) {
+                st = 'idle';
+            } else if (state.seeking) {
+                st = 'seek';
+            } else if (state.sessionState === SessionState.RECOVERING || state.sessionState === SessionState.FAILED) {
+                st = 'recovering';
+            } else if (state.sessionState === SessionState.DEGRADED || (state.buffer || 0) < 2) {
+                st = 'degraded';
+            } else if (state.statusKey === 'pause' || state.statusKey === 'stop' || state.sessionState === SessionState.USER_PAUSED) {
+                st = 'paused';
+            } else if (state.statusKey === 'play' || state.sessionState === SessionState.ACTIVE) {
+                st = 'active';
+            }
+
+            this._fab.dataset.state = st;
+        }
+
         update(state) {
             if (!state) return;
 
@@ -2853,6 +3909,7 @@
 
             set('va-status', s.status || '检测中');
             set('va-type', s.playerLabel || s.playerType || '-');
+            set('va-session-state', s.sessionState || '-');
             set('va-buf-time', (s.buffer || 0).toFixed(1) + 's');
             set('va-rec', s.recoveries || 0);
             set('va-count', s.videos || 0);
@@ -2873,16 +3930,19 @@
 
             const q = s.quality || {};
             let qText = '-';
+
             if (q.level >= 0 && q.total > 0) {
                 qText = (q.level + 1) + '/' + q.total + (q.height ? ' ' + q.height + 'p' : '');
             } else if (q.height > 0) {
                 qText = q.height + 'p';
             }
+
             set('va-quality', qText);
 
             const canQ = s.canChangeQuality === true;
             const upBtn = this._panel.querySelector('#va-up');
             const downBtn = this._panel.querySelector('#va-down');
+
             if (upBtn) upBtn.disabled = !canQ;
             if (downBtn) downBtn.disabled = !canQ;
 
@@ -2892,19 +3952,30 @@
             const dot = this._panel.querySelector('#va-dot');
             if (dot) {
                 let cls = 'dot';
+
                 if (s.seeking) cls += ' seek';
                 else if (s.statusKey === 'play') cls += ' live';
                 else if (s.statusKey === 'pause') cls += ' pause';
                 else if (s.statusKey === 'stop') cls += ' stop';
+
                 dot.className = cls;
             }
 
             const stallEl = this._panel.querySelector('#va-stall');
             if (stallEl) {
-                if (s.stallLevel >= 3) stallEl.innerHTML = '<span class="stall-badge s3">重载中</span>';
-                else if (s.stallLevel === 2) stallEl.innerHTML = '<span class="stall-badge s2">恢复中</span>';
-                else if (s.stallLevel === 1) stallEl.innerHTML = '<span class="stall-badge s1">轻推</span>';
-                else stallEl.innerHTML = '';
+                if (s.stallLevel >= 3) {
+                    stallEl.textContent = '重载中';
+                    stallEl.className = 'stall-badge s3';
+                } else if (s.stallLevel === 2) {
+                    stallEl.textContent = '恢复中';
+                    stallEl.className = 'stall-badge s2';
+                } else if (s.stallLevel === 1) {
+                    stallEl.textContent = '轻推';
+                    stallEl.className = 'stall-badge s1';
+                } else {
+                    stallEl.textContent = '';
+                    stallEl.className = '';
+                }
             }
 
             const now = NOW();
@@ -2919,15 +3990,14 @@
        启动
     ═══════════════════════════════════════════════════════════ */
 
-    // 尽早安装钩子，保证 document-start 阶段开始嗅探
     HookManager.installAll(PW, DOC);
+    Detector.start();
+    Scheduler.start();
 
     let ui = null;
     if (IS_TOP) {
         ui = new UIManager(Bus);
     }
-
-    Detector.start();
 
     if (IS_TOP) {
         try {
@@ -2951,6 +4021,5 @@
         });
     } catch (e) { }
 
-    Logger.info('Boot', '微内核视频加速引擎已启动', { version: VERSION, top: IS_TOP });
-
+    Logger.info('Boot', 'v19 视频加速引擎已启动', { version: VERSION, top: IS_TOP });
 })();
