@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.1.1
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -1029,20 +1029,20 @@
     // 门面模式：RuleStore 和 ConfigStore 委托到 storage 实例
     // node/jest 下 storage 为 null，跳过门面装配（产物仍可 require 做 UI 契约测试）
     if (storage) {
-    ['getDomainBlocks', 'addRule', 'removeRule', 'toggleDisabled', 'getData',
-        'getIframeBlocks', 'addIframeRule', 'removeIframeRule', 'toggleIframeRuleDisabled',
-        'exportAll', 'importAll', 'invalidateDataCache', 'getDomainSet',
-        'getStatic', 'getDynamic', 'getRegex', 'getAttribute', 'getStructural',
-        'getComplex', 'getPathPattern', 'domain'
-    ].forEach(m => {
-        if (typeof storage[m] === 'function') RuleStore[m] = (...args) => storage[m](...args);
-        else RuleStore[m] = storage[m];
-    });
-    ['getConfig', 'setConfig', 'getIframeConfig', 'markAsFlashing', 'resetFlash', 'flashList'
-    ].forEach(m => {
-        if (typeof storage[m] === 'function') ConfigStore[m] = (...args) => storage[m](...args);
-        else ConfigStore[m] = storage[m];
-    });
+        ['getDomainBlocks', 'addRule', 'removeRule', 'toggleDisabled', 'getData',
+            'getIframeBlocks', 'addIframeRule', 'removeIframeRule', 'toggleIframeRuleDisabled',
+            'exportAll', 'importAll', 'invalidateDataCache', 'getDomainSet',
+            'getStatic', 'getDynamic', 'getRegex', 'getAttribute', 'getStructural',
+            'getComplex', 'getPathPattern', 'domain'
+        ].forEach(m => {
+            if (typeof storage[m] === 'function') RuleStore[m] = (...args) => storage[m](...args);
+            else RuleStore[m] = storage[m];
+        });
+        ['getConfig', 'setConfig', 'getIframeConfig', 'markAsFlashing', 'resetFlash', 'flashList'
+        ].forEach(m => {
+            if (typeof storage[m] === 'function') ConfigStore[m] = (...args) => storage[m](...args);
+            else ConfigStore[m] = storage[m];
+        });
     }
 
     /**
@@ -9871,64 +9871,64 @@
     // Effectively with Legacy Code》§3 接缝；Fowler《重构》§12.2 提取可测函数）
     if (typeof document !== 'undefined' && typeof window !== 'undefined' && typeof window.HTMLElement !== 'undefined') {
 
-    // 网络层拦截须最先执行：在页面任何 fetch/XHR/script 加载前完成 hook，确保广告请求被源头丢弃
-    NetworkInterceptor.init();
-    // 跳转拦截（window.open/location/form）：补充 NetworkInterceptor 未覆盖的导航型广告
-    try {
-        const _blockedDomains = storage.getDomainBlocks().map(r => r.domain);
-        OverlayAdScanner.enableNavigationInterceptor(_blockedDomains);
-    } catch (e) { Log.warn(e.message || e); }
-    // Shadow DOM 穿透须在页面脚本调用 attachShadow 前完成代理
-    BlockEngine.hookAttachShadow();
-    BlockEngine.fastInject();
-    BlockEngine.startObserver();
+        // 网络层拦截须最先执行：在页面任何 fetch/XHR/script 加载前完成 hook，确保广告请求被源头丢弃
+        NetworkInterceptor.init();
+        // 跳转拦截（window.open/location/form）：补充 NetworkInterceptor 未覆盖的导航型广告
+        try {
+            const _blockedDomains = storage.getDomainBlocks().map(r => r.domain);
+            OverlayAdScanner.enableNavigationInterceptor(_blockedDomains);
+        } catch (e) { Log.warn(e.message || e); }
+        // Shadow DOM 穿透须在页面脚本调用 attachShadow 前完成代理
+        BlockEngine.hookAttachShadow();
+        BlockEngine.fastInject();
+        BlockEngine.startObserver();
 
-    // ─── iframe 防线初始化（§9 启动流程） ───
-    // 帧发现引擎：最先启动，监听 iframe 创建/插入
-    FrameDetector.init();
-    // 帧间通信与消息监控：所有帧（顶层 + 子帧）均需初始化
-    FrameMessenger.init();
-    MessageGuard.init();
-    // iframe 检测与分类：订阅 FrameDetector 事件
-    IframeGuard.init();
+        // ─── iframe 防线初始化（§9 启动流程） ───
+        // 帧发现引擎：最先启动，监听 iframe 创建/插入
+        FrameDetector.init();
+        // 帧间通信与消息监控：所有帧（顶层 + 子帧）均需初始化
+        FrameMessenger.init();
+        MessageGuard.init();
+        // iframe 检测与分类：订阅 FrameDetector 事件
+        IframeGuard.init();
 
-    // 子帧自治上报（§6.1 策略A）：子帧向父帧 postMessage 上报自身分类结果
-    // 顶层窗口无需上报；延迟到 DOMContentLoaded 后计算评分（确保正文已渲染）
-    if (window.self !== window.top) {
-        const _reportSelf = () => {
-            try {
-                // BUG-FIX: 子帧用 computeSelfAdScore 自评估（非 computeAdScore(null,...) 恒 0）
-                const cScore = ContentClassifier.computeContentScore(document, null);
-                const aScore = ContentClassifier.computeSelfAdScore(cScore.score);
-                let verdict = 'unknown';
-                if (cScore.score > 60) verdict = 'content';
-                else if (aScore.score > 70 && cScore.score < 20) verdict = 'ad';
-                FrameMessenger.sendReport({
-                    contentScore: cScore.score,
-                    adScore: aScore.score,
-                    hasContent: cScore.score > 60,
-                    verdict,
-                    url: window.location.href
-                });
-            } catch (e) { Log.warn(e.message || e); }
-        };
-        if (document.readyState === 'complete' || document.readyState === 'interactive') {
-            setTimeout(_reportSelf, TIMING.REPORT_DELAY_MS);
-        } else {
-            document.addEventListener('DOMContentLoaded', () => setTimeout(_reportSelf, TIMING.REPORT_DELAY_MS));
-        }
-    }
-
-    if (window.self === window.top) {
-        let uiInstance = null;
-        function getUI() {
-            if (!uiInstance) uiInstance = new UIManager();
-            return uiInstance;
+        // 子帧自治上报（§6.1 策略A）：子帧向父帧 postMessage 上报自身分类结果
+        // 顶层窗口无需上报；延迟到 DOMContentLoaded 后计算评分（确保正文已渲染）
+        if (window.self !== window.top) {
+            const _reportSelf = () => {
+                try {
+                    // BUG-FIX: 子帧用 computeSelfAdScore 自评估（非 computeAdScore(null,...) 恒 0）
+                    const cScore = ContentClassifier.computeContentScore(document, null);
+                    const aScore = ContentClassifier.computeSelfAdScore(cScore.score);
+                    let verdict = 'unknown';
+                    if (cScore.score > 60) verdict = 'content';
+                    else if (aScore.score > 70 && cScore.score < 20) verdict = 'ad';
+                    FrameMessenger.sendReport({
+                        contentScore: cScore.score,
+                        adScore: aScore.score,
+                        hasContent: cScore.score > 60,
+                        verdict,
+                        url: window.location.href
+                    });
+                } catch (e) { Log.warn(e.message || e); }
+            };
+            if (document.readyState === 'complete' || document.readyState === 'interactive') {
+                setTimeout(_reportSelf, TIMING.REPORT_DELAY_MS);
+            } else {
+                document.addEventListener('DOMContentLoaded', () => setTimeout(_reportSelf, TIMING.REPORT_DELAY_MS));
+            }
         }
 
-        // GM 菜单注册：复用 _buildMenu 纯函数，消除 9 处重复模板
-        _buildMenu(GM_registerMenuCommand, getUI);
-    }
+        if (window.self === window.top) {
+            let uiInstance = null;
+            function getUI() {
+                if (!uiInstance) uiInstance = new UIManager();
+                return uiInstance;
+            }
+
+            // GM 菜单注册：复用 _buildMenu 纯函数，消除 9 处重复模板
+            _buildMenu(GM_registerMenuCommand, getUI);
+        }
 
     } // end: 真实浏览器初始化守卫
 
