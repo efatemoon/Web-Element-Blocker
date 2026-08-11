@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '19.0.4';
+    const VERSION = '3.0.2';
     const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
     let IS_TOP = true;
