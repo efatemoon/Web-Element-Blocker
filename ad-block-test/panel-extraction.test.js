@@ -62,3 +62,30 @@ describe('Phase B Panel Extraction (god-module slice)', () => {
         });
     });
 });
+
+/**
+ * Phase C/D 隐藏缺陷回归守卫（v8.5 修复）
+ * 守卫不变量：抽取/端口化过程引入或遗留的运行时缺陷不得回潮。
+ */
+describe('Hidden-defect regression guards (v8.5)', () => {
+    it('IframePanel.renderScanList binds the list click listener ONLY ONCE (guards listener leak)', () => {
+        // 回归：renderScanList 每次重渲染都对复用节点 list 重新 addEventListener，
+        // 会导致监听器指数级累积、面板卡死。修复后必须用 guard 仅绑定一次。
+        expect(content).toContain('if (!list._scanClickBound)');
+        expect(content).toContain('list._scanClickBound = true');
+    });
+
+    it('OverlayScanEngine.scan honors root scope (no silent full-document scan)', () => {
+        // 回归：scan(root, options) 契约——调用方传入的 root 子树作用域必须被尊重，
+        // 旧实现忽略 root 始终扫描顶层 document，是潜性的契约破裂。
+        expect(content).toMatch(/function scan\(root, options\) \{/);
+        expect(content).toContain('const scope = (root && typeof root.querySelectorAll ===');
+        expect(content).toContain('scope.querySelectorAll(QUICK_SEL)');
+    });
+
+    it('no dead _navBlocked accumulator (unbounded memory leak removed)', () => {
+        // 回归：_navBlocked 累加器从不被读取/清空，长会话无限增长。仅允许出现在解释性注释中。
+        const codeRefs = lines.filter(l => /_navBlocked/.test(l) && !/^\s*\/\//.test(l));
+        expect(codeRefs.length).toBe(0);
+    });
+});

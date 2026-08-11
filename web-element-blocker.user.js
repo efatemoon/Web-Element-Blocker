@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.1.0
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -3806,7 +3806,7 @@
 
     // OverlayDetector：统一覆盖层检测引擎
     // 职责：不可见覆盖层扫描 + 肤色检测 + 追踪像素检测
-    // 合并自：OverlayAdScanner + BlockEngine.scanInvisibleOverlays
+    // 合并自：OverlayScanEngine + BlockEngine.scanInvisibleOverlays
     // 依赖：ElementHider, UIManager, BlockEngine (域名匹配)
     // ═══════════════════════════════════════════════════════════
     const OverlayDetector = {
@@ -3819,24 +3819,24 @@
             return BlockEngine.scanInvisibleOverlaysAsync(options);
         },
 
-        // 委托到 OverlayAdScanner（后续逐步迁移实现）
+        // 委托到 OverlayScanEngine（后续逐步迁移实现）
         scan(root, options) {
-            return OverlayAdScanner.scan(root, options);
+            return OverlayScanEngine.scan(root, options);
         },
 
         deepScan() {
-            return OverlayAdScanner.deepScan();
+            return OverlayScanEngine.deepScan();
         }
     };
 
     /**
      * ═══════════════════════════════════════════════════════════════
-     *  算法二：OverlayAdScanner — 不可见/覆盖层广告专攻
+     *  算法二：OverlayScanEngine — 不可见/覆盖层广告专攻
      *
      *  专攻目标：不可见元素 · 覆盖层 · 博彩/色情图片 · 点击跳转拦截
      * ═══════════════════════════════════════════════════════════════
      */
-    const OverlayAdScanner = (() => {
+    const OverlayScanEngine = (() => {
 
         const VICE_CONTAINER_RE = /(^|[\s_-])(ad|ads|advert|banner|sponsor|promo|overlay|popup|popunder|float|sticky|interstitial|modal|mask|cover|layer|tracking|pixel|casino|bet|porn|xxx|adult|sex|live|cam|dating|hot|splash|takeover|skyscraper|leaderboard|notification|push)([\s_-]|$)/i;
         const VICE_IMG_RE = /(^|[\s_-])(hot|live|sexy|nude|girl|casino|slot|bet|bonus|jackpot|winner|free|click|download|register|promo|banner|ad|popup)([\s_-]|$)/i;
@@ -3852,14 +3852,17 @@
             'a[href*="goto"]', 'a[href*="click"]', 'a[href*="jump"]'
         ].join(',');
 
-        function scan() {
+        function scan(root, options) {
             const t0 = performance.now();
             const results = [];
             const seen = new Set();
+            // 尊重调用方传入的 root：按子树作用域扫描，而非始终扫描顶层 document。
+            // root 未传时退化为 document（行为不变）。
+            const scope = (root && typeof root.querySelectorAll === 'function') ? root : document;
 
             // 阶段1：快速选择器扫描
             try {
-                const candidates = document.querySelectorAll(QUICK_SEL);
+                const candidates = scope.querySelectorAll(QUICK_SEL);
                 for (const el of candidates) {
                     if (seen.has(el)) continue;
                     // 统一保护判定：脚本自身 UI 宿主（含 Shadow DOM 内部节点）跳过
@@ -3872,7 +3875,7 @@
 
             // 阶段2：定位元素扫描（覆盖层核心）
             try {
-                const positioned = document.querySelectorAll('div,section,aside,article');
+                const positioned = scope.querySelectorAll('div,section,aside,article');
                 for (const el of positioned) {
                     if (seen.has(el)) continue;
                     if (ProtectedCheck.isProtected(el)) continue;
@@ -3887,7 +3890,7 @@
 
             // 阶段3：可点击图片专项（博彩/色情核心）
             try {
-                const clickableImgs = document.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
+                const clickableImgs = scope.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
                 for (const img of clickableImgs) {
                     if (seen.has(img)) continue;
                     if (ProtectedCheck.isProtected(img)) continue;
@@ -3900,7 +3903,7 @@
             // 阶段4：内联事件广告（移动端最常见的劫持手法）
             // 扫描所有 [onclick]、[ontouchstart]、[onmousedown] 的元素
             try {
-                const inlineEventAds = document.querySelectorAll('[onclick], [ontouchstart], [onmousedown], [data-href], [data-url], [data-link]');
+                const inlineEventAds = scope.querySelectorAll('[onclick], [ontouchstart], [onmousedown], [data-href], [data-url], [data-link]');
                 for (const el of inlineEventAds) {
                     if (seen.has(el)) continue;
                     if (ProtectedCheck.isProtected(el)) continue;
@@ -4199,12 +4202,13 @@
         }
 
         // ─── 跳转拦截（博彩/色情核心防线，补充 NetworkInterceptor 未覆盖的导航型拦截）───
-        let _navBlocked = [];
         let _navInterceptorActive = false;
 
         function enableNavigationInterceptor(blockedDomains) {
             if (_navInterceptorActive) return;
             _navInterceptorActive = true;
+            // 注意：_navBlocked 累加器曾用于记录被拦截导航，但全文件无任何读取/清空逻辑，
+            // 长会话下无限增长（内存泄漏），且数据从未被消费，已于 v8.5 移除。拦截副作用（Log.warn + 阻止跳转）不受影响。
             // BUG-A2 修复：blockedDomains 是启动期快照，用户后续新封杀的域名不会进入闭包。
             // 改为实时读取 BlockEngine.getDomainSet()——该集合由 invalidateCache() 在
             // addRule/removeRule/saveData 时自动失效重建，确保新封域名即时生效。
@@ -4227,7 +4231,6 @@
             window.open = function (url) {
                 const args = Array.prototype.slice.call(arguments);
                 if (_checkNav(url)) {
-                    _navBlocked.push({ type: 'window.open', url: url, time: Date.now() });
                     Log.warn('拦截 window.open:', url);
                     return null;
                 }
@@ -4245,8 +4248,7 @@
                     if (href && _checkNav(href)) {
                         e.preventDefault();
                         e.stopPropagation();
-                        _navBlocked.push({ type: 'link.click', url: href, time: Date.now() });
-                        Log.warn('[OverlayAdScanner] 拦截链接:', href);
+                        Log.warn('[OverlayScanEngine] 拦截链接:', href);
                         const container = link.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || link;
                         // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
                         if (!ProtectedCheck.isProtected(container)) container.remove();
@@ -4267,7 +4269,6 @@
                                     e.preventDefault();
                                     e.stopPropagation();
                                     e.stopImmediatePropagation && e.stopImmediatePropagation();
-                                    _navBlocked.push({ type: 'onclick', url: url[1], time: Date.now() });
                                     Log.warn('拦截onclick跳转:', url[1]);
                                     const container = target.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || target;
                                     // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
@@ -4287,7 +4288,6 @@
                     Object.defineProperty(Location.prototype, 'href', {
                         set(val) {
                             if (_checkNav(val)) {
-                                _navBlocked.push({ type: 'location.href', url: val, time: Date.now() });
                                 Log.warn('拦截location:', val);
                                 return;
                             }
@@ -4305,7 +4305,6 @@
                 if (action && _checkNav(action)) {
                     e.preventDefault();
                     e.stopPropagation();
-                    _navBlocked.push({ type: 'form.submit', url: action, time: Date.now() });
                 }
             }, true);
         }
@@ -4664,11 +4663,11 @@
     // （《整洁架构》Ch.5 DIP；《PoEAA》Repository 单一写入方）
     // ═══════════════════════════════════════════════════════════════
 
-    // OverlayService：覆盖层扫描用例编排端口。消除 UIManager→OverlayAdScanner 跨层直调（R3-1 违规①）
+    // OverlayService：覆盖层扫描用例编排端口。消除 UIManager→OverlayScanEngine 跨层直调（R3-1 违规①）
     const OverlayService = {
         scan(root, options) { return OverlayDetector.scan(root, options); },
         deepScan(options) { return OverlayDetector.deepScan(options); },
-        enableNavigationInterceptor(domains) { return OverlayAdScanner.enableNavigationInterceptor(domains); },
+        enableNavigationInterceptor(domains) { return OverlayScanEngine.enableNavigationInterceptor(domains); },
         scanInvisibleOverlays(options) { return BlockEngine.scanInvisibleOverlays(options); }
     };
 
@@ -5662,24 +5661,29 @@
 
                 list.innerHTML = rows.join('');
 
-                // 行 click = 切换勾选（H8），仅按钮触发动作
-                list.addEventListener('click', (e) => {
-                    const row = e.target.closest('.gd-domain-row');
-                    if (!row) return;
-                    // 忽略 checkbox 自身和按钮
-                    if (e.target.classList.contains('iframe-row-cb') || e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
-                    const idx = row.dataset.idx;
-                    const elIdx = row.dataset.elIdx;
-                    if (idx !== undefined) {
-                        if (_selectedSet.has(Number(idx))) _selectedSet.delete(Number(idx));
-                        else _selectedSet.add(Number(idx));
-                    } else if (elIdx !== undefined) {
-                        const key = '_e_' + Number(elIdx);
-                        if (_selectedSet.has(key)) _selectedSet.delete(key);
-                        else _selectedSet.add(key);
-                    }
-                    renderScanList();
-                });
+                // 行 click = 切换勾选（H8），仅按钮触发动作。
+                // 仅绑定一次：list.innerHTML 只替换子节点，绑定在 list 上的监听器不会随重渲染移除，
+                // 每次 renderScanList 都 addEventListener 会导致监听器指数级累积（面板卡死）。
+                if (!list._scanClickBound) {
+                    list.addEventListener('click', (e) => {
+                        const row = e.target.closest('.gd-domain-row');
+                        if (!row) return;
+                        // 忽略 checkbox 自身和按钮
+                        if (e.target.classList.contains('iframe-row-cb') || e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
+                        const idx = row.dataset.idx;
+                        const elIdx = row.dataset.elIdx;
+                        if (idx !== undefined) {
+                            if (_selectedSet.has(Number(idx))) _selectedSet.delete(Number(idx));
+                            else _selectedSet.add(Number(idx));
+                        } else if (elIdx !== undefined) {
+                            const key = '_e_' + Number(elIdx);
+                            if (_selectedSet.has(key)) _selectedSet.delete(key);
+                            else _selectedSet.add(key);
+                        }
+                        renderScanList();
+                    });
+                    list._scanClickBound = true;
+                }
 
                 // 绑定帧级 block/protect 按钮
                 list.querySelectorAll('[data-action="block"]').forEach(btn => {
@@ -6500,8 +6504,8 @@
             const panel = document.createElement('div');
             panel.className = 'panel';
 
-            // 双引擎采集：BlockEngine.scanInvisibleOverlays（透明跳转覆盖层）+ OverlayAdScanner（不可见/覆盖层/博彩色情图片/追踪像素）
-            // 合并策略：按元素引用合并，BlockEngine 提供触发URL/跨域/尺寸，OverlayAdScanner 提供嫌疑分/分类/特征/原因
+            // 双引擎采集：BlockEngine.scanInvisibleOverlays（透明跳转覆盖层）+ OverlayScanEngine（不可见/覆盖层/博彩色情图片/追踪像素）
+            // 合并策略：按元素引用合并，BlockEngine 提供触发URL/跨域/尺寸，OverlayScanEngine 提供嫌疑分/分类/特征/原因
             // 过滤策略：已封杀域名 / 已被脚本隐藏 / 已匹配现有规则的元素不再重复展示
             const collectAll = async (opts = {}) => {
                 const deep = !!opts.deep;
@@ -6514,7 +6518,7 @@
                     //              deep=false 调用 scan（快速基线），两者维度/耗时显著区分
                     oasResult = deep ? OverlayService.deepScan({ deep: true }) : OverlayService.scan();
                 } catch (e) { Log.warn(e.message || e); }
-                // 以元素引用为 key 建立 OverlayAdScanner 特征索引
+                // 以元素引用为 key 建立 OverlayScanEngine 特征索引
                 const oasMap = new Map();
                 for (const r of (oasResult.results || [])) {
                     if (r.el) oasMap.set(r.el, r);
@@ -6771,7 +6775,7 @@
                     render();
                 }
                 try {
-                    // collectAll 内部按 deep 调用 OverlayAdScanner.deepScan/scan，此处不再冗余预调用(BUG-M6)
+                    // collectAll 内部按 deep 调用 OverlayScanEngine.deepScan/scan，此处不再冗余预调用(BUG-M6)
                     const collected = await collectAll({ deep });
                     records = collected.records;
                     oasElapsed = collected.oasElapsed;
@@ -9262,8 +9266,8 @@ class UIManager {
                 } catch (e) { Log.warn(e.message || e); }
 
                 // 3. H3+H4 修复：overlay 结果直接 _buildRecord 透传 suspicion（不二次过滤）
-                // 删除 OverlayAdScanner.deepScan 整段（H3 性能灾难：顶层文档+每帧重复跑 Canvas 肤色采样）
-                // 帧内高阶特征由 BlockEngine.scanInvisibleOverlays 统一覆盖
+                // deepScan 仍保留（见 OverlayScanEngine.deepScan）：其高阶特征（肤色/伪元素/混淆URL）
+                // 仅在 opts.deep 时启用，且肤色采样限定于可点击图片，避免全站 Canvas 开销（H3 性能约束）
                 try {
                     const cw = iframe.contentWindow;
                     if (cw) {
@@ -9356,7 +9360,7 @@ class UIManager {
             };
         },
 
-        // 从 OverlayAdScanner result 构建 record
+        // 从 OverlayScanEngine result 构建 record
         _buildRecord(oasEl, doc, iframe, frameHost, chain, depth, oas) {
             const rect = oasEl.getBoundingClientRect ? oasEl.getBoundingClientRect() : { width: 0, height: 0 };
             const suspicion = oas.suspicion || 0;

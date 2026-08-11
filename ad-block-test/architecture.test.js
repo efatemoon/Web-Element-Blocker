@@ -19,7 +19,7 @@ describe('Architecture Dependencies', () => {
         it('should not have UI module references in engine layer', () => {
             // Check that engine modules don't reference UIManager directly
             const engineModules = [
-                'DomScanner', 'OverlayDetector', 'OverlayAdScanner',
+                'DomScanner', 'OverlayDetector', 'OverlayScanEngine',
                 'BlockEngine', 'NetworkEngine', 'RegexEngine'
             ];
 

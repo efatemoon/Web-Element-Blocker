@@ -13,7 +13,7 @@
 const { OverlayService, StorageService } = require('../web-element-blocker.user.js');
 
 describe('服务层端口（DIP 接缝）', () => {
-    test('OverlayService 暴露 4 个覆盖层用例端口方法（消除 UIManager→OverlayAdScanner 跨层直调）', () => {
+    test('OverlayService 暴露 4 个覆盖层用例端口方法（消除 UIManager→OverlayScanEngine 跨层直调）', () => {
         ['scan', 'deepScan', 'enableNavigationInterceptor', 'scanInvisibleOverlays'].forEach(m => {
             expect(typeof OverlayService[m]).toBe('function');
         });
