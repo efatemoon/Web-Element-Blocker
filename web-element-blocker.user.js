@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
+// @version      2.0.1
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -1214,7 +1214,8 @@
 
             // 自身 UI 保护：所有选择器追加 :not() 排除 #pro-blocker-ui-host 及其子元素，
             // 确保任何用户规则都不会隐藏脚本自身的面板宿主（否则所有面板都会消失）
-            const SELF_PROTECT = ':not(#pro-blocker-ui-host):not(#pro-blocker-ui-host *)';
+            // 跨脚本保护：同时排除 #va-ui-host（视频加速脚本 UI），防止广告拦截误伤视频控制 FAB
+            const SELF_PROTECT = ':not(#pro-blocker-ui-host):not(#pro-blocker-ui-host *):not(#va-ui-host):not(#va-ui-host *)';
             const protectedSelectors = selectors.map(s => {
                 // 复合选择器（含逗号）拆分后逐个保护再合并
                 return s.split(',').map(part => part.trim() + SELF_PROTECT).join(', ');
@@ -1338,15 +1339,23 @@
     // ═══════════════════════════════════════════════════════════
     // ProtectedCheck：元素保护判定（从 UIManager.isProtectedElement 提取）
     // 职责：判定元素是否属于脚本 UI 宿主或其子节点，防止误拦截
+    // 跨脚本保护：同时识别 video-accelerator 的 va-ui-host，避免误拦截
     // ═══════════════════════════════════════════════════════════
     const ProtectedCheck = {
         isProtected(el) {
             if (!el) return true;
+            // 广告拦截器自身 UI
             if (el.id === 'pro-blocker-ui-host') return true;
             if (el.closest && el.closest('#pro-blocker-ui-host')) return true;
             let root;
             try { root = el.getRootNode && el.getRootNode(); } catch (e) { root = null; }
             if (root && root.host && root.host.id === 'pro-blocker-ui-host') return true;
+            // 视频加速脚本 UI（跨脚本保护）
+            if (el.id === 'va-ui-host') return true;
+            if (el.closest && el.closest('#va-ui-host')) return true;
+            if (root && root.host && root.host.id === 'va-ui-host') return true;
+            // 视频加速 FAB 按钮（z-index: 2147483646 会被误判为广告覆盖层）
+            if (el.classList && el.classList.contains('fab')) return true;
             return false;
         }
     };
