@@ -3148,6 +3148,10 @@
 
             this.root = this.host.attachShadow({ mode: 'closed' });
 
+            // 跨脚本保护：监听广告拦截器 UI 的 DOM 节点（pro-blocker-ui-host）
+            // 防止广告拦截器将视频加速 UI 误判为广告覆盖层
+            this._observeAdBlockerUI();
+
             const style = DOC.createElement('style');
             style.textContent = `
                 :host{
