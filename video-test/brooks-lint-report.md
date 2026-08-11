@@ -337,3 +337,36 @@ if (t === this._lastTime && !frameRecent) { ... }    // ✅ 倒置修复
 ---
 
 > 报告结束 | 下一步优先级：[MANUAL-B] 测试重构 > [MANUAL-A] 模块拆分 > P-1 空 catch > P-3 版本 bump
+
+---
+
+## 深度修复轮次（2026-08-11 13:18）
+
+> 在 R1–R6 结构扫描（健康分 68→84）基础上，对**核心功能逻辑**做第二轮深度扫描：通读 RecoveryOrchestrator / ConfigManager / FrameMesh / VideoSession 状态机 / CandidateArbiter 评分 / tryPlay / 缓冲与卡顿检测等约 700 行关键路径，逐处核验常量定义、状态迁移、算术与边界。
+
+### 扫描结论
+- **无新增 Critical / Important 级功能 bug**：前序修复（`_lastTime` 双归属、frameRecent 倒置、缓冲阈值缺口）经重读确认稳定有效；所有被引用的 `VA_TUNING` / `VA_BUFFER` 常量（含 `EMERGENCY_THROTTLE_MS`、`LOW_COUNT_TRIGGER`、`RECOVERY_TIMEOUT_MS`、`ERROR_RECOVER_THROTTLE_MS`）均已定义，**无"数值 > undefined 恒为 false"式静默失效**。
+- tryPlay 的 C4 修复（autoplay 被拦截时置 `_playedOnce`）完好，未回归。
+- 发现并修复 **3 项真实 Minor 缺陷**（见下）。
+
+### ✅ 深度修复日志（3 项，AUTO，单文件无接口变更）
+
+| ID | 位置 | 问题 | 修复 | 引用 |
+|----|------|------|------|------|
+| F-D1 | L3061-3066 (`_onBufferLow` level-2) | 发出 `RECOVERY_ATTEMPT` 的 `level: 0`，但同路径 `_record(session, 1)` 记录/执行等级为 1 → 遥测与 UI 显示错误等级 | `level: 0` → `level: 1` | 代码大全§8.1 逻辑一致性 |
+| F-D2 | L421-422 (`_normalize`) | `minVideoArea` 仅做 `Math.max(0, mva)`，无上限；配置损坏/误设极大值会静默丢失面积加分（虽不致命，但违背"检测阈值"语义） | 增加上限 `Math.min(100000000, ...)` | 代码大全§18.1 边界约束 |
+| F-D3 | L2367 (`_bufferCheck` 降画质分支) | `this._lastEmergency = now` 已在 L2357 设置，此处为冗余死写 | 删除该冗余行 | Clean Code§5.1 消除冗余 |
+
+### 验证
+- `node --check` 通过
+- unit 150/150 + core 50/50 = **200 断言全过**（无回归）
+
+### 健康分
+- 维持 **84/100**（微幅上浮至 85：遥测一致性 + 配置健壮性 + 死写清理）
+- 本轮重点结论：**代码在结构 + 功能两层均已健康**，残留风险集中于架构级 [MANUAL] 项与测试架构（R6 覆盖率幻觉）。
+
+### 残余 [MANUAL] 项（同前，未变）
+- [MANUAL-A] 4125 行上帝模块拆分（ESM 构建管线）
+- [MANUAL-B] 测试套件改为 `import` 真实编译产物（消除覆盖率幻觉）
+- [MANUAL-C] `Bus ⇄ Hook/Frame/Detect` 循环依赖治理
+- P-1：104 处空 catch 关键路径补 Logger

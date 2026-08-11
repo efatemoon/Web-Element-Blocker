@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      19.0.3
+// @version      19.0.4
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '19.0.3';
+    const VERSION = '19.0.4';
     const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
     let IS_TOP = true;
@@ -419,7 +419,7 @@
             c.recoveryBudget = clamp(parseInt(c.recoveryBudget, 10) || 8, 1, 20);
 
             const mva = parseInt(c.minVideoArea, 10);
-            c.minVideoArea = isNaN(mva) ? 8000 : Math.max(0, mva);
+            c.minVideoArea = isNaN(mva) ? 8000 : Math.min(100000000, Math.max(0, mva));
 
             const levels = ['debug', 'info', 'warn', 'error'];
             if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
@@ -2364,7 +2364,6 @@
                         ConfigManager.get('qualityManage')
                     ) {
                         if (Adaptor.switchLevel(v, -1)) {
-                            this._lastEmergency = now;
                             Bus.emit('TOAST', { msg: '网络不佳，已降画质', kind: 'warn', remote: false });
                             Bus.emit('QUALITY_CHANGED', { sessionId: this.id, direction: 'down' });
                             Logger.warn('Session', '自动降低画质 #' + this.id);
@@ -3060,7 +3059,7 @@
 
                 this.bus.emit('RECOVERY_ATTEMPT', {
                     sessionId: session.id,
-                    level: 0,
+                    level: 1,
                     reason: 'buffer-low'
                 });
             }
