@@ -1,5 +1,6 @@
 # 忽略目录
 .tare/
+node_modules/
 
 # 忽略特定文件
 优化方案.md

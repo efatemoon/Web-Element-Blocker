@@ -1,8 +1,14 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.10.0
-// @description  集成原生CSS极速注入、Shadow DOM隔离、DOM结构拦截、广告域封杀、正则文本拦截、动态资源域实时拦截、路径模式拦截与规则导入导出。支持积木组合模式、元素层级缩放选择与全局域名黑名单，彻底解决广告刷新复活。双算法协同：全局域名深度检索（6通道12维评分）、不可见覆盖层专攻（博彩/色情图片检测）。v0.10.0：iframe 防线 v3.0 重构——15项Bug修复（冻结测量+单一数据源防振荡、帧内元素级深扫、拦截持久化、geometry小数支持、零输入白名单、stats事件驱动、指纹跨扫描保留、子帧2s去抖补报、PathInvertedIndex滑窗修复、Toast叠放修复）；新增IframeDeepScanner帧内深扫模块（domainSet+pathPattern+scanInvisibleOverlays全引擎入帧）；面板重做（元素级列表+🛡拦截/✅保护按钮+已拦截行锁定）；showManager帧内徽章+过滤联动+reapplyInFrames。
+// @version      0.12.0
+// @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
+//               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
+//               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
+//               IframeGuard（iframe 分类决策）、IframeDeepScanner（帧内深扫）、FrameMessenger（跨域通信）。
+//               iframe 防线 v3.0：正文保护铁律、冻结测量防振荡、帧内深扫、双路径决策（同域递归+跨域上报）。
+//               v0.12.0：FrameDetector 独立化——从 IframeGuard 提取帧发现逻辑，通过 EventBus 事件通信；
+//               启动顺序：FrameDetector → IframeGuard；模块依赖更清晰。
 // @author       EFate
 // @match        *://*/*
 // @grant        GM_registerMenuCommand
@@ -13,6 +19,58 @@
 // @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/web-element-blocker.user.js
 // @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/web-element-blocker.meta.js
 // ==/UserScript==
+
+/**
+ * 架构总览 v2.1
+ *
+ * 三层架构（低耦合）：
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  UI Layer（面板层）                                              │
+ * │  UIManager + EventBus                                          │
+ * │  依赖：所有 Engine 模块                                        │
+ * └─────────────────────────────────────────────────────────────────┘
+ *                              ↓ EventBus 事件驱动
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  Engine Layer（引擎层）                                          │
+ * │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
+ * │  │ NetworkEngine │  │  DOMScanner   │  │    CSSEngine         │ │
+ * │  │ (网络拦截)    │  │ (动态扫描)    │  │  (CSS 规则注入)      │ │
+ * │  └──────────────┘  └──────────────┘  └──────────────────────┘ │
+ * │                          ↓                                      │
+ * │  ┌──────────────┐  ┌──────────────────────────────────────┐   │
+ * │  │ FrameDetector │  │         IframeGuard                  │   │
+ * │  │ (帧发现)      │──│  ┌──────────┐ ┌──────────┐          │   │
+ * │  │ frame:new     │  │  │Classifier│ │DeepScan  │          │   │
+ * │  │ frame:same    │  │  │(分类器)   │ │(帧内深扫) │          │   │
+ * │  │ frame:diff    │  │  └──────────┘ └──────────┘          │   │
+ * │  └──────────────┘  │         FrameMessenger(跨域通信)     │   │
+ * │                    └──────────────────────────────────────┘   │
+ * └─────────────────────────────────────────────────────────────────┘
+ *                              ↓
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  Storage Layer（存储层）                                         │
+ * │  StorageManager（规则 CRUD + 持久化）                           │
+ * │  WhitelistStore（iframe 白名单）                               │
+ * │  依赖：GM_setValue / GM_getValue                               │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * 启动顺序：
+ *   NetworkInterceptor.init() → BlockEngine.hookAttachShadow() → BlockEngine.fastInject()
+ *   → BlockEngine.startObserver() → FrameDetector.init() → IframeGuard.init()
+ *
+ * 模块依赖关系：
+ *   FrameDetector ──(frame:new)──> IframeGuard
+ *   IframeGuard ──(iframe:blocked/protected)──> UIManager
+ *   ContentClassifier ──(classify)──> IframeGuard
+ *   FrameMessenger ──(postMessage)──> IframeGuard
+ *
+ * 核心设计原则：
+ * 1. 正文保护铁律：contentScore > 60 → 仅清理内部广告，绝不整体隐藏 iframe
+ * 2. 冻结测量防振荡：首次几何值缓存，避免 hidden→重测→分数变化→恢复的循环
+ * 3. 粘性判定：blocked/manual 状态跨扫描保留，除非白名单
+ * 4. 双路径决策：同域递归深扫 + 跨域 postMessage 上报
+ * 5. 用户规则优先：iframeBlock 规则 > 白名单 > 自动分类
+ */
 
 (function () {
     'use strict';
@@ -39,10 +97,93 @@
         return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     }
 
+    // ─── 日志工具：统一错误处理，避免空catch块掩盖错误 ───
+    const Log = {
+        _tag: '[Pro Blocker]',
+        _enabled: true,
+        info(...args) {
+            if (!this._enabled) return;
+            try { console.info(this._tag, ...args); } catch (e) { Log.warn(e.message || e); }
+        },
+        // 安全日志：失败时不抛出，仅记录警告
+        warn(...args) {
+            if (!this._enabled) return;
+            try { console.warn(this._tag, ...args); } catch (e) { Log.warn(e.message || e); }
+        },
+        error(...args) {
+            if (!this._enabled) return;
+            try { console.error(this._tag, ...args); } catch (e) { Log.warn(e.message || e); }
+        },
+        // 包装函数：自动捕获异常并记录
+        wrap(fn, name = 'anonymous') {
+            return function (...args) {
+                try {
+                    return fn.apply(this, args);
+                } catch (e) {
+                    Log.error(name + ' 执行失败:', e);
+                    return null;
+                }
+            };
+        },
+        // 空catch块替代：安全执行，失败时记录警告
+        safe(fn, name = 'operation') {
+            try {
+                return fn();
+            } catch (e) {
+                Log.warn(name + ' 异常:', e.message || e);
+                return undefined;
+            }
+        }
+    };
+
+    // safeExecute: 统一错误处理包装器，替代重复的 catch (e) { Log.warn(...) } 模式
+    function safeExecute(fn, name = 'operation') {
+        try {
+            return fn();
+        } catch (e) {
+            Log.warn(name + ' 异常:', e.message || e);
+        }
+    }
+
+
     // 安全获取计算样式：跨帧调用时若失败则返回 null
     function safeGetComputedStyle(el, view) {
         try { return view.getComputedStyle(el); } catch (e) { return null; }
     }
+
+    // 安全提取 URL hostname：失败返回空字符串
+    function safeURLHostname(url) {
+        try { return new URL(url).hostname; } catch (e) { return ''; }
+    }
+
+    // 分数钳制：确保值在 [min, max] 范围内
+    function clampScore(val, min, max) {
+        return Math.min(max, Math.max(min, val));
+    }
+
+    // ─── 配置常量：统一魔法数字，便于调整和维护 ───
+    const CONFIG = {
+        // 分数相关
+        MAX_SCORE: 255,
+        SCORE_BASE: 10,
+        SCORE_THRESHOLD_50: 50,
+        SCORE_THRESHOLD_100: 100,
+        // 置信度阈值
+        CONFIDENCE_HIGH: 0.7,
+        CONFIDENCE_LOW: 0.1,
+        CONFIDENCE_MEDIUM: 0.3,
+        // 时间相关
+        DEBOUNCE_MS: 300,
+        RELOAD_DELAY_MS: 1500,
+        OBSERVER_DEBOUNCE_MS: 2000,
+        // 尺寸相关
+        MIN_VISIBLE_RATIO: 0.25,
+        MAX_TEXT_LENGTH: 200,
+        // 深度限制
+        MAX_SCAN_DEPTH: 3,
+        MAX_NESTING_DEPTH: 10
+    };
+
 
     // 资源选择器构建器：统一域名/路径资源属性选择器构建，消除 8+ 处手动拼接(4.4 节)
     const ResourceSelectorBuilder = {
@@ -80,7 +221,7 @@
             domains.forEach(d => {
                 const sel = ResourceSelectorBuilder.buildDomainAttr(d);
                 document.querySelectorAll(sel).forEach(el => {
-                    if (UIManager.isProtectedElement(el)) return;
+                    if (ProtectedCheck.isProtected(el)) return;
                     if (hideMode === 'full') {
                         BlockEngine.hideElement(el);
                         if (el.parentElement) BlockEngine.hideElement(el.parentElement);
@@ -214,11 +355,12 @@
     // ═══════════════════════════════════════════════════════════
     const ConfigStore = {};
 
-    /**
-     * 核心数据与配置管理模块
-     * 规则分类（前7类按域名隔离，domainBlock全局生效）：
-     *   static / dynamic / regex / attribute / structural / complex / pathPattern / domainBlock
-     */
+    // ═══════════════════════════════════════════════════════════
+    // StorageManager：存储层核心模块
+    // 职责：规则 CRUD + 持久化（GM_setValue/GM_getValue）+ 防抖落盘
+    // 规则类型：static/dynamic/regex/attribute/structural/complex/pathPattern/domainBlock/iframeBlock
+    // 依赖：GM API、CSSInjector（规则变更时触发重建）
+    // ═══════════════════════════════════════════════════════════
     class StorageManager {
         constructor() {
             this.domain = window.location.hostname;
@@ -262,11 +404,11 @@
             const out = [];
             const seen = new Set();
             arr.forEach(item => {
-                const domain = (typeof item === 'string') ? item : (item && item.domain);
-                if (!domain || typeof domain !== 'string' || domain.length === 0 || domain.length >= 200 || seen.has(domain)) return;
+                const domain = typeof item === 'string' ? item : (item?.domain);
+                if (!domain || typeof domain !== 'string' || domain.length < 1 || domain.length > 200 || seen.has(domain)) return;
                 seen.add(domain);
-                const ts = (item && typeof item === 'object' && typeof item._ts === 'number') ? item._ts : 0;
-                const disabled = (item && typeof item === 'object' && item._disabled === true) ? true : false;
+                const ts = (item && typeof item._ts === 'number') ? item._ts : 0;
+                const disabled = item?._disabled === true;
                 out.push({ domain, _ts: ts, _disabled: disabled });
             });
             return out;
@@ -530,7 +672,7 @@
             Object.keys(this.constructor._KEY_TO_BUCKET).forEach(key => {
                 const dict = this._readKey(key, {});
                 Object.keys(dict).forEach(d => {
-                    if (Array.isArray(dict[d]) && dict[d].length > 0) allSiteDomains.add(d);
+                    if (Array.isArray(dict[d]) && dict[d].length) allSiteDomains.add(d);
                 });
             });
 
@@ -542,7 +684,7 @@
                 Object.keys(this.constructor._KEY_TO_BUCKET).forEach(key => {
                     const dict = this._readKey(key, {});
                     const rules = dict[domain];
-                    if (Array.isArray(rules) && rules.length > 0) {
+                    if (Array.isArray(rules) && rules.length) {
                         const bucket = this.constructor._KEY_TO_BUCKET[key];
                         site[bucket] = rules.map(r => {
                             // id 基于规则内容（排除 id 自身）计算，确保同一规则始终同 ID
@@ -769,7 +911,7 @@
             try {
                 IframeGuard._loadConfig();
                 IframeGuard.rescanAll();
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             return true;
         }
 
@@ -985,6 +1127,12 @@
     // 职责：Constructable Stylesheets 管理 + CSS 规则批量注入 + 指纹比对
     // 依赖：storage, ResourceSelectorBuilder, escapeCSSAttr
     // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // CSSInjector：CSSEngine（引擎层·CSS 规则注入模块）
+    // 职责：将规则编译为 CSS 选择器并注入页面样式表
+    // 优化：Constructable Stylesheets + 批量合并选择器（40条/批）+ 指纹缓存
+    // 依赖：StorageManager、ResourceSelectorBuilder
+    // ═══════════════════════════════════════════════════════════
     const CSSInjector = {
         styleElementId: 'pro-blocker-core-css',
         // CSSOM 增量注入指纹：记录上次注入的选择器集合，内容未变时跳过重建
@@ -1142,7 +1290,7 @@
             if (!sheet) return;
             // 快路径：Constructable Stylesheets 用 replaceSync('') 一次性清空，O(1) 调用
             if (this._useConstructable) {
-                try { sheet.replaceSync(''); return; } catch (e) { }
+                try { sheet.replaceSync(''); return; } catch (e) { Log.warn(e.message || e); }
             }
             // <style> 降级路径：直接清空 ownerNode.textContent（触发整表重建，O(1) 调用）
             // 替代原 deleteRule(0) 循环——每次删首条后剩余规则索引全重排，N 条规则 O(N²)
@@ -1188,9 +1336,31 @@
     };
 
     // ═══════════════════════════════════════════════════════════
+    // ProtectedCheck：元素保护判定（从 UIManager.isProtectedElement 提取）
+    // 职责：判定元素是否属于脚本 UI 宿主或其子节点，防止误拦截
+    // ═══════════════════════════════════════════════════════════
+    const ProtectedCheck = {
+        isProtected(el) {
+            if (!el) return true;
+            if (el.id === 'pro-blocker-ui-host') return true;
+            if (el.closest && el.closest('#pro-blocker-ui-host')) return true;
+            let root;
+            try { root = el.getRootNode && el.getRootNode(); } catch (e) { root = null; }
+            if (root && root.host && root.host.id === 'pro-blocker-ui-host') return true;
+            return false;
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
     // ElementHider：元素隐藏/还原引擎（从 BlockEngine 拆分）
     // 职责：统一的 display/opacity/visibility/pointer-events 四件套隐藏口径
     // 依赖：UIManager.isProtectedElement
+    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // ElementHider：隐藏执行器（统一四件套隐藏口径）
+    // 职责：hideElement/showElement 统一入口，确保 display/opacity/visibility/pointer-events 一致
+    // 保护：isProtectedElement 全局守卫，防止误伤脚本自身 UI
+    // 依赖：UIManager（isProtectedElement）
     // ═══════════════════════════════════════════════════════════
     const ElementHider = {
         // ─── 统一隐藏口径(BUG-M3 & 5.2 隐藏口径统一) ───
@@ -1199,7 +1369,7 @@
         // 保护脚本自身 UI 宿主：拦截入口统一豁免 #pro-blocker-ui-host，防止任何规则隐藏面板
         hideElement(el) {
             if (!el || el === document.body || el === document.documentElement) return;
-            if (UIManager.isProtectedElement(el)) return;
+            if (ProtectedCheck.isProtected(el)) return;
             el.style.setProperty('display', 'none', 'important');
             el.style.setProperty('opacity', '0', 'important');
             el.style.setProperty('visibility', 'hidden', 'important');
@@ -1302,7 +1472,7 @@
                     if (!p || !p.startsWith('/') || p.length <= 5) continue;
                     const segs = p.split('/').filter(Boolean);
                     if (segs.length >= 2) candidates.add('/' + segs.slice(0, 3).join('/'));
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             return candidates;
         },
@@ -1511,7 +1681,7 @@
                 };
                 requestIdleCallback(processChunk, { timeout: 1000 });
             } catch (e) {
-                console.error('[Pro Blocker] 正则遍历异常:', e);
+                Log.error('正则遍历异常:', e);
             }
         },
 
@@ -1563,12 +1733,12 @@
             let element = node.parentElement;
             if (!element) return;
             // 全局保护：避免正则规则隐藏到脚本自身 UI 宿主
-            if (UIManager.isProtectedElement(element)) return;
+            if (ProtectedCheck.isProtected(element)) return;
             for (let i = 0; i < level; i++) {
                 if (element.parentElement && element.parentElement !== document.body) {
                     element = element.parentElement;
                     // 上溯过程中再次校验，避免选中受保护祖先
-                    if (UIManager.isProtectedElement(element)) return;
+                    if (ProtectedCheck.isProtected(element)) return;
                 } else break;
             }
             if (element && element.style.display !== 'none') {
@@ -1595,7 +1765,7 @@
                     if (callback(node) === false) break;
                 }
             } catch (e) {
-                console.error('[Pro Blocker] 文本节点遍历异常:', e);
+                Log.error('文本节点遍历异常:', e);
             }
         },
 
@@ -1604,7 +1774,7 @@
             const results = conditions.map(c => {
                 let val = '';
                 if (c.type === 'text') val = el.textContent || '';
-                else if (c.type === 'class') val = typeof el.className === 'string' ? el.className : '';
+                else if (c.type === 'class') val = el.className || '';
                 else if (c.type === 'id') val = el.id || '';
                 if (c.operator === 'contains') return val.includes(c.value);
                 if (c.operator === 'not_contains') return val !== '' && !val.includes(c.value);
@@ -1635,7 +1805,7 @@
 
                     elements.forEach(el => {
                         // 全局保护：脚本自身 UI 宿主跳过，避免积木规则误伤面板
-                        if (UIManager.isProtectedElement(el)) return;
+                        if (ProtectedCheck.isProtected(el)) return;
                         if (baseSelector === '*' && (el.textContent || '').length > 3000) return;
 
                         if (this.evaluateConditions(rule.conditions, rule.logic, el)) {
@@ -1647,7 +1817,7 @@
                         }
                     });
                 } catch (e) {
-                    console.error('[Pro Blocker] 积木规则执行错误:', e);
+                    Log.error('积木规则执行错误:', e);
                 }
             });
         }
@@ -1657,6 +1827,18 @@
     // DomScanner：DOM 动态扫描引擎（从 BlockEngine 拆分）
     // 职责：MutationObserver 监听 + 动态资源域扫描 + Shadow DOM 递归
     // 依赖：storage, CSSInjector, RegexEngine, ElementHider, UIManager
+    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // DomScanner：DOM 动态扫描引擎（引擎层·MutationObserver 模块）
+    // 职责：监听 DOM 变化、扫描新节点资源域/路径、执行隐藏
+    // 特性：Shadow DOM 穿透、SPA 路由监听、去抖时间分片（requestIdleCallback）
+    // 依赖：StorageManager、BlockEngine（isUrlBlocked）、ElementHider
+    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // DomScanner：DOM 动态扫描引擎（引擎层·MutationObserver 模块）
+    // 职责：监听 DOM 变化、扫描新节点资源域/路径、执行隐藏
+    // 特性：Shadow DOM 穿透、SPA 路由监听、去抖时间分片（requestIdleCallback）
+    // 依赖：StorageManager、BlockEngine（isUrlBlocked）、ElementHider
     // ═══════════════════════════════════════════════════════════
     const DomScanner = {
         _addedNodesBuffer: [],
@@ -1688,14 +1870,14 @@
             const elements = [node];
             try {
                 node.querySelectorAll && node.querySelectorAll('img, iframe, video, script, a, source, embed, object').forEach(el => elements.push(el));
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             const currentHost = window.location.hostname;
 
             const _t0 = performance.now();
             elements.forEach(el => {
                 // 全局保护：脚本自身 UI 宿主及其子节点跳过，避免误伤面板
-                if (UIManager.isProtectedElement(el)) return;
+                if (ProtectedCheck.isProtected(el)) return;
                 let blocked = false;
                 let matchedDomain = '';
                 let matchedPattern = '';
@@ -1749,7 +1931,7 @@
                                 }
                             }
                         }
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 }
 
                 if (blocked) {
@@ -2021,7 +2203,7 @@
             if (!orig || orig.__proBlockerHooked) return;
             const hooked = function (init) {
                 const root = orig.call(this, init);
-                try { DomScanner._observeShadowRoot(root); } catch (e) { }
+                try { DomScanner._observeShadowRoot(root); } catch (e) { Log.warn(e.message || e); }
                 return root;
             };
             hooked.__proBlockerHooked = true;
@@ -2089,10 +2271,12 @@
         }
     };
 
-    /**
-     * 拦截引擎（门面）：DOM/CSS 控制 + 动态扫描
-     * 已拆分：CSS 注入 → CSSInjector，元素隐藏 → ElementHider，选择器构建 → SelectorBuilder
-     */
+    // ═══════════════════════════════════════════════════════════
+    // BlockEngine：核心拦截引擎（引擎层·规则应用中枢）
+    // 职责：域名/路径匹配、选择器生成、CSS 规则重建、隐藏/显示操作
+    // 性能：LRU 缓存（域名 200 条 + URL 100 条）、倒排索引（路径 4-char 滑窗）
+    // 依赖：StorageManager、CSSInjector、PathInvertedIndex、ElementHider、DomScanner
+    // ═══════════════════════════════════════════════════════════
     class BlockEngine {
         static _cachedDomainList = null;
         static _cachedDomainSet = null;
@@ -2187,7 +2371,7 @@
                     this._ensurePathIndex();
                     if (PathInvertedIndex.size > 0 && PathInvertedIndex.test(pathStr)) result = true;
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // LRU 淘汰：缓存满 100 条时淘汰最旧条目
             if (this._urlBlockCache.size >= 100) {
                 this._urlBlockCache.delete(this._urlBlockCache.keys().next().value);
@@ -2274,7 +2458,7 @@
                     this._flashDetectedThisLoad = true;
                     storage.markAsFlashing();
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         }
 
         /**
@@ -2317,7 +2501,7 @@
             // 广告 SDK 常在 shadow 内注入透明跳转层以规避常规选择器，不递归则完全漏拦
             // 脚本自身的 closed shadowRoot 不可访问，且 isProtectedElement 已在候选遍历时排除
             candidates.forEach(el => {
-                if (el.shadowRoot && !UIManager.isProtectedElement(el)) {
+                if (el.shadowRoot && !ProtectedCheck.isProtected(el)) {
                     const shadowResults = this.scanInvisibleOverlays({ autoBlock, root: el.shadowRoot, minSize, _depth: _depth + 1, view });
                     for (let i = 0; i < shadowResults.length; i++) results.push(shadowResults[i]);
                 }
@@ -2331,7 +2515,7 @@
         static _checkOverlayCandidate(el, minSize, selfHost, autoBlock, view = window, viewCSS = null) {
             viewCSS = viewCSS || ((el) => { try { return view.getComputedStyle(el); } catch (e) { return null; } });
             // 统一保护判定：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过，避免误伤面板
-            if (UIManager.isProtectedElement(el)) return null;
+            if (ProtectedCheck.isProtected(el)) return null;
             if (el.style.display === 'none') return null;
 
             // 两阶段过滤：先用廉价的 getBoundingClientRect 过滤面积/视口，
@@ -2414,7 +2598,7 @@
                 const key = record.tagName + '|' + record.id + '|' + record.className;
                 if (!this._loggedOverlays.has(key)) {
                     this._loggedOverlays.add(key);
-                    console.info(`[Pro Blocker] 拦截不可见覆盖层 ${record.tagName} ${record.rect.w}x${record.rect.h} -> ${triggerUrl || 'onclick'}`);
+                    Log.info(`[Pro Blocker] 拦截不可见覆盖层 ${record.tagName} ${record.rect.w}x${record.rect.h} -> ${triggerUrl || 'onclick'}`);
                 }
             }
             return record;
@@ -2478,7 +2662,7 @@
         // Shadow DOM 递归扫描辅助：供同步/异步扫描共用
         static _scanShadowOverlays(candidates, autoBlock, minSize, _depth, results, view = window, viewCSS = null) {
             candidates.forEach(el => {
-                if (el.shadowRoot && !UIManager.isProtectedElement(el)) {
+                if (el.shadowRoot && !ProtectedCheck.isProtected(el)) {
                     const shadowResults = this.scanInvisibleOverlays({ autoBlock, root: el.shadowRoot, minSize, _depth: _depth + 1, view });
                     for (let i = 0; i < shadowResults.length; i++) results.push(shadowResults[i]);
                 }
@@ -2667,7 +2851,7 @@
                     meta.count++;
                     meta.sources.add(source);
                     if (reason) meta.reasons.add(reason);
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             };
 
             const scanString = (str, source) => {
@@ -2711,7 +2895,7 @@
                     ? '*'
                     : 'img, iframe, video, source, embed, a, script, link, div, section, article, aside, span';
                 element.querySelectorAll && element.querySelectorAll(selectors).forEach(collect);
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             if (deep && includeStyles && isFullPage) {
                 try {
@@ -2724,10 +2908,10 @@
                                 const cssText = rule.cssText || '';
                                 const matches = cssText.match(/url\(["']?([^"')]+)["']?\)/g);
                                 if (matches) matches.forEach(m => addUrl(m.replace(/url\(["']?|["']?\)/g, ''), 'stylesheet'));
-                            } catch (e) { }
+                            } catch (e) { Log.warn(e.message || e); }
                         });
                     });
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
 
             if (deep && includeScripts && isFullPage) {
@@ -2742,7 +2926,7 @@
                             if (domainMatches) domainMatches.forEach(d => addUrl('https://' + d.replace(/["']/g, ''), 'script-var'));
                         }
                     });
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
 
                 // 内联事件属性中的 URL 采集（onclick/ontouchstart/onmousedown + data-href/data-url/data-link）
                 try {
@@ -2753,7 +2937,7 @@
                             if (val) scanString(val, 'inline-event');
                         });
                     });
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
 
             domainMeta.forEach((meta, host) => {
@@ -2768,7 +2952,7 @@
                 if (KNOWN_SAFE_CDNS.has(host)) score -= 50;
                 if (host === window.location.hostname || host.endsWith('.' + window.location.hostname)) score -= 1000;
                 // 上界 100：避免线性累加导致"分数无上限"，与 LR 引擎的 0-100 概率刻度对齐
-                meta.score = Math.min(100, Math.max(0, score));
+                meta.score = clampScore(score, 0, 100);
             });
 
             const scoredDomains = Array.from(domainMeta.entries())
@@ -2843,9 +3027,15 @@
      * 命中全局域名黑名单或路径模式时直接丢弃请求，从源头阻止广告资源加载（而非等 DOM 渲染后再隐藏）。
      * 判定逻辑复用 BlockEngine.isUrlBlocked，与 DOM 层拦截规则完全一致，避免双标。
      */
-    class NetworkInterceptor {
-
-        static init() {
+    // ═══════════════════════════════════════════════════════════
+    // NetworkEngine（原名 NetworkInterceptor，保留别名）：网络请求拦截引擎
+    // 职责：Hook fetch/XHR/script.src/img.src/link.href/media.src 等网络请求，
+    //       在请求发起前检查域名黑名单和路径模式，拦截广告请求
+    // 依赖：BlockEngine（isUrlBlocked）
+    // 命名：保持 NetworkInterceptor 别名兼容，同时使用 NetworkEngine 新名称
+    // ═══════════════════════════════════════════════════════════
+    const NetworkEngine = {
+        init() {
             this.hookFetch();
             this.hookXHR();
             this.hookScriptSrc();
@@ -2855,21 +3045,21 @@
             this.hookWebSocket();
             this.hookSendBeacon();
             this.hookIframeSrc();
-        }
+        },
 
-        static isUrlBlocked(url) {
+        isUrlBlocked(url) {
             // 显式规则拦截：域名黑名单 + 路径模式（与 DOM 层规则一致）
             return BlockEngine.isUrlBlocked(url);
-        }
+        },
 
-        static hookFetch() {
+        hookFetch() {
             if (!window.fetch || window.fetch.__proBlockerHooked) return;
             const origFetch = window.fetch;
             const hooked = function (input, init) {
                 let url = '';
                 if (typeof input === 'string') url = input;
                 else if (input && typeof input.url === 'string') url = input.url;
-                if (NetworkInterceptor.isUrlBlocked(url)) {
+                if (NetworkEngine.isUrlBlocked(url)) {
                     BlockEngine.stats.networkBlocks++;
                     // 返回空 200 响应，避免页面 fetch().then 抛错影响正常逻辑
                     return Promise.resolve(new Response('', { status: 200, statusText: 'blocked by Pro Blocker' }));
@@ -2878,13 +3068,13 @@
             };
             hooked.__proBlockerHooked = true;
             window.fetch = hooked;
-        }
+        },
 
-        static hookXHR() {
+        hookXHR() {
             if (!window.XMLHttpRequest || XMLHttpRequest.prototype.open.__proBlockerHooked) return;
             const origOpen = XMLHttpRequest.prototype.open;
             const hooked = function (method, url) {
-                if (NetworkInterceptor.isUrlBlocked(url)) {
+                if (NetworkEngine.isUrlBlocked(url)) {
                     BlockEngine.stats.networkBlocks++;
                     // 改写为 about:blank（同源空响应），XHR 正常完成但无广告数据
                     arguments[1] = 'about:blank';
@@ -2893,35 +3083,30 @@
             };
             hooked.__proBlockerHooked = true;
             XMLHttpRequest.prototype.open = hooked;
-        }
+        },
 
-        // 拦截动态 <script src="...">：仅拦截黑名单 URL，合法脚本不受影响
-        static hookScriptSrc() {
+        hookScriptSrc() {
             this._hookSrcProperty(HTMLScriptElement, 'src');
-        }
+        },
 
-        // 拦截动态 <img src="...">：广告图片常通过 new Image().src 动态加载(7.1 节)
-        static hookImageSrc() {
+        hookImageSrc() {
             this._hookSrcProperty(HTMLImageElement, 'src');
-        }
+        },
 
-        // 拦截 <link href="...">：广告样式表 / preload / prefetch 资源
-        static hookLinkHref() {
+        hookLinkHref() {
             this._hookSrcProperty(HTMLLinkElement, 'href');
-        }
+        },
 
-        // 拦截 <video>/<audio> src：视频广告 / 音频广告
-        static hookMediaSrc() {
+        hookMediaSrc() {
             this._hookSrcProperty(HTMLMediaElement, 'src');
-        }
+        },
 
-        // 通用属性 setter 劫持：复用于 script/img/link/media 的 src/href 拦截
-        static _hookSrcProperty(ElementClass, propName) {
+        _hookSrcProperty(ElementClass, propName) {
             const desc = Object.getOwnPropertyDescriptor(ElementClass.prototype, propName);
             if (!desc || !desc.set || desc.set.__proBlockerHooked) return;
             const origSet = desc.set;
             const hooked = function (url) {
-                if (NetworkInterceptor.isUrlBlocked(url)) {
+                if (NetworkEngine.isUrlBlocked(url)) {
                     BlockEngine.stats.networkBlocks++;
                     return; // 静默丢弃：不设置 src/href，广告资源永不加载
                 }
@@ -2938,16 +3123,13 @@
             } catch (e) {
                 // 某些环境描述符不可重定义，静默跳过（DOM 层仍会拦截）
             }
-        }
+        },
 
-        // 拦截 iframe src 加载（§7.1 创建时拦截）：黑名单域名的 iframe 永不发起请求
-        // 复用 _hookSrcProperty 通用机制，命中黑名单时静默丢弃 src 设置
-        static hookIframeSrc() {
+        hookIframeSrc() {
             this._hookSrcProperty(HTMLIFrameElement, 'src');
-        }
+        },
 
-        // 拦截 WebSocket 广告追踪：广告 SDK 常通过 WebSocket 实时上报
-        static hookWebSocket() {
+        hookWebSocket() {
             if (!window.WebSocket || window.WebSocket.__proBlockerHooked) return;
             const OrigWS = window.WebSocket;
             // 全局追踪集合：记录所有 WS 连接目标，供 GlobalDomainScanner 深度扫描挖掘隐藏域名
@@ -2959,8 +3141,8 @@
                 try {
                     const target = typeof url === 'string' ? url : (url && url.url) || '';
                     if (target && window.__proBlocker_ws_targets.length < 200) window.__proBlocker_ws_targets.push(target);
-                } catch (e) { }
-                if (NetworkInterceptor.isUrlBlocked(typeof url === 'string' ? url : (url && url.url) || '')) {
+                } catch (e) { Log.warn(e.message || e); }
+                if (NetworkEngine.isUrlBlocked(typeof url === 'string' ? url : (url && url.url) || '')) {
                     BlockEngine.stats.networkBlocks++;
                     // 返回一个立即关闭的伪 WebSocket，避免页面 new WS() 抛错
                     return new OrigWS('ws://localhost:0'); // 连接立即失败，不产生广告上报
@@ -2973,24 +3155,26 @@
             hooked.OPEN = OrigWS.OPEN;
             hooked.CLOSING = OrigWS.CLOSING;
             hooked.CLOSED = OrigWS.CLOSED;
-            try { window.WebSocket = hooked; } catch (e) { }
-        }
+            try { window.WebSocket = hooked; } catch (e) { Log.warn(e.message || e); }
+        },
 
-        // 拦截 navigator.sendBeacon：广告 SDK 常用 sendBeacon 上报用户行为
-        static hookSendBeacon() {
+        hookSendBeacon() {
             if (!navigator.sendBeacon || navigator.sendBeacon.__proBlockerHooked) return;
             const origBeacon = navigator.sendBeacon.bind(navigator);
             const hooked = function (url, data) {
-                if (NetworkInterceptor.isUrlBlocked(url)) {
+                if (NetworkEngine.isUrlBlocked(url)) {
                     BlockEngine.stats.networkBlocks++;
                     return true; // 静默丢弃：返回 true 让页面认为上报成功
                 }
                 return origBeacon(url, data);
             };
             hooked.__proBlockerHooked = true;
-            try { navigator.sendBeacon = hooked; } catch (e) { }
+            try { navigator.sendBeacon = hooked; } catch (e) { Log.warn(e.message || e); }
         }
-    }
+    };
+
+    // 保留别名：NetworkInterceptor → NetworkEngine（向后兼容）
+    const NetworkInterceptor = NetworkEngine;
 
 
     // ═══════════════════════════════════════════════════════════
@@ -2998,7 +3182,7 @@
     // 职责：资源域名提取 + 评分 + 采集通道管理
     // 合并自：GlobalDomainScanner + BlockEngine.extractResourceDomains
     // 依赖：isAdKeywordHost, GAMBLING_TLDS, AD_TOKENS_UNIFIED, storage
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════    // ═══════════════════════════════════════════════════════════
     const DomainAnalyzer = {
         // 委托到 BlockEngine.extractResourceDomains（后续逐步迁移实现）
         extractResourceDomains(element, options) {
@@ -3111,9 +3295,9 @@
                                 info.hasRedirect = true;
                             }
                         }
-                    } catch (ex) { }
+                    } catch (ex) { Log.warn(ex.message || ex); }
                 }
-            } catch (ex) { }
+            } catch (ex) { Log.warn(ex.message || ex); }
 
             // 通道B：DOM 资源元素（懒加载/srcset/poster）
             try {
@@ -3143,10 +3327,10 @@
                             const h = abs.hostname.toLowerCase();
                             const type = TYPE_MAP[el.tagName.toLowerCase()] || 'other';
                             _addEntry(h, raw, type, 0);
-                        } catch (ex) { }
+                        } catch (ex) { Log.warn(ex.message || ex); }
                     }
                 }
-            } catch (ex) { }
+            } catch (ex) { Log.warn(ex.message || ex); }
 
             // 通道C：iframe 递归（同源 iframe 内部资源）
             try {
@@ -3164,12 +3348,12 @@
                                 try {
                                     const h2 = new URL(img.src).hostname.toLowerCase();
                                     _addEntry(h2, img.src, 'image', 0);
-                                } catch (e2) { }
+                                } catch (e2) { Log.warn(e2.message || e2); }
                             }
                         }
-                    } catch (ex) { }
+                    } catch (ex) { Log.warn(ex.message || ex); }
                 }
-            } catch (ex) { }
+            } catch (ex) { Log.warn(ex.message || ex); }
 
             // 通道D：CSS 中的外部资源（@import / url()）
             try {
@@ -3186,13 +3370,13 @@
                                     try {
                                         const h = new URL(m[1], sheet.href || location.href).hostname.toLowerCase();
                                         _addEntry(h, m[1], 'image', 0);
-                                    } catch (e3) { }
+                                    } catch (e3) { Log.warn(e3.message || e3); }
                                 }
                             }
                         }
-                    } catch (ex) { }
+                    } catch (ex) { Log.warn(ex.message || ex); }
                 }
-            } catch (ex) { }
+            } catch (ex) { Log.warn(ex.message || ex); }
 
             // 通道E：页面中所有链接的跳转目标（博彩/色情跳转检测）
             try {
@@ -3209,9 +3393,9 @@
                             const info = map.get(h);
                             if (info) info.hasRedirect = true;
                         }
-                    } catch (ex) { }
+                    } catch (ex) { Log.warn(ex.message || ex); }
                 }
-            } catch (ex) { }
+            } catch (ex) { Log.warn(ex.message || ex); }
 
             // 通道F：内联事件属性中的跳转 URL（onclick/ontouchstart/onmousedown 中的 window.open/location）
             try {
@@ -3232,12 +3416,12 @@
                                         const info = map.get(h);
                                         if (info) info.hasRedirect = true;
                                     }
-                                } catch (ex) { }
+                                } catch (ex) { Log.warn(ex.message || ex); }
                             }
                         }
                     }
                 }
-            } catch (ex) { }
+            } catch (ex) { Log.warn(ex.message || ex); }
 
             // 标记第三方
             for (const [, info] of map) {
@@ -3353,7 +3537,7 @@
             else if (s >= 15) level = 'watch';
             else level = 'safe';
 
-            return { score: Math.min(s, 100), level, reasons: r, signals: sig };
+            return { score: clampScore(s, 0, 100), level, reasons: r, signals: sig };
         }
 
         // ════════════════════════════════════════
@@ -3419,11 +3603,11 @@
                                 const u = new URL(reg.scope || '');
                                 const h = u.hostname.toLowerCase();
                                 if (_addHost(h, reg.scope || '', 'sw')) extras.swHosts.push(h);
-                            } catch (e) { }
+                            } catch (e) { Log.warn(e.message || e); }
                         }
-                    }).catch(() => { });
+                    }).catch((e) => { Log.warn('serviceWorker scan failed:', e); });
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ② 活跃 WebSocket 连接域名（无法直接枚举，扫描已 hook 的 WebSocket 实例）
             // NetworkInterceptor.hookWebSocket 已记录 ws 连接，此处从全局追踪集合读取
@@ -3434,10 +3618,10 @@
                             const u = new URL(wsUrl);
                             const h = u.hostname.toLowerCase();
                             if (_addHost(h, wsUrl, 'ws')) extras.wsHosts.push(h);
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ③ Base64 / Blob URL 溯源：Blob URL 本身不含域名，但创建前的源码常含真实地址
             try {
@@ -3453,14 +3637,14 @@
                                 try {
                                     const h = new URL(u).hostname.toLowerCase();
                                     if (_addHost(h, u, 'data-embed')) extras.blobUrls.push(u);
-                                } catch (e) { }
+                                } catch (e) { Log.warn(e.message || e); }
                             }
                         }
                     }
                     // blob: URL 无法直接溯源，记录出现供后续追溯
                     if (val.startsWith('blob:')) extras.blobUrls.push(val);
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ④ CSS 伪元素 ::before/::after 中的 url() 注入
             try {
@@ -3469,7 +3653,7 @@
                 for (const el of candidates) {
                     if (checked >= 500) break; // 采样上限
                     checked++;
-                    if (UIManager.isProtectedElement(el)) continue;
+                    if (ProtectedCheck.isProtected(el)) continue;
                     try {
                         const before = window.getComputedStyle(el, '::before').content;
                         const after = window.getComputedStyle(el, '::after').content;
@@ -3480,12 +3664,12 @@
                                 try {
                                     const h = new URL(m[1]).hostname.toLowerCase();
                                     if (_addHost(h, m[1], 'pseudo-css')) extras.pseudoUrls.push(m[1]);
-                                } catch (e) { }
+                                } catch (e) { Log.warn(e.message || e); }
                             }
                         });
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ⑤ SVG <use href> / <image href> / <image xlink:href> 资源引用
             try {
@@ -3498,9 +3682,9 @@
                         const abs = new URL(href, location.href);
                         const h = abs.hostname.toLowerCase();
                         if (_addHost(h, href, 'svg-ref')) extras.svgUrls.push(href);
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             return extras;
         }
@@ -3544,14 +3728,14 @@
                                         info.types.add(TYPE_MAP[el.tagName.toLowerCase()] || 'other');
                                         info.count++;
                                     }
-                                } catch (e) { }
+                                } catch (e) { Log.warn(e.message || e); }
                             }
                         });
                         // 递归处理嵌套同域 iframe
                         collectIframeDomains(baseMap, maxDepth, currentDepth + 1);
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 });
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         }
 
         /**
@@ -3582,7 +3766,7 @@
                     if (info.types.has('svg-ref')) { extraScore += 8; extraReasons.push('SVG引用'); }
                     if (info.types.has('data-embed')) { extraScore += 10; extraReasons.push('📦data内嵌'); }
                 }
-                const finalScore = Math.min(100, score + extraScore);
+                const finalScore = clampScore(score + extraScore, 0, 100);
                 const allReasons = extraReasons.length > 0 ? reasons.concat(extraReasons) : reasons;
                 results.push(Object.assign({}, f, {
                     score: finalScore, level: finalScore >= 55 && signals + (extraScore > 0 ? 1 : 0) >= 3 ? 'ad' : level,
@@ -3657,19 +3841,19 @@
                 for (const el of candidates) {
                     if (seen.has(el)) continue;
                     // 统一保护判定：脚本自身 UI 宿主（含 Shadow DOM 内部节点）跳过
-                    if (UIManager.isProtectedElement(el)) continue;
+                    if (ProtectedCheck.isProtected(el)) continue;
                     seen.add(el);
                     const f = _analyzeElement(el);
                     if (f.suspicion > 0) results.push(f);
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // 阶段2：定位元素扫描（覆盖层核心）
             try {
                 const positioned = document.querySelectorAll('div,section,aside,article');
                 for (const el of positioned) {
                     if (seen.has(el)) continue;
-                    if (UIManager.isProtectedElement(el)) continue;
+                    if (ProtectedCheck.isProtected(el)) continue;
                     const cs = _cs(el);
                     if (!cs) continue;
                     if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
@@ -3677,19 +3861,19 @@
                     const f = _analyzeOverlay(el, cs);
                     if (f.suspicion > 0) results.push(f);
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // 阶段3：可点击图片专项（博彩/色情核心）
             try {
                 const clickableImgs = document.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
                 for (const img of clickableImgs) {
                     if (seen.has(img)) continue;
-                    if (UIManager.isProtectedElement(img)) continue;
+                    if (ProtectedCheck.isProtected(img)) continue;
                     seen.add(img);
                     const f = _analyzeClickableImage(img);
                     if (f.suspicion > 0) results.push(f);
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // 阶段4：内联事件广告（移动端最常见的劫持手法）
             // 扫描所有 [onclick]、[ontouchstart]、[onmousedown] 的元素
@@ -3697,12 +3881,12 @@
                 const inlineEventAds = document.querySelectorAll('[onclick], [ontouchstart], [onmousedown], [data-href], [data-url], [data-link]');
                 for (const el of inlineEventAds) {
                     if (seen.has(el)) continue;
-                    if (UIManager.isProtectedElement(el)) continue;
+                    if (ProtectedCheck.isProtected(el)) continue;
                     seen.add(el);
                     const f = _analyzeInlineEventAd(el);
                     if (f.suspicion > 0) results.push(f);
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             results.sort((a, b) => b.suspicion - a.suspicion);
             const elapsed = (performance.now() - t0).toFixed(1);
@@ -3711,12 +3895,12 @@
 
         function _analyzeElement(el) {
             // 防御性保护：即使从外部直接调用也不会扫描脚本自身 UI
-            if (UIManager.isProtectedElement(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'unknown' };
+            if (ProtectedCheck.isProtected(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'unknown' };
             const f = { el, suspicion: 0, reasons: [], features: {}, category: 'unknown' };
             const cs = _cs(el);
             if (!cs) return f;
             const tag = el.tagName.toLowerCase();
-            const cls = (el.className || '').toString().toLowerCase();
+            const cls = (el.className || '').toLowerCase();
             const id = (el.id || '').toLowerCase();
             const rect = _rect(el);
 
@@ -3742,7 +3926,7 @@
                 f.suspicion += 40; f.reasons.push('1×1像素');
                 f.features.pixel = true; f.category = 'tracking';
             }
-            const z = parseInt(cs.zIndex) || 0;
+            const z = parseInt(cs.zIndex, 10) || 0;
             if ((cs.position === 'fixed' || cs.position === 'absolute') && z > 999) {
                 f.suspicion += 25; f.reasons.push('z:' + z);
                 f.features.highZ = z; f.category = 'overlay';
@@ -3780,7 +3964,7 @@
                                 f.suspicion += 15; f.reasons.push('跨域跳转');
                                 f.features.externalLink = targetHost;
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                 }
             }
@@ -3794,7 +3978,7 @@
                     if (targetHost !== location.hostname) {
                         f.features.externalLink = targetHost;
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             f.selector = _buildSelector(el);
             f.features.tag = tag;
@@ -3802,10 +3986,10 @@
         }
 
         function _analyzeOverlay(el, cs) {
-            if (UIManager.isProtectedElement(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
+            if (ProtectedCheck.isProtected(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
             const f = { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
             const rect = _rect(el);
-            const cls = (el.className || '').toString().toLowerCase();
+            const cls = (el.className || '').toLowerCase();
             const id = (el.id || '').toLowerCase();
             const z = parseInt(cs.zIndex) || 0;
 
@@ -3842,7 +4026,7 @@
         }
 
         function _analyzeClickableImage(img) {
-            if (UIManager.isProtectedElement(img)) return { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
+            if (ProtectedCheck.isProtected(img)) return { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
             const f = { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
             const rect = _rect(img);
             const parent = img.closest('a, [onclick]');
@@ -3867,7 +4051,7 @@
                                 }
                             }
                         }
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                     if (href.includes('window.open') || href.includes('location')) {
                         f.suspicion += 25; f.reasons.push('JS跳转');
                         f.features.jsRedirect = true;
@@ -3889,7 +4073,7 @@
             }
             const cs = _cs(img) || _cs(container);
             if (cs && (cs.position === 'fixed' || cs.position === 'absolute')) {
-                const z = parseInt(cs.zIndex) || 0;
+                const z = parseInt(cs.zIndex, 10) || 0;
                 if (z > 100) { f.suspicion += 15; f.reasons.push('图片覆盖层z:' + z); }
             }
             if (img.dataset && img.dataset._dynamicInsert === '1') {
@@ -3905,11 +4089,11 @@
         // 分析带内联事件的广告元素（移动端劫持核心）
         // 针对 [onclick] / [ontouchstart] / [onmousedown] / [data-href] 等元素
         function _analyzeInlineEventAd(el) {
-            if (UIManager.isProtectedElement(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
+            if (ProtectedCheck.isProtected(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
             const f = { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
             const tag = el.tagName.toLowerCase();
             const rect = _rect(el);
-            const cls = (el.className || '').toString().toLowerCase();
+            const cls = (el.className || '').toLowerCase();
             const id = (el.id || '').toLowerCase();
             const onclickVal = el.getAttribute('onclick') || '';
             if (onclickVal) {
@@ -3927,7 +4111,7 @@
                                 f.features.viceTarget = targetHost;
                                 f.category = 'vice-image';
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                 }
                 if (/^gogogo|^gourl|^godown|^golh|^goAppHtml|^GoGd|^GoTp|^lksdjfrefruise|^diensfeifwej|^_czc\./.test(onclickVal.trim())) {
@@ -3963,7 +4147,7 @@
                         f.features.viceTarget = targetHost;
                         f.category = 'vice-image';
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             if (tag === 'a') {
                 const href = el.getAttribute('href') || '';
@@ -4022,7 +4206,7 @@
                 const args = Array.prototype.slice.call(arguments);
                 if (_checkNav(url)) {
                     _navBlocked.push({ type: 'window.open', url: url, time: Date.now() });
-                    console.warn('[OverlayAdScanner] 拦截 window.open:', url);
+                    Log.warn('拦截 window.open:', url);
                     return null;
                 }
                 return _origOpen.apply(this, args);
@@ -4031,7 +4215,7 @@
             // ② 拦截 <a> 点击 + onclick 内联跳转（捕获阶段）
             document.addEventListener('click', function (e) {
                 // 统一保护：脚本自身 UI 宿主内的点击不处理，避免误删面板
-                if (UIManager.isProtectedElement(e.target)) return;
+                if (ProtectedCheck.isProtected(e.target)) return;
                 // 先检查 <a href> 跳转
                 const link = e.target.closest && e.target.closest('a');
                 if (link) {
@@ -4040,10 +4224,10 @@
                         e.preventDefault();
                         e.stopPropagation();
                         _navBlocked.push({ type: 'link.click', url: href, time: Date.now() });
-                        console.warn('[OverlayAdScanner] 拦截链接:', href);
+                        Log.warn('[OverlayAdScanner] 拦截链接:', href);
                         const container = link.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || link;
                         // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
-                        if (!UIManager.isProtectedElement(container)) container.remove();
+                        if (!ProtectedCheck.isProtected(container)) container.remove();
                         return;
                     }
                 }
@@ -4062,10 +4246,10 @@
                                     e.stopPropagation();
                                     e.stopImmediatePropagation && e.stopImmediatePropagation();
                                     _navBlocked.push({ type: 'onclick', url: url[1], time: Date.now() });
-                                    console.warn('[OverlayAdScanner] 拦截 onclick 跳转:', url[1]);
+                                    Log.warn('拦截onclick跳转:', url[1]);
                                     const container = target.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || target;
                                     // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
-                                    if (!UIManager.isProtectedElement(container)) container.remove();
+                                    if (!ProtectedCheck.isProtected(container)) container.remove();
                                     return;
                                 }
                             }
@@ -4082,7 +4266,7 @@
                         set(val) {
                             if (_checkNav(val)) {
                                 _navBlocked.push({ type: 'location.href', url: val, time: Date.now() });
-                                console.warn('[OverlayAdScanner] 拦截 location:', val);
+                                Log.warn('拦截location:', val);
                                 return;
                             }
                             desc.set.call(this, val);
@@ -4091,7 +4275,7 @@
                         configurable: true
                     });
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ④ 拦截 form 提交
             document.addEventListener('submit', function (e) {
@@ -4227,7 +4411,7 @@
                         results.push({ type: 'text', value: text });
                     }
                 });
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             return results;
         }
 
@@ -4306,7 +4490,7 @@
             try {
                 const clickableImgs = document.querySelectorAll('a img, a > img, [onclick] img, img[onclick]');
                 for (const img of clickableImgs) {
-                    if (UIManager.isProtectedElement(img)) continue;
+                    if (ProtectedCheck.isProtected(img)) continue;
                     const ratio = detectSkinTone(img);
                     if (ratio > 0.3) {
                         deepExtras.viceImages.push({
@@ -4316,7 +4500,7 @@
                         });
                     }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ② 伪元素穿透：扫描高 z-index 定位元素（覆盖层广告常注入伪元素）
             try {
@@ -4325,19 +4509,19 @@
                 for (const el of positioned) {
                     if (checked >= 800) break; // 采样上限，避免大型页面卡顿
                     checked++;
-                    if (UIManager.isProtectedElement(el)) continue;
+                    if (ProtectedCheck.isProtected(el)) continue;
                     const items = extractPseudoContent(el);
                     if (items.length > 0) {
                         deepExtras.pseudoInjects.push({ el, items });
                     }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ③ 混淆跳转沙箱解码：扫描含混淆特征的内联事件
             try {
                 const inlineEls = document.querySelectorAll('[onclick], [ontouchstart], [onmousedown], [data-href], [data-url], [data-link]');
                 for (const el of inlineEls) {
-                    if (UIManager.isProtectedElement(el)) continue;
+                    if (ProtectedCheck.isProtected(el)) continue;
                     const attrs = ['onclick', 'ontouchstart', 'onmousedown', 'data-href', 'data-url', 'data-link'];
                     for (const attr of attrs) {
                         const val = el.getAttribute(attr);
@@ -4348,7 +4532,7 @@
                         }
                     }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ④ Icon Font 映射检测：扫描博彩/色情容器内的元素
             try {
@@ -4356,13 +4540,13 @@
                     '[class*="casino"], [class*="bet"], [class*="slot"], [class*="poker"], [class*="lottery"], ins'
                 );
                 for (const c of viceContainers) {
-                    if (UIManager.isProtectedElement(c)) continue;
+                    if (ProtectedCheck.isProtected(c)) continue;
                     if (isCustomFont(c)) {
                         const sample = (c.textContent || '').trim().substring(0, 50);
                         deepExtras.customFontEls.push({ el: c, sample });
                     }
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
 
             // ⑤ 融合深度发现到 results：肤色调色情图直接升级 category，混淆 URL 注入 triggerUrl
             const elToResult = new Map();
@@ -4800,7 +4984,7 @@
             this.shadowRoot.appendChild(overlay);
             overlay.querySelector('#cf-yes').addEventListener('click', () => {
                 overlay.remove();
-                try { onConfirm && onConfirm(); } catch (e) { console.error('[Pro Blocker] 确认回调异常:', e); }
+                try { onConfirm && onConfirm(); } catch (e) { Log.error('确认回调异常:', e); }
             });
             overlay.querySelector('#cf-no').addEventListener('click', () => overlay.remove());
             overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
@@ -4855,7 +5039,7 @@
             this.shadowRoot.appendChild(banner);
             this._previewBanner = banner;
             banner.querySelector('.pro-preview-close').addEventListener('click', () => {
-                try { onClose && onClose(); } catch (e) { console.error('[Pro Blocker] 预览关闭异常:', e); }
+                try { onClose && onClose(); } catch (e) { Log.error('预览关闭异常:', e); }
             });
         }
         _hidePreviewBanner() {
@@ -4870,7 +5054,7 @@
         // store 为调用方预览状态的 elements 数组，隐藏的节点推入其中便于还原
         _previewHideNode(node, store) {
             if (!node || node === document.body || node === document.documentElement) return false;
-            if (UIManager.isProtectedElement(node)) return false;
+            if (ProtectedCheck.isProtected(node)) return false;
             if (node.style.display === 'none') return false;
             // 统一隐藏口径(5.2 节)：预览与正式拦截一致，避免预览看到的与实际不符
             BlockEngine.hideElement(node);
@@ -4895,7 +5079,7 @@
                 const sel = ResourceSelectorBuilder.buildDomainAttr(d);
                 try {
                     document.querySelectorAll(sel).forEach(el => this._previewHideResourceAndWrappers(el, store));
-                } catch (e) { } // 选择器可能因特殊字符抛 SyntaxError
+                } catch (e) { Log.warn(e.message || e); } // 选择器可能因特殊字符抛 SyntaxError
             });
         }
 
@@ -4925,14 +5109,14 @@
                 });
                 // iframe 规则变更后重新扫描（reapplyAll 不覆盖 iframe 扫描）
                 if (items.some(it => it.type === 'iframeBlock')) {
-                    try { IframeGuard.rescanAll(); } catch (e) { }
+                    try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
                 }
                 // 统一调用 reapplyAll(问题2)：与删除规则后重新应用逻辑保持一致，
                 // 将来 reapplyAll 增加步骤（如覆盖层重扫）时撤销逻辑自动跟上
                 BlockEngine.reapplyAll();
                 this.showToast(entry.batch ? `已撤销批量删除（${items.length} 条）` : '已撤销删除', 'success');
             } catch (e) {
-                console.error('[Pro Blocker] 撤销失败:', e);
+                Log.error('撤销失败:', e);
                 this.showToast('撤销失败：' + e.message, 'error');
             }
         }
@@ -4956,7 +5140,7 @@
             panel.querySelector('#btn-close-err').addEventListener('click', () => this.clearPanel());
             panel.querySelector('#btn-retry').addEventListener('click', () => {
                 this.clearPanel();
-                if (typeof onRetry === 'function') { try { onRetry(); } catch (e) { console.error('[Pro Blocker] 重试失败:', e); } }
+                if (typeof onRetry === 'function') { try { onRetry(); } catch (e) { Log.error('重试失败:', e); } }
             });
         }
 
@@ -4966,7 +5150,7 @@
             try {
                 fn();
             } catch (e) {
-                console.error('[Pro Blocker] ' + title + '失败:', e);
+                Log.error(title + '失败:', e);
                 this._showErrorPanel(title + '失败', e && e.message ? e.message : String(e), retry);
             }
         }
@@ -5121,7 +5305,7 @@
             this._origFormSubmit = HTMLFormElement.prototype.submit;
 
             window.open = (...args) => {
-                console.warn('[Pro Blocker] 选择模式：拦截 window.open', args[0]);
+                Log.warn('拦截window.open:', args[0]);
                 return null;
             };
             try {
@@ -5130,20 +5314,20 @@
                     Object.defineProperty(Location.prototype, 'href', {
                         get: desc.get,
                         set: (val) => {
-                            console.warn('[Pro Blocker] 选择模式：拦截 location.href =', val);
+                            Log.warn('拦截location.href:', val);
                         },
                         configurable: true
                     });
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             Location.prototype.assign = function (url) {
-                console.warn('[Pro Blocker] 选择模式：拦截 location.assign', url);
+                Log.warn('拦截location.assign:', url);
             };
             Location.prototype.replace = function (url) {
-                console.warn('[Pro Blocker] 选择模式：拦截 location.replace', url);
+                Log.warn('拦截location.replace:', url);
             };
             HTMLFormElement.prototype.submit = function () {
-                console.warn('[Pro Blocker] 选择模式：拦截 form.submit');
+                Log.warn('拦截form.submit');
             };
             // pushState/replaceState 不再重复劫持，改用标志位让 startObserver 的 wrapper 主动让路(BUG-S1)
             // 这样退出选择模式后无需恢复，SPA 路由监听 wrapper 始终在位、永久生效
@@ -5158,7 +5342,7 @@
             if (this._origLocationHrefDesc) {
                 try {
                     Object.defineProperty(Location.prototype, 'href', this._origLocationHrefDesc);
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             if (this._origAssign) Location.prototype.assign = this._origAssign;
             if (this._origReplace) Location.prototype.replace = this._origReplace;
@@ -5169,7 +5353,7 @@
         _handleMouseOver(e) {
             if (!e.target || !e.target.closest) return;
             // 统一调用 isProtectedElement：覆盖 shadowRoot 内部子元素，防止选中面板自身
-            if (UIManager.isProtectedElement(e.target)) return;
+            if (ProtectedCheck.isProtected(e.target)) return;
             // 排除 body/html：透明覆盖层覆盖全页时 mouseover target 可能是 body/html，
             // 高亮整个页面会导致用户无法选择具体广告元素
             if (e.target === document.body || e.target === document.documentElement) return;
@@ -5182,7 +5366,7 @@
                 const r = target.getBoundingClientRect();
                 if (r.width <= vw * 0.9 || r.height <= vh * 0.9) break;
                 const child = target.querySelector('div, section, aside, article, iframe, img, a');
-                if (!child || UIManager.isProtectedElement(child)) break;
+                if (!child || ProtectedCheck.isProtected(child)) break;
                 target = child;
             }
             if (target !== e.target) {
@@ -5201,7 +5385,7 @@
             if (!e.touches || e.touches.length === 0) return;
             const touch = e.touches[0];
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
-            if (!target || !target.closest || UIManager.isProtectedElement(target)) return;
+            if (!target || !target.closest || ProtectedCheck.isProtected(target)) return;
             if (target === document.body || target === document.documentElement) return;
             if (this.highlightEl) this.highlightEl.classList.remove('pro-blocker-highlight');
             this.highlightEl = target;
@@ -5215,7 +5399,7 @@
             if (!e.changedTouches || e.changedTouches.length === 0) return;
             const touch = e.changedTouches[0];
             const target = document.elementFromPoint(touch.clientX, touch.clientY);
-            if (!target || !target.closest || UIManager.isProtectedElement(target)) return;
+            if (!target || !target.closest || ProtectedCheck.isProtected(target)) return;
             if (target === document.body || target === document.documentElement) return;
             e.preventDefault();
             e.stopPropagation();
@@ -5232,7 +5416,7 @@
 
         // 阻止 touchstart 默认行为，防止广告通过 touch 事件直接触发跳转（移动端）
         _handleTouchStart(e) {
-            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
+            if (!e.target || !e.target.closest || ProtectedCheck.isProtected(e.target)) return;
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
@@ -5241,7 +5425,7 @@
         // pointerdown 是最早的人机交互事件，先于 mousedown/touchstart/click 触发
         // 在 capture 阶段拦截，确保广告 ontouchstart="this.click();" / onclick 无法执行
         _handlePointerDown(e) {
-            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
+            if (!e.target || !e.target.closest || ProtectedCheck.isProtected(e.target)) return;
             // 必须先 stop 掉广告可能的 ontouchstart / onclick
             e.preventDefault();
             e.stopPropagation();
@@ -5250,7 +5434,7 @@
 
         // mousedown 作为兜底：有些环境 pointerdown 不触发（如纯鼠标点击）
         _handleMouseDown(e) {
-            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
+            if (!e.target || !e.target.closest || ProtectedCheck.isProtected(e.target)) return;
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
@@ -5258,14 +5442,14 @@
 
         // 拦截中键/右键辅助点击：广告 <a target="_blank"> 中键点击会绕过 click 监听直接打开新标签
         _handleAuxClick(e) {
-            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
+            if (!e.target || !e.target.closest || ProtectedCheck.isProtected(e.target)) return;
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
         }
 
         _handleClick(e) {
-            if (!e.target || !e.target.closest || UIManager.isProtectedElement(e.target)) return;
+            if (!e.target || !e.target.closest || ProtectedCheck.isProtected(e.target)) return;
             // body/html 不是有效拦截目标，提示用户选择具体元素
             if (e.target === document.body || e.target === document.documentElement) {
                 e.preventDefault();
@@ -5313,7 +5497,7 @@
                             return;
                         }
                     }
-                } catch (ex) { }
+                } catch (ex) { Log.warn(ex.message || ex); }
             }
 
             // 元素有效性校验：广告脚本可能在 stopSelection 触发的导航解冻瞬间移除目标元素
@@ -5343,7 +5527,7 @@
             this._clearSelectionHighlight();
             this.currentSelectedEl = element;
             element.classList.add('pro-blocker-selected');
-            try { element.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (e) { }
+            try { element.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (e) { Log.warn(e.message || e); }
         }
 
         _resetActionPreview(panel) {
@@ -5351,7 +5535,7 @@
             // 新版预览隐藏「所选域名命中的全部元素 + 当前广告容器」，需逐个还原
             // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(display/opacity/visibility/pointer-events)
             // 否则 visibility/pointer-events 残留会导致元素永久不可见(BUG-1)
-            if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length > 0) {
+            if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length) {
                 this._actionPreview.elements.forEach(el => BlockEngine.showElement(el));
             }
             this._actionPreview = { active: false, elements: [] };
@@ -5385,7 +5569,7 @@
                 const sel = ResourceSelectorBuilder.buildPathAttr(p);
                 try {
                     document.querySelectorAll(sel).forEach(target => this._previewHideResourceAndWrappers(target, store));
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             });
             // 3) 当前框选的广告容器（正式封杀也会手动隐藏容器）
             this._previewHideNode(BlockEngine.findSingleChildWrapper(el, 4), store);
@@ -5396,7 +5580,7 @@
             if (!this._actionPreview.active) return;
             // 还原当前预览隐藏的元素（保留 active=true）
             // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(BUG-1)
-            if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length > 0) {
+            if (Array.isArray(this._actionPreview.elements) && this._actionPreview.elements.length) {
                 this._actionPreview.elements.forEach(el => BlockEngine.showElement(el));
             }
             this._actionPreview.elements = [];
@@ -5588,7 +5772,7 @@
             // 动态类名拦截
             panel.querySelector('#btn-dynamic').addEventListener('click', () => {
                 const el = this.currentSelectedEl;
-                const primaryClass = (typeof el.className === 'string' ? el.className : '').split(/\s+/)[0];
+                const primaryClass = (el.className || '').split(/\s+/)[0];
                 if (!primaryClass) { this.showToast('当前元素无有效类名，请选择其他拦截方式。', 'warning'); return; }
                 storage.addRule('dynamic', { className: primaryClass, type: 'dynamic' });
                 this.clearPanel();
@@ -5706,7 +5890,7 @@
             const blockedDomainSet = new Set(storage.getDomainBlocks().map(r => r.domain));
             const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
             let gdsResult = { results: [], elapsed: '0', total: 0 };
-            try { gdsResult = GlobalDomainScanner.scan(); } catch (e) { }
+            try { gdsResult = GlobalDomainScanner.scan(); } catch (e) { Log.warn(e.message || e); }
             const gdsMap = new Map();
             for (const r of (gdsResult.results || [])) gdsMap.set(r.hostname, r);
 
@@ -6035,6 +6219,7 @@
                     <option value="regex">正则表达式模式 (适合高级用户)</option>
                     <option value="attribute">属性选择器模式 (如 [src*="ad"] 或 [id^="banner"])</option>
                     <option value="path">路径模式 (拦截广告跳转链接，如 /flink/url.php)</option>
+                    <option value="iframeBlock">iframe 子文档拦截 (封杀指定域名的 iframe 帧)</option>
                 </select>
 
                 <div id="standard-ui" style="display: none;">
@@ -6046,6 +6231,12 @@
                     <label for="path-input">广告跳转路径片段</label>
                     <input type="text" id="path-input" placeholder="例如：/flink/url.php 或 /000/flink" />
                     <p style="color:#bbb; font-size:11px;">提示：从广告链接 href 中提取有辨识度的路径片段，无需完整 URL。匹配该片段的所有链接与资源都将被拦截。</p>
+                </div>
+
+                <div id="iframe-block-ui" style="display: none;">
+                    <label for="iframe-domain-input">iframe 子文档域名</label>
+                    <input type="text" id="iframe-domain-input" placeholder="例如：ads.example.com 或 doubleclick.net" />
+                    <p style="color:#bbb; font-size:11px;">提示：输入广告 iframe 的 src 域名，系统将生成 iframeBlock 规则，拦截所有 src 包含该域名的 iframe 帧（即 $subdocument 拦截）。可封杀整个广告 iframe，而不影响同域名下的正常页面内容。</p>
                 </div>
 
                 <div id="attr-ui" style="display: none;">
@@ -6089,13 +6280,16 @@
             const levelRow = panel.querySelector('#level-row');
             const conditionsContainer = panel.querySelector('#builder-conditions');
 
+            const iframeBlockUI = panel.querySelector('#iframe-block-ui');
+
             modeSelect.addEventListener('change', (e) => {
                 const v = e.target.value;
                 standardUI.style.display = (v === 'contains' || v === 'regex') ? 'block' : 'none';
                 builderUI.style.display = (v === 'builder') ? 'block' : 'none';
                 pathUI.style.display = (v === 'path') ? 'block' : 'none';
                 attrUI.style.display = (v === 'attribute') ? 'block' : 'none';
-                levelRow.style.display = (v === 'path' || v === 'attribute') ? 'none' : 'block';
+                iframeBlockUI.style.display = (v === 'iframeBlock') ? 'block' : 'none';
+                levelRow.style.display = (v === 'path' || v === 'attribute' || v === 'iframeBlock') ? 'none' : 'block';
                 if (v === 'builder' && conditionsContainer.children.length === 0) addConditionRow();
             });
 
@@ -6165,7 +6359,7 @@
                     let hit = 0;
                     const hideNode = (node) => {
                         if (!node || node === document.body || node === document.documentElement) return false;
-                        if (UIManager.isProtectedElement(node)) return false;
+                        if (ProtectedCheck.isProtected(node)) return false;
                         if (node.style.display === 'none') return false;
                         BlockEngine.hideElement(node);
                         this._previewAffectedElements.push({ el: node });
@@ -6195,7 +6389,7 @@
                     try {
                         document.querySelectorAll(text).forEach(el => {
                             if (!el || el.style.display === 'none') return;
-                            if (UIManager.isProtectedElement(el)) return;
+                            if (ProtectedCheck.isProtected(el)) return;
                             this._previewAffectedElements.push({ el });
                             BlockEngine.hideElement(el); // 统一 4 属性口径(冗余-5)
                         });
@@ -6293,6 +6487,19 @@
             panel.querySelector('#btn-save-regex').addEventListener('click', () => {
                 const mode = modeSelect.value;
 
+                if (mode === 'iframeBlock') {
+                    const domain = panel.querySelector('#iframe-domain-input').value.trim().toLowerCase();
+                    if (!domain) { this.showToast('校验失败：请输入要拦截的 iframe 域名。', 'warning'); return; }
+                    if (!/^[a-z0-9.\-]+$/.test(domain)) { this.showToast('校验失败：域名格式无效（仅允许字母、数字、点和横线）。', 'error'); return; }
+                    const added = storage.addIframeRule({ matchType: 'srcDomain', value: domain });
+                    if (!added) { this.showToast('该域名已存在 iframeBlock 规则，已跳过重复添加。', 'info'); return; }
+                    IframeGuard._iframeBlockRules = null;
+                    EventBus.emit('rule:changed', { type: 'iframeBlock' });
+                    this.showToast(`已添加 iframe 拦截规则：${domain}`, 'success');
+                    this.clearPanel();
+                    return;
+                }
+
                 if (mode === 'path') {
                     const text = panel.querySelector('#path-input').value.trim();
                     if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
@@ -6364,6 +6571,19 @@
                     BlockEngine.applyRegexRules();
                 }
 
+                if (mode === 'iframeBlock') {
+                    const domain = panel.querySelector('#iframe-domain-input').value.trim().toLowerCase();
+                    if (!domain) { this.showToast('校验失败：请输入要拦截的 iframe 域名。', 'warning'); return; }
+                    if (!/^[a-z0-9.\-]+$/.test(domain)) { this.showToast('校验失败：域名格式无效（仅允许字母、数字、点和横线）。', 'error'); return; }
+                    const added = storage.addIframeRule({ matchType: 'srcDomain', value: domain });
+                    if (!added) { this.showToast('该域名已存在 iframeBlock 规则，已跳过重复添加。', 'info'); return; }
+                    IframeGuard._iframeBlockRules = null;
+                    EventBus.emit('rule:changed', { type: 'iframeBlock' });
+                    this.showToast(`已添加 iframe 拦截规则：${domain}`, 'success');
+                    this.clearPanel();
+                    return;
+                }
+
                 this.clearPanel();
             });
 
@@ -6420,7 +6640,7 @@
                         const content = node.textContent || '';
                         if (isContains ? content.toLowerCase().includes(lowerText) : regex.test(content)) count++;
                     });
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
                 impacts.push({ type: 'regex', index: i, count, score: this._calcImpactScore(count) });
             });
 
@@ -6447,7 +6667,7 @@
         // 统一 querySelectorAll 计数：失败时返回 0
         _countMatches(selector) {
             let count = 0;
-            try { count = document.querySelectorAll(selector).length; } catch (e) { }
+            try { count = document.querySelectorAll(selector).length; } catch (e) { Log.warn(e.message || e); }
             return count;
         }
 
@@ -6558,6 +6778,10 @@
             let _iframeRecs = [];
             let _selectedSet = new Set();
             let _scanning = false;
+            // 扫描缓存：5s 内复用结果，避免每次打开面板都全量深扫
+            let _scanCache = null;
+            let _scanCacheTime = 0;
+            const SCAN_CACHE_TTL = 5000;
 
             // 首绘 stats（H9）
             (() => {
@@ -6591,10 +6815,19 @@
 
                 // 异步深扫，避免同步阻塞 UI
                 await new Promise(r => setTimeout(r, 10));
-                const deepResults = IframeDeepScanner.scanAll();
+
+                // 缓存命中：5s 内复用结果，避免每次打开面板都全量深扫
+                const now = Date.now();
+                let deepResults;
+                if (_scanCache && (now - _scanCacheTime) < SCAN_CACHE_TTL) {
+                    deepResults = _scanCache.results;
+                } else {
+                    deepResults = IframeDeepScanner.scanAll();
+                    _scanCache = { results: deepResults, time: now };
+                }
                 const iframeRecs = [];
                 document.querySelectorAll('iframe').forEach(iframe => {
-                    if (UIManager.isProtectedElement(iframe)) return;
+                    if (ProtectedCheck.isProtected(iframe)) return;
                     const rec = IframeGuard._ensureRecord(iframe);
                     iframeRecs.push({ iframe, rec, _idx: iframeRecs.length });
                 });
@@ -6766,7 +6999,7 @@
                         const idx = parseInt(btn.getAttribute('data-wl-del'), 10);
                         WhitelistStore.remove(idx);
                         this.showToast('已从白名单移除', 'success');
-                        try { IframeGuard.rescanAll(); } catch (err) { }
+                        try { IframeGuard.rescanAll(); } catch (err) { Log.warn(err.message || err); }
                         renderWlList();
                     });
                 });
@@ -6779,6 +7012,7 @@
             // ─── 事件绑定 ───
             panel.querySelector('#btn-iframe-scan').addEventListener('click', () => {
                 _selectedSet.clear();
+                _scanCache = null; // 清除缓存，强制重新扫描
                 renderScanList();
             });
             panel.querySelector('#btn-iframe-rescan').addEventListener('click', () => {
@@ -7168,7 +7402,7 @@
                     if (type === 'iframeBlock') {
                         const nowDisabled = storage.toggleIframeRuleDisabled(index);
                         this.showToast(nowDisabled ? '规则已禁用' : '规则已启用', nowDisabled ? 'warning' : 'success');
-                        try { IframeGuard.rescanAll(); } catch (e) { }
+                        try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
                         records = rebuildRecords();
                         renderList();
                         return;
@@ -7185,7 +7419,7 @@
                             if (targetRule && targetRule.rule?._meta === 'iframe-scan') {
                                 IframeGuard.reapplyInFrames();
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                     records = rebuildRecords();
                     renderList();
@@ -7232,7 +7466,7 @@
                     BlockEngine.reapplyAll();
                     // B4: 若是 iframe-scan 规则，同步重应用到各帧
                     if (capturedRule && capturedRule._meta === 'iframe-scan') {
-                        try { IframeGuard.reapplyInFrames(); } catch (e) { }
+                        try { IframeGuard.reapplyInFrames(); } catch (e) { Log.warn(e.message || e); }
                     }
                 }
                 // 推入撤销栈并显示带撤销按钮的 Toast（5s 内可恢复）
@@ -7338,7 +7572,7 @@
                     BlockEngine.reapplyAll();
                     // iframeBlock 规则变更需重新扫描（reapplyAll 不覆盖 iframe 扫描）
                     if (tasks.some(t => t.type === 'iframeBlock')) {
-                        try { IframeGuard.rescanAll(); } catch (e) { }
+                        try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
                     }
                     // 推入批量撤销条目（一次撤销恢复全部）
                     if (captured.length > 0) {
@@ -7481,7 +7715,7 @@
                     ruleBuckets[bucket] = {};
                     for (const domain in raw.sites) {
                         const arr = raw.sites[domain][bucket];
-                        if (Array.isArray(arr) && arr.length > 0) {
+                        if (Array.isArray(arr) && arr.length) {
                             ruleBuckets[bucket][domain] = arr.map(r => ({ ...r, type: BUCKET_TO_TYPE[bucket] }));
                         }
                     }
@@ -7752,7 +7986,7 @@
                     // 不一致-3 修复：deep=true 调用 deepScan（肤色/伪元素/沙箱解码高阶探测），
                     //              deep=false 调用 scan（快速基线），两者维度/耗时显著区分
                     oasResult = deep ? OverlayAdScanner.deepScan({ deep: true }) : OverlayAdScanner.scan();
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
                 // 以元素引用为 key 建立 OverlayAdScanner 特征索引
                 const oasMap = new Map();
                 for (const r of (oasResult.results || [])) {
@@ -7763,14 +7997,14 @@
                 const isAlreadyBlocked = (rec) => {
                     if (!rec.el) return true;
                     // 脚本自身 UI 永远视为已处理（不展示在扫描结果中）
-                    if (UIManager.isProtectedElement(rec.el)) return true;
+                    if (ProtectedCheck.isProtected(rec.el)) return true;
                     // 元素已从 DOM 移除（被脚本 remove() 或被父级移除）
                     if (!document.contains(rec.el)) return true;
                     if (rec.triggerUrl) {
                         try {
                             const h = new URL(rec.triggerUrl, location.href).hostname;
                             if (blockedDomains.has(h)) return true;
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                     // 内联隐藏（脚本封杀后打的内联样式）：扩展 visibility/opacity/pointer-events 的 important 检查
                     if (rec.el.style) {
@@ -7793,7 +8027,7 @@
                                 if (pcs.display === 'none' || pcs.visibility === 'hidden') return true;
                                 parent = parent.parentElement;
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                     // 检查元素是否匹配现有的静态/属性规则（确保持久化拦截的元素不再展示）
                     if (rec.el) {
@@ -7813,7 +8047,7 @@
                                     if (r.className && rec.el.classList.contains(r.className)) return true;
                                 }
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                     return false;
                 };
@@ -8026,7 +8260,7 @@
                     return true; // 扫描成功(BUG-9)：供深度扫描回调判断是否显示完成 Toast
                 } catch (e) {
                     scanning = false;
-                    console.error('[Pro Blocker] 覆盖层扫描失败:', e);
+                    Log.error('覆盖层扫描失败:', e);
                     this.showToast('扫描失败：' + e.message, 'error');
                     render();
                     return false; // 扫描失败：避免回调再显示矛盾的"深度扫描完成"Toast
@@ -8061,7 +8295,7 @@
                     const r = records[idx];
                     if (!r || !r.el || !document.contains(r.el)) return;
                     // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过
-                    if (UIManager.isProtectedElement(r.el)) return;
+                    if (ProtectedCheck.isProtected(r.el)) return;
                     if (r.el.style.display !== 'none') {
                         // 统一隐藏口径(5.2 节)
                         BlockEngine.hideElement(r.el);
@@ -8071,7 +8305,7 @@
                         try {
                             const u = new URL(r.triggerUrl, location.href);
                             if (u.hostname !== window.location.hostname) this._overlayPreview.hiddenDomains.add(u.hostname);
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                 });
                 // ③ 勾选域名时，同步预览全页该域名资源的隐藏效果（与正式拦截同口径）
@@ -8120,7 +8354,7 @@
                 try {
                     updatePreview();
                 } catch (err) {
-                    console.error('[Pro Blocker] 覆盖层预览失败:', err);
+                    Log.error('覆盖层预览失败:', err);
                     this._overlayPreview.active = false;
                     this.showToast('预览失败：' + err.message, 'error');
                     return;
@@ -8146,7 +8380,7 @@
                     const r = records[idx];
                     if (!r || !r.el || !document.contains(r.el)) return;
                     // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）绝不拦截，否则所有面板都会消失
-                    if (UIManager.isProtectedElement(r.el)) {
+                    if (ProtectedCheck.isProtected(r.el)) {
                         skippedSelfUI++;
                         return;
                     }
@@ -8183,7 +8417,7 @@
                                 ruleCount++;
                             }
                         }
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                     // 仅在勾选「封杀域名」时收集跨域跳转域名（去重）
                     if (blockDomainToo && r.triggerUrl) {
                         try {
@@ -8191,7 +8425,7 @@
                             if (u.hostname !== window.location.hostname) {
                                 domainsToBlock.add(u.hostname);
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }
                 });
                 // 循环内 addRule 均用 skipApply=true 跳过，此处统一重建一次样式表(冗余-2)
@@ -8322,7 +8556,7 @@
             this._hidePreviewBanner();
             // B7 修复：iframe EventBus 退订
             if (this._iframeUnsubs) {
-                this._iframeUnsubs.forEach(u => { try { u(); } catch (e) { } });
+                this._iframeUnsubs.forEach(u => { try { u(); } catch (e) { Log.warn(e.message || e); } });
                 this._iframeUnsubs = null;
             }
 
@@ -8340,9 +8574,9 @@
 
     // ================= iframe 防线模块（v2.0 动态 iframe 广告拦截） =================
     // 依据《动态 iframe 广告拦截完整重构方案 v2.0》实现：
-    //   EventBus · WhitelistStore · ContentClassifier · FrameMessenger · MessageGuard · IframeGuard
+    //   FrameDetector · EventBus · WhitelistStore · ContentClassifier · FrameMessenger · MessageGuard · IframeGuard
     // 设计原则：正文保护铁律（§2.1）+ 帧内自治 + 顶层仲裁双层决策（§1.2③）
-    // 所有新模块以独立对象挂载，不拆分已有 BlockEngine/UIManager，降低回归风险
+    // 模块依赖：FrameDetector（帧发现）→ IframeGuard（分类决策）
 
     // ─── EventBus：模块解耦核心（§11.2 事件清单） ───
     // 同层模块通过事件通信，下层不引用上层，避免循环依赖
@@ -8353,9 +8587,135 @@
             this._handlers.get(event).add(handler);
             return () => { this._handlers.get(event) && this._handlers.get(event).delete(handler); };
         },
+        off(event, handler) {
+            const handlers = this._handlers.get(event);
+            if (handlers) handlers.delete(handler);
+        },
         emit(event, data) {
             const handlers = this._handlers.get(event);
-            if (handlers) handlers.forEach(h => { try { h(data); } catch (e) { } });
+            if (handlers) handlers.forEach(h => { try { h(data); } catch (e) { Log.warn(e.message || e); } });
+        }
+    };
+
+    // ─── FrameDetector：iframe 发现与同域判定（§4.1 FrameDetect） ───
+    // 职责：监听 iframe 创建/插入、URL 解析、同域判断、事件分发
+    // 依赖：无（底层模块）
+    // 事件：frame:new · frame:sameOrigin · frame:differentOrigin
+    const FrameDetector = {
+        _observer: null,
+        _interactionTime: 0,
+
+        init() {
+            this._hookCreateElement();
+            this._startObserver();
+            this._trackInteractions();
+        },
+
+        // §7.1 创建时拦截：Hook document.createElement
+        _hookCreateElement() {
+            const orig = document.createElement;
+            const self = this;
+            const hooked = function (tagName) {
+                const el = orig.apply(this, arguments);
+                if (typeof tagName === 'string' && tagName.toLowerCase() === 'iframe') {
+                    // 延迟检测：src 可能在此之后才设置
+                    self._observeIframeSrc(el);
+                }
+                return el;
+            };
+            if (!document.createElement.__proBlockerHooked) {
+                document.createElement = hooked;
+                document.createElement.__proBlockerHooked = true;
+            }
+        },
+
+        // 监听 iframe src/srcdoc 设置：属性变更后触发 frame:new 事件
+        _observeIframeSrc(iframe) {
+            if (iframe.__proBlockerIframeObserved) return;
+            iframe.__proBlockerIframeObserved = true;
+            const self = this;
+            try {
+                const obs = new MutationObserver(() => {
+                    if (iframe.src || iframe.srcdoc) {
+                        self._emitFrameEvent(iframe);
+                        obs.disconnect();
+                    }
+                });
+                obs.observe(iframe, { attributes: true, attributeFilter: ['src', 'srcdoc'] });
+                // 超时兜底——iframe 创建后 30s 未设 src 则断开 observer，防止 GC 泄漏
+                setTimeout(() => { try { obs.disconnect(); } catch (e) { Log.warn(e.message || e); } }, 30000);
+            } catch (e) { Log.warn(e.message || e); }
+        },
+
+        // MutationObserver 监听 DOM 中新增 iframe
+        _startObserver() {
+            this._observer = new MutationObserver(mutations => {
+                for (let i = 0; i < mutations.length; i++) {
+                    const added = mutations[i].addedNodes;
+                    for (let j = 0; j < added.length; j++) {
+                        const node = added[j];
+                        if (node.nodeType !== 1) continue;
+                        if (node.tagName === 'IFRAME') {
+                            this._emitFrameEvent(node);
+                        } else if (node.querySelectorAll) {
+                            try {
+                                node.querySelectorAll('iframe').forEach(f => this._emitFrameEvent(f));
+                            } catch (e) { Log.warn(e.message || e); }
+                        }
+                    }
+                }
+            });
+            this._observer.observe(document.documentElement, { childList: true, subtree: true });
+        },
+
+        // 记录用户交互时间，用于「创建时机在用户交互后 300ms 内」评分
+        _trackInteractions() {
+            const record = () => { this._interactionTime = Date.now(); };
+            ['click', 'mousedown', 'touchstart', 'keydown'].forEach(evt => {
+                document.addEventListener(evt, record, { capture: true, passive: true });
+            });
+        },
+
+        // 统一触发 frame 事件并分发
+        _emitFrameEvent(iframe) {
+            if (!iframe || iframe.nodeType !== 1) return;
+            const src = iframe.src || '';
+            const sameOrigin = this._isSameOrigin(iframe);
+            EventBus.emit('frame:new', { iframe, src, sameOrigin, interactionTime: this._interactionTime });
+            if (sameOrigin) {
+                EventBus.emit('frame:sameOrigin', { iframe, src });
+            } else {
+                EventBus.emit('frame:differentOrigin', { iframe, src });
+            }
+        },
+
+        // 同域判断：try-catch 是最可靠的运行时方式
+        _isSameOrigin(iframe) {
+            try {
+                const src = iframe.src || '';
+                if (!src || src === 'about:blank') return true;
+                const iframeURL = new URL(src, window.location.href);
+                return iframeURL.origin === window.location.origin;
+            } catch (e) {
+                return false;
+            }
+        },
+
+        // 获取用户最近交互时间
+        getInteractionTime() { return this._interactionTime; },
+
+        // 首次全量扫描已有 iframe
+        scanAll() {
+            try {
+                document.querySelectorAll('iframe').forEach(f => this._emitFrameEvent(f));
+            } catch (e) { Log.warn(e.message || e); }
+        },
+
+        destroy() {
+            if (this._observer) {
+                this._observer.disconnect();
+                this._observer = null;
+            }
         }
     };
 
@@ -8378,14 +8738,14 @@
                 const entry = list[i];
                 // 选择器匹配
                 if (entry.selector && iframe.matches) {
-                    try { if (iframe.matches(entry.selector)) return true; } catch (e) { }
+                    try { if (iframe.matches(entry.selector)) return true; } catch (e) { Log.warn(e.message || e); }
                 }
                 // 域名精确匹配（含子域）
                 if (entry.domain && iframe.src) {
                     try {
                         const host = new URL(iframe.src).hostname;
                         if (host === entry.domain || host.endsWith('.' + entry.domain)) return true;
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 }
             }
             return false;
@@ -8430,13 +8790,13 @@
             try {
                 const text = doc.body ? (doc.body.innerText || '') : '';
                 if (text.length > 200) { score += 40; reasons.push('text>200'); }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // 含语义标签 article/p/h1~h6/main: +25
             try {
                 if (doc.querySelector && doc.querySelector('article,p,h1,h2,h3,h4,h5,h6,main')) {
                     score += 25; reasons.push('semantic');
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // iframe src 与当前页同主域: +15
             if (iframe && iframe.src) {
                 try {
@@ -8447,7 +8807,7 @@
                         topHost.endsWith('.' + iframeHost)) {
                         score += 15; reasons.push('same-origin-domain');
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             // iframe 面积占视口 30%~90%: +10（B1：使用冻结值）
             if (iframe) {
@@ -8459,7 +8819,7 @@
                         const ratio = (rect.width * rect.height) / (vw * vh);
                         if (ratio >= 0.3 && ratio <= 0.9) { score += 10; reasons.push('area 30-90%'); }
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             // iframe 有 id 或 name 含 content/main/article/body: +10
             if (iframe) {
@@ -8471,7 +8831,7 @@
                 try {
                     const opacity = frozen ? frozen.opacity : parseFloat(window.getComputedStyle(iframe).opacity);
                     if (opacity < 0.05) { score -= 20; reasons.push('transparent'); }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             // position:fixed 且覆盖 > 70% 视口: -30（B1：使用冻结值）
             if (iframe) {
@@ -8486,7 +8846,7 @@
                             if (ratio > 0.7) { score -= 30; reasons.push('fixed overlay'); }
                         }
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             // iframe src 域名在广告黑名单: -25
             if (iframe && iframe.src) {
@@ -8495,7 +8855,7 @@
                     if (host !== window.location.hostname && BlockEngine.hostnameBlocked(host, BlockEngine.getDomainSet())) {
                         score -= 25; reasons.push('src in blacklist');
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             return { score, reasons };
         },
@@ -8512,14 +8872,14 @@
                     if (host !== window.location.hostname && BlockEngine.hostnameBlocked(host, BlockEngine.getDomainSet())) {
                         score += 35; reasons.push('src blacklisted');
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             // src 域名含广告关键词: +25
             if (iframe.src) {
                 try {
                     const host = new URL(iframe.src).hostname;
                     if (isAdKeywordHost(host)) { score += 25; reasons.push('ad keyword host'); }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
             // 透明/隐藏但仍可点击: +25（B1：使用冻结值）
             try {
@@ -8529,7 +8889,7 @@
                 if ((opacity < 0.1 || visibility === 'hidden') && pointerEvents !== 'none') {
                     score += 25; reasons.push('hidden but clickable');
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // position:fixed/absolute + z-index > 999: +20（B1：使用冻结值）
             try {
                 const pos = frozen ? frozen.position : window.getComputedStyle(iframe).position;
@@ -8537,7 +8897,7 @@
                 if ((pos === 'fixed' || pos === 'absolute') && zi > 999) {
                     score += 20; reasons.push('fixed/abs z>999');
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // 面积 > 视口 60% 且无实质文本: +15（B1：使用冻结值）
             try {
                 const rect = frozen ? { width: frozen.w, height: frozen.h } : iframe.getBoundingClientRect();
@@ -8548,9 +8908,9 @@
                     const textLen = doc && doc.body ? (doc.body.innerText || '').length : 0;
                     if (ratio > 0.6 && textLen < 50) { score += 15; reasons.push('large area no text'); }
                 }
-            } catch (e) { }
-            // 创建时机在用户交互后 300ms 内: +15（IframeGuard 记录 _lastInteraction）
-            if (IframeGuard._lastInteraction && Date.now() - IframeGuard._lastInteraction < 300) {
+            } catch (e) { Log.warn(e.message || e); }
+            // 创建时机在用户交互后 300ms 内: +15（FrameDetector 记录交互时间）
+            if (FrameDetector._interactionTime && Date.now() - FrameDetector._interactionTime < 300) {
                 score += 15; reasons.push('post-interaction');
             }
             // srcdoc 内含广告关键词: +10
@@ -8597,11 +8957,11 @@
                 if (selfHost && BlockEngine.hostnameBlocked(selfHost, BlockEngine.getDomainSet())) {
                     score += 35; reasons.push('self blacklisted');
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // src 域名含广告关键词: +25
             if (selfHost && isAdKeywordHost(selfHost)) { score += 25; reasons.push('ad keyword host'); }
             // 创建时机在用户交互后 300ms 内: +15
-            if (IframeGuard._lastInteraction && Date.now() - IframeGuard._lastInteraction < 300) {
+            if (FrameDetector._interactionTime && Date.now() - FrameDetector._interactionTime < 300) {
                 score += 15; reasons.push('post-interaction');
             }
             // 正文分 > 50: -50（有正文则大幅降低广告判定）
@@ -8649,7 +9009,7 @@
                     hostname: window.location.hostname,
                     ...payload
                 }, targetOrigin);
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         }
     };
 
@@ -8713,7 +9073,7 @@
                             if (host !== window.location.hostname && BlockEngine.hostnameBlocked(host, BlockEngine.getDomainSet())) {
                                 suspicious = true; reason = 'blacklisted url in msg'; break;
                             }
-                        } catch (err) { }
+                        } catch (err) { Log.warn(err.message || err); }
                     }
                 }
                 if (suspicious) {
@@ -8721,7 +9081,7 @@
                     if (this._log.length > this._maxLog) this._log.length = this._maxLog;
                     EventBus.emit('message:suspicious', { origin: e.origin, reason });
                 }
-            } catch (err) { }
+            } catch (err) { Log.warn(err.message || err); }
         }
     };
 
@@ -8741,12 +9101,12 @@
                     try {
                         const doc = iframe.contentDocument;
                         if (!doc || !doc.documentElement) return;
-                        const frameHost = iframe.src ? (() => { try { return new URL(iframe.src).hostname; } catch (e) { return ''; } })() : window.location.hostname;
+                        const frameHost = iframe.src ? safeURLHostname(iframe.src) : window.location.hostname;
                         const elResults = this.scanFrame(iframe, doc, frameHost, [], 0);
                         results.push(...elResults);
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 });
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             return results;
         },
 
@@ -8766,7 +9126,7 @@
                                 const r = this._classifyElement(el, doc, iframe, frameHost, chain, depth, 'domain-ad');
                                 if (r) results.push(r);
                             });
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     });
                 }
 
@@ -8783,7 +9143,7 @@
                             }
                         });
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
 
                 // 3. H3+H4 修复：overlay 结果直接 _buildRecord 透传 suspicion（不二次过滤）
                 // 删除 OverlayAdScanner.deepScan 整段（H3 性能灾难：顶层文档+每帧重复跑 Canvas 肤色采样）
@@ -8803,7 +9163,7 @@
                             }
                         });
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
 
                 // 5. 递归处理嵌套 iframe
                 try {
@@ -8814,14 +9174,14 @@
                         // 同时处理内嵌 iframe 自身的分类
                         IframeGuard._classifyAndAct(inner, depth + 1);
                     });
-                } catch (e) { }
-            } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
+            } catch (e) { Log.warn(e.message || e); }
             return results;
         },
 
         // 对帧内元素进行分类判定
         _classifyElement(el, doc, iframe, frameHost, chain, depth, baseCategory) {
-            if (!el || UIManager.isProtectedElement(el)) return null;
+            if (!el || ProtectedCheck.isProtected(el)) return null;
             if (el.style.display === 'none') return null;
 
             const rect = el.getBoundingClientRect();
@@ -8834,7 +9194,7 @@
             let category = baseCategory;
 
             // 基于 class/id/文本命名可疑度
-            const cls = (el.className || '').toString().toLowerCase();
+            const cls = (el.className || '').toLowerCase();
             const id = (el.id || '').toLowerCase();
             const text = (el.textContent || '').trim().slice(0, 100);
             if (/(?:^|\s)(?:ad|ads|advert|banner|popup|overlay|promo|sponsor|skyscraper|leaderboard|native)[\w-]*\s*/.test(cls)) {
@@ -8858,7 +9218,7 @@
                     if (isAdKeywordHost(u.hostname)) {
                         suspicion += 25; reasons.push('src ad keyword host'); adDomains.push(u.hostname);
                     }
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
 
             // 几何特征
@@ -8911,11 +9271,9 @@
     // 职责：发现 iframe → 分类 → 拦截纯广告 / 清理内容帧内部广告 / 保护白名单
     // 正文保护铁律（§2.1）在 _handleAdNode 中强制执行
     const IframeGuard = {
-        _observer: null,
         _processedIframes: new WeakSet(),
         _stats: { blocked: 0, protected: 0, scanned: 0, cleaned: 0 },
         _maxDepth: 3,
-        _lastInteraction: 0,
         _init: false,
         _iframeBlockRules: null, // iframeBlock 规则缓存
         // B1 修复：帧记录单一数据源——冻结几何测量，防止「测量-动作耦合」导致分数不一致+振荡
@@ -8927,21 +9285,17 @@
             if (this._init) return;
             this._init = true;
             this._loadConfig();
-            this._hookCreateElement();
-            this._startObserver();
-            this._trackInteractions();
+            // 订阅 FrameDetector 事件（§4.2 帧发现→分类）
+            EventBus.on('frame:new', ({ iframe }) => {
+                this._handleNewIframe(iframe);
+            });
             // 监听规则变更
             EventBus.on('rule:changed', () => { this._iframeBlockRules = null; });
             // BUG-FIX: 注册 frame:report 处理器——子帧上报分类结果后重新评估对应 iframe
             // 此前 frame:report 事件无消费者，跨域帧双层决策模型完全断裂
             EventBus.on('frame:report', (payload) => { this._handleFrameReport(payload); });
-            // 首次扫描
-            if (document.body) {
-                this.scanAll();
-            } else {
-                // body 未就绪，等 DOMContentLoaded
-                document.addEventListener('DOMContentLoaded', () => this.scanAll());
-            }
+            // 首次扫描（FrameDetector 已启动，触发全量 frame:new 事件）
+            FrameDetector.scanAll();
         },
 
         // B1 修复：确保帧记录存在，冻结首次测量的几何值
@@ -8954,7 +9308,7 @@
                 try {
                     cs = window.getComputedStyle(iframe);
                     q = iframe.getBoundingClientRect();
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
                 r = {
                     iframe,
                     frozen: {
@@ -8997,75 +9351,9 @@
             }
         },
 
-        // §7.1 创建时拦截：Hook document.createElement
-        _hookCreateElement() {
-            const orig = document.createElement;
-            const self = this;
-            const hooked = function (tagName) {
-                const el = orig.apply(this, arguments);
-                if (typeof tagName === 'string' && tagName.toLowerCase() === 'iframe') {
-                    // 延迟检测：src 可能在此之后才设置
-                    self._observeIframeSrc(el);
-                }
-                return el;
-            };
-            if (!document.createElement.__proBlockerHooked) {
-                document.createElement = hooked;
-                document.createElement.__proBlockerHooked = true;
-            }
-        },
-
-        // 监听 iframe src/srcdoc 设置：属性变更后触发分类
-        _observeIframeSrc(iframe) {
-            if (iframe.__proBlockerIframeObserved) return;
-            iframe.__proBlockerIframeObserved = true;
-            const self = this;
-            // 使用 attribute observer 监听 src/srcdoc 变更
-            try {
-                const obs = new MutationObserver(() => {
-                    if (iframe.src || iframe.srcdoc) {
-                        self._handleNewIframe(iframe);
-                        obs.disconnect();
-                    }
-                });
-                obs.observe(iframe, { attributes: true, attributeFilter: ['src', 'srcdoc'] });
-                // BUG-FIX: 超时兜底——iframe 创建后 30s 未设 src 则断开 observer，防止 GC 泄漏
-                setTimeout(() => { try { obs.disconnect(); } catch (e) { } }, 30000);
-            } catch (e) { }
-        },
-
-        _startObserver() {
-            this._observer = new MutationObserver(mutations => {
-                for (let i = 0; i < mutations.length; i++) {
-                    const added = mutations[i].addedNodes;
-                    for (let j = 0; j < added.length; j++) {
-                        const node = added[j];
-                        if (node.nodeType !== 1) continue;
-                        if (node.tagName === 'IFRAME') {
-                            this._handleNewIframe(node);
-                        } else if (node.querySelectorAll) {
-                            try {
-                                node.querySelectorAll('iframe').forEach(f => this._handleNewIframe(f));
-                            } catch (e) { }
-                        }
-                    }
-                }
-            });
-            this._observer.observe(document.documentElement, { childList: true, subtree: true });
-        },
-
-        _trackInteractions() {
-            // 记录用户交互时间，用于「创建时机在用户交互后 300ms 内」评分
-            const record = () => { this._lastInteraction = Date.now(); };
-            ['click', 'mousedown', 'touchstart', 'keydown'].forEach(evt => {
-                document.addEventListener(evt, record, { capture: true, passive: true });
-            });
-        },
-
+        // 首次全量扫描（委托给 FrameDetector）
         scanAll() {
-            try {
-                document.querySelectorAll('iframe').forEach(f => this._handleNewIframe(f));
-            } catch (e) { }
+            FrameDetector.scanAll();
         },
 
         // 规则变更后重新评估所有 iframe（包括已处理的）：清除 WeakSet 后全量重扫
@@ -9079,7 +9367,7 @@
                 this._frameRecords = keep;
                 this._frameMutObs = new WeakMap();
                 this.scanAll();
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         },
 
         // H7 修复：强制重扫同样保留粘性记录
@@ -9091,14 +9379,14 @@
                 this._frameRecords = keep;
                 this._frameMutObs = new WeakMap();
                 this.scanAll();
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         },
 
         _handleNewIframe(iframe) {
             if (!iframe || iframe.nodeType !== 1) return;
             if (this._processedIframes.has(iframe)) return;
             // 保护脚本自身 UI
-            if (UIManager.isProtectedElement(iframe)) return;
+            if (ProtectedCheck.isProtected(iframe)) return;
             this._processedIframes.add(iframe);
             // B1 修复：stats 统一通过 _incStat 计数 + EventBus 发射
             this._incStat('scanned');
@@ -9120,7 +9408,7 @@
         _classifyAndAct(iframe, depth) {
             if (depth > this._maxDepth) return;
             if (!iframe.isConnected) return; // iframe 已脱离 DOM
-            if (UIManager.isProtectedElement(iframe)) return;
+            if (ProtectedCheck.isProtected(iframe)) return;
 
             // B1 修复：单一数据源——所有判定基于 _ensureRecord 的冻结测量
             const rec = this._ensureRecord(iframe);
@@ -9179,7 +9467,7 @@
                     try {
                         const host = new URL(iframe.src).hostname;
                         if (host === r.value || host.endsWith('.' + r.value)) return true;
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                 }
                 if (r.matchType === 'srcdocKeyword' && r.value && iframe.srcdoc) {
                     if (iframe.srcdoc.toLowerCase().includes(r.value.toLowerCase())) return true;
@@ -9254,7 +9542,7 @@
                             doc.querySelectorAll(sel).forEach(el => {
                                 this._handleAdNode(el, doc);
                             });
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     });
                 }
                 // 递归处理嵌套 iframe（§7.2 深度控制）
@@ -9262,8 +9550,8 @@
                     doc.querySelectorAll('iframe').forEach(inner => {
                         this._classifyAndAct(inner, depth + 1);
                     });
-                } catch (e) { }
-            } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
+            } catch (e) { Log.warn(e.message || e); }
             // B10: 为同源帧设置子帧 MutationObserver，2s 去抖补报动态元素
             this._observeFrameChildren(iframe, depth);
         },
@@ -9294,17 +9582,17 @@
                                 newIf.forEach(f => this._classifyAndAct(f, depth + 1));
                                 reportCount++;
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     }, 2000);
                 });
                 observer.observe(doc.documentElement, { childList: true, subtree: true });
                 this._frameMutObs.set(iframe, observer);
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         },
 
         // 正文保护判定（§5.2）：有正文 → 仅删广告节点，不动容器
         _handleAdNode(node, doc) {
-            if (!node || UIManager.isProtectedElement(node)) return;
+            if (!node || ProtectedCheck.isProtected(node)) return;
             // 找最近的包裹容器
             const container = BlockEngine.findSingleChildWrapper(node, 4);
             let containerText = '';
@@ -9312,7 +9600,7 @@
             try {
                 containerText = (container.innerText || container.textContent || '');
                 hasSemantic = !!(container.querySelector && container.querySelector('article,main,p,h1,h2,h3,h4,h5,h6'));
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             // 铁律2：有正文 → 只删广告节点，不动容器
             if (containerText.length > 200 || hasSemantic) {
                 BlockEngine.hideElement(node);
@@ -9334,13 +9622,13 @@
 
             // 1. 域名封杀（全局域规则）
             if (rec.adDomains && rec.adDomains.length > 0) {
-                try { DomainBlockExecutor.execute(rec.adDomains, { hideMode: 'none' }); } catch (e) { }
+                try { DomainBlockExecutor.execute(rec.adDomains, { hideMode: 'none' }); } catch (e) { Log.warn(e.message || e); }
             }
 
             // 2. H14 修复：用 generateOptimalSelector 生成精准选择器，避免 tag+2class 过宽误伤
             let selector = rec.selector;
             if (!selector && rec.el) {
-                try { selector = BlockEngine.generateOptimalSelector(rec.el); } catch (e) { }
+                try { selector = BlockEngine.generateOptimalSelector(rec.el); } catch (e) { Log.warn(e.message || e); }
             }
             if (selector && !rec.crossOrigin && rec.frameHost) {
                 try {
@@ -9349,11 +9637,11 @@
                         type: 'attribute',
                         _meta: 'iframe-scan'
                     });
-                } catch (e) { }
+                } catch (e) { Log.warn(e.message || e); }
             }
 
             // 3. 即时隐藏
-            try { BlockEngine.hideElement(rec.el); } catch (e) { }
+            try { BlockEngine.hideElement(rec.el); } catch (e) { Log.warn(e.message || e); }
 
             // 4. 更新 record
             rec.blocked = true;
@@ -9370,7 +9658,7 @@
                     try { doc = iframe.contentDocument; } catch (e) { return; }
                     if (!doc) return;
                     // H5 修复：用 hostname 与 domain 比较，而非完整 URL
-                    const host = (() => { try { return new URL(iframe.src).hostname; } catch (e) { return ''; } })();
+                    const host = safeURLHostname(iframe.src);
                     if (!host) return;
                     // 1. 先恢复所有帧内 inline 隐藏（清除旧规则覆盖的 display:none）
                     doc.querySelectorAll('*').forEach(el => {
@@ -9384,13 +9672,13 @@
                         try {
                             if (r.rule && r.rule.attrSelector && !r.rule._disabled) {
                                 doc.querySelectorAll(r.rule.attrSelector).forEach(el => {
-                                    if (!UIManager.isProtectedElement(el)) BlockEngine.hideElement(el);
+                                    if (!ProtectedCheck.isProtected(el)) BlockEngine.hideElement(el);
                                 });
                             }
-                        } catch (e) { }
+                        } catch (e) { Log.warn(e.message || e); }
                     });
                 });
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         },
 
         // B4 新增：白名单零输入——行内保护
@@ -9400,7 +9688,7 @@
             const selector = rec.selector || (rec.el.id ? '#' + rec.el.id : '');
             WhitelistStore.add({ selector, domain: frameHost, reason: 'scan-pick' });
             // 恢复被隐藏的元素
-            try { BlockEngine.showElement(rec.el); } catch (e) { }
+            try { BlockEngine.showElement(rec.el); } catch (e) { Log.warn(e.message || e); }
             const r = IframeGuard._ensureRecord(rec.iframe || rec.el.closest('iframe'));
             if (r) r.manual = true;
             EventBus.emit('iframe:protected', { record: rec, reason: 'whitelist-pick' });
@@ -9416,10 +9704,10 @@
             try {
                 const iframes = document.querySelectorAll('iframe');
                 iframes.forEach(iframe => {
-                    if (UIManager.isProtectedElement(iframe)) return;
+                    if (ProtectedCheck.isProtected(iframe)) return;
                     const rect = iframe.getBoundingClientRect();
                     let cs = null;
-                    try { cs = window.getComputedStyle(iframe); } catch (e) { }
+                    try { cs = window.getComputedStyle(iframe); } catch (e) { Log.warn(e.message || e); }
                     const record = {
                         el: iframe,
                         src: iframe.src || '',
@@ -9447,7 +9735,7 @@
                             record.reasons = record.reasons.slice(0, 4).concat(['+ ' + (result.reasons.length - 4) + ' more']);
                         }
                         if (result.verdict !== 'unknown') record.verdict = result.verdict;
-                    } catch (e) { }
+                    } catch (e) { Log.warn(e.message || e); }
                     // 跨域检测
                     try {
                         const doc = iframe.contentDocument;
@@ -9455,7 +9743,7 @@
                     } catch (e) { record.crossOrigin = true; }
                     results.push(record);
                 });
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
             return results;
         },
 
@@ -9487,7 +9775,7 @@
                     // unknown：不干预，继续监听
                     return;
                 }
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         }
     };
 
@@ -9499,17 +9787,19 @@
     try {
         const _blockedDomains = storage.getDomainBlocks().map(r => r.domain);
         OverlayAdScanner.enableNavigationInterceptor(_blockedDomains);
-    } catch (e) { }
+    } catch (e) { Log.warn(e.message || e); }
     // Shadow DOM 穿透须在页面脚本调用 attachShadow 前完成代理
     BlockEngine.hookAttachShadow();
     BlockEngine.fastInject();
     BlockEngine.startObserver();
 
     // ─── iframe 防线初始化（§9 启动流程） ───
+    // 帧发现引擎：最先启动，监听 iframe 创建/插入
+    FrameDetector.init();
     // 帧间通信与消息监控：所有帧（顶层 + 子帧）均需初始化
     FrameMessenger.init();
     MessageGuard.init();
-    // iframe 检测与分类：所有帧均需初始化（每帧可能含嵌套 iframe）
+    // iframe 检测与分类：订阅 FrameDetector 事件
     IframeGuard.init();
 
     // 子帧自治上报（§6.1 策略A）：子帧向父帧 postMessage 上报自身分类结果
@@ -9530,7 +9820,7 @@
                     verdict,
                     url: window.location.href
                 });
-            } catch (e) { }
+            } catch (e) { Log.warn(e.message || e); }
         };
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
             setTimeout(_reportSelf, 100);

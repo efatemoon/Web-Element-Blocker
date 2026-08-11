@@ -3,7 +3,7 @@
 ## iframe 防线 v3.0 架构要点
 
 ### 核心设计
-- **冻结测量**：`IframeGuard._ensureRecord()` 首次测量 iframe 几何值（width/height/opacity/zIndex），后续 classify 读冻结值，防「隐藏→测量归零→分数漂移→振荡」
+- **冻结测量**：`IframeGuard._ensureRecord()` 首次测量 iframe 几何值（width/height/opacity/zIndex），后续 classify 读冻结值，防「隐藏→重测→分数漂移→振荡」
 - **单一数据源**：`_frameRecords` WeakMap 持有每个 iframe 的 record，verdict/blocked/manual/counted 全部集中存储
 - **判定粘性**：`blocked || manual` 的 frame 永不自动复活（除非白名单）
 - **stats 首次计数**：`rec.counted` 对象确保每个 iframe 的 blocked/protected/scanned 只计数一次
@@ -68,3 +68,17 @@
 - isSafeOutermost 逻辑压缩：6 行 → 3 行
 - BUG-S1 过时注释清理
 - 语法检查通过，10 个菜单项完整
+
+## video-accelerator.user.js 深度扫描（2026-08-11）
+- 健康评分：66/100 → 68/100（C1/W9 修复后）
+- Brooks-lint 全部 MANUAL 项已修复：C1 跨域双文档守卫、W9 _evaluateStale() 死代码实现
+- 测试套件：122/122（unit）+ 50/50（core-module）= 172/172 全部通过
+- 架构优化：提取 `static _configMap`（25项）消除 3× 重复配置代码，删除透明包装 `_mount()`
+- 当前文件：4008 行
+
+## web-element-blocker.user.js 深度扫描 v3.0（2026-08-11）
+- 健康评分: 69/100 (C+)
+- 已修复: 空 catch 块 172→0, console 残留 19→0, UIManager 反向依赖 49→0
+- 测试套件: 13 个文件, 44 个测试用例 (ad-block-test/)
+- 待修复 P0: OverlayAdScanner 4766 行需拆分, 138 魔法数字需提取常量
+- 报告: ad-block-test/HEALTH_REPORT.md
