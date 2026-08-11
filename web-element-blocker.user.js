@@ -6771,8 +6771,10 @@
 
             // ─── B8: 已拦截指纹（跨扫描保留） ───
             const blockedFingerprints = new WeakSet();
-            IframeGuard._frameRecords.forEach((rec) => {
-                if (rec.blocked || rec.manual) blockedFingerprints.add(rec.iframe);
+            // WeakMap 不可枚举，以 DOM 存活帧为真实来源反查记录
+            IframeGuard._liveFrames().forEach((iframe) => {
+                const rec = IframeGuard._frameRecords.get(iframe);
+                if (rec && (rec.blocked || rec.manual)) blockedFingerprints.add(iframe);
             });
             const isBlocked = (iframe) => blockedFingerprints.has(iframe);
 
@@ -8644,15 +8646,18 @@
             iframe.__proBlockerIframeObserved = true;
             const self = this;
             try {
+                let cleanupTimer = null;
                 const obs = new MutationObserver(() => {
                     if (iframe.src || iframe.srcdoc) {
                         self._emitFrameEvent(iframe);
                         obs.disconnect();
+                        // FIX-A (Brooks R6): src 已就绪则取消兜底定时器，避免 30s 空转
+                        if (cleanupTimer) clearTimeout(cleanupTimer);
                     }
                 });
                 obs.observe(iframe, { attributes: true, attributeFilter: ['src', 'srcdoc'] });
                 // 超时兜底——iframe 创建后 30s 未设 src 则断开 observer，防止 GC 泄漏
-                setTimeout(() => { try { obs.disconnect(); } catch (e) { Log.warn(e.message || e); } }, 30000);
+                cleanupTimer = setTimeout(() => { try { obs.disconnect(); } catch (e) { Log.warn(e.message || e); } }, 30000);
             } catch (e) { Log.warn(e.message || e); }
         },
 
@@ -8679,6 +8684,9 @@
 
         // 记录用户交互时间，用于「创建时机在用户交互后 300ms 内」评分
         _trackInteractions() {
+            // FIX-B (Brooks R6): 幂等保护——init() 无守卫时重复调用会叠加 4 个 document 监听器
+            if (this._interactionsTracked) return;
+            this._interactionsTracked = true;
             const record = () => { this._interactionTime = Date.now(); };
             ['click', 'mousedown', 'touchstart', 'keydown'].forEach(evt => {
                 document.addEventListener(evt, record, { capture: true, passive: true });
@@ -9286,6 +9294,8 @@
         _init: false,
         _iframeBlockRules: null, // iframeBlock 规则缓存
         // B1 修复：帧记录单一数据源——冻结几何测量，防止「测量-动作耦合」导致分数不一致+振荡
+        // 注意：WeakMap/WeakSet 按设计均不可枚举（无 forEach/迭代器）。
+        // 如需遍历记录，请用 _liveFrames() 以 DOM 为真实来源反查，切勿另建 key 集合。
         _frameRecords: new WeakMap(),
         // B10: 子帧 MutationObserver——帧内动态元素补报（≤3次）
         _frameMutObs: new WeakMap(),
@@ -9338,6 +9348,33 @@
             return r;
         },
 
+        // 枚举当前文档树中所有存活 iframe（含同源嵌套帧，深度受 _maxDepth 约束）
+        // WeakMap 不可枚举，故以 DOM 为唯一真实来源反查记录：既不持有强引用（无泄漏），
+        // 又天然跳过已脱离文档的废弃帧
+        _liveFrames(root = document, depth = 0, out = []) {
+            if (depth > this._maxDepth) return out;
+            try {
+                root.querySelectorAll('iframe').forEach(f => {
+                    out.push(f);
+                    try {
+                        const doc = f.contentDocument;
+                        if (doc) this._liveFrames(doc, depth + 1, out);
+                    } catch (e) { /* 跨域帧 contentDocument 不可访问，属预期情况 */ }
+                });
+            } catch (e) { Log.warn(e.message || e); }
+            return out;
+        },
+
+        // H7 修复：挑出粘性记录（blocked/manual）迁移到新 WeakMap，防止重扫后手动拦截复活
+        _keepStickyRecords() {
+            const keep = new WeakMap();
+            this._liveFrames().forEach(iframe => {
+                const rec = this._frameRecords.get(iframe);
+                if (rec && (rec.blocked || rec.manual)) keep.set(iframe, rec);
+            });
+            return keep;
+        },
+
         // B1 修复：统一 stats 计数口径——首次计数 + EventBus 发射实时看板
         _incStat(k, n = 1) {
             this._stats[k] = (this._stats[k] || 0) + n;
@@ -9370,25 +9407,15 @@
         rescanAll() {
             try {
                 this._processedIframes = new WeakSet();
-                // H7 修复：保留粘性记录迁移到新 WeakMap
-                const keep = new WeakMap();
-                this._frameRecords.forEach((v, k) => { if (v.blocked || v.manual) keep.set(k, v); });
-                this._frameRecords = keep;
+                this._frameRecords = this._keepStickyRecords();
                 this._frameMutObs = new WeakMap();
                 this.scanAll();
             } catch (e) { Log.warn(e.message || e); }
         },
 
-        // H7 修复：强制重扫同样保留粘性记录
+        // H7 修复：强制重扫语义与 rescanAll 完全一致，保留独立入口供外部调用
         forceRescan() {
-            try {
-                this._processedIframes = new WeakSet();
-                const keep = new WeakMap();
-                this._frameRecords.forEach((v, k) => { if (v.blocked || v.manual) keep.set(k, v); });
-                this._frameRecords = keep;
-                this._frameMutObs = new WeakMap();
-                this.scanAll();
-            } catch (e) { Log.warn(e.message || e); }
+            this.rescanAll();
         },
 
         _handleNewIframe(iframe) {
@@ -9578,6 +9605,8 @@
                 let debounceTimer = null; // H13 修复：存 timer，2s 去抖
                 const observer = new MutationObserver((mutations) => {
                     if (reportCount >= maxReports) {
+                        // FIX-C (Brooks R6): 达到上报上限时清除待执行的去抖定时器，避免空转
+                        clearTimeout(debounceTimer);
                         observer.disconnect();
                         return;
                     }

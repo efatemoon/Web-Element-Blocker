@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      19.0.4
+// @version      3.0.0
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -87,6 +87,8 @@
         IGNORE_MATCH_PENALTY: 80,        // 命中站点忽略选择器惩罚
         AD_LIKE_SHORT_PENALTY: 18,       // 疑似广告短视频（短+静音+循环）惩罚
         TAKEOVER_SCORE: 70,              // 触发接管的评分阈值（须 > STANDBY_SCORE）
+        MIN_VIDEO_AREA_DEFAULT: 8000,    // minVideoArea 默认值（像素²，约 100×80）
+        MIN_VIDEO_AREA_MAX: 100000000,   // minVideoArea 上限（像素²，10000×10000），防配置损坏
         ARBITER_COOLDOWN_MS: 2000,       // 接管决策冷却（防止同一视频频繁接管，毫秒）
         // 以下缓冲/保活阈值，单独放在 VA_BUFFER 子对象，避免 VA_TUNING 过长
     };
@@ -356,7 +358,7 @@
                 fastDetect: true,
                 fetchPriority: true,
                 visibleOnly: true,
-                minVideoArea: 8000,
+                minVideoArea: VA_TUNING.MIN_VIDEO_AREA_DEFAULT,
 
                 protoHook: true,
                 earlyPointer: true,
@@ -419,7 +421,9 @@
             c.recoveryBudget = clamp(parseInt(c.recoveryBudget, 10) || 8, 1, 20);
 
             const mva = parseInt(c.minVideoArea, 10);
-            c.minVideoArea = isNaN(mva) ? 8000 : Math.min(100000000, Math.max(0, mva));
+            c.minVideoArea = isNaN(mva)
+                ? VA_TUNING.MIN_VIDEO_AREA_DEFAULT
+                : Math.min(VA_TUNING.MIN_VIDEO_AREA_MAX, Math.max(0, mva));
 
             const levels = ['debug', 'info', 'warn', 'error'];
             if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
@@ -2371,8 +2375,10 @@
                         this._lowCount = 0;
                     }
                 }
-                // 警告区间应为「低于警告水位」（1~5s），原写法是 5~8s，
-                // 反而把 1~5s 这段更危险的缓冲落进 else 分支，完全不做预加载增强（W3）
+                // 三级水位设计：<1s 紧急恢复(L2) / <5s 轻推预加载(L1) / >8s 判定恢复正常。
+                // 5~8s 这段是刻意留出的迟滞带（hysteresis）：缓冲已足够舒适，无需再增强，
+                // 但也还没达到退出 DEGRADED 的信心水位，避免在阈值附近反复进出状态。
+                // 因此此处用 WARNING(5) 而非 RECOVER(8)——两者语义不同，不可互换。
             } else if (ahead < VA_BUFFER.BUFFER_LEVEL_WARNING && !v.paused && !this.isSeeking) {
                 Bus.emit('BUFFER_LOW', { session: this, level: 1, ahead: ahead });
 
@@ -3568,13 +3574,24 @@
                         }
                     }
                 });
-                observer.observe(document.documentElement || document.body, {
+                // 树观察：只关心节点增删（拦截器把 UI 包进隐藏容器 / 重新插入）。
+                // 这里刻意不开 attributes——否则整页每次 style/class 变更都要排队回调，
+                // 在 SPA 与广告密集页上是显著的性能负担。
+                observer.observe(DOC.documentElement || DOC.body, {
                     childList: true,
-                    subtree: true,
-                    attributes: true,
-                    attributeFilter: ['style', 'class']
+                    subtree: true
                 });
-            } catch (e) { }
+                // 属性观察：只钉在 host 自身，精确覆盖「拦截器直接给已挂载 host 设
+                // display:none」这一场景（W9），代价与页面规模无关。
+                if (this.host) {
+                    observer.observe(this.host, {
+                        attributes: true,
+                        attributeFilter: ['style', 'class']
+                    });
+                }
+            } catch (e) {
+                Logger.warn('Cross-script', '广告拦截器 UI 观察器安装失败: ' + (e && e.message ? e.message : e));
+            }
         }
 
         _subscribe() {
