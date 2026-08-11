@@ -52,7 +52,7 @@
 
     const clamp = function (n, lo, hi) { return (typeof n !== "number" || isNaN(n)) ? lo : Math.max(lo, Math.min(hi, n)); };
 
-    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv|mp3|aac)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
+    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
     const isVideoResource = function (url) { return VIDEO_RE.test(url || ''); };
 
     const isLive = function (v) {
@@ -93,6 +93,12 @@
         STALL_LOG_THROTTLE_MS: 2000,     // 停滞日志节流（毫秒）
         LOG_LINE_LIMIT: 200,             // 日志行最大数量
         USER_GESTURE_WINDOW_MS: 3000,    // 用户手势有效窗口（毫秒）
+        // Stall 分级阈值（毫秒）
+        FRAME_RECENT_WINDOW_MS: 3000,    // RVFC 帧时间窗口（毫秒）
+        STALL_LEVEL_1_MS: 1500,          // L1 卡顿判定（毫秒）
+        STALL_LEVEL_2_MS: 3000,          // L2 卡顿判定（毫秒）
+        STALL_LEVEL_3_MS: 5000,          // L3 卡顿判定（毫秒）
+        RECOVERY_TIMEOUT_MS: 15000,      // 恢复操作超时（毫秒）
     };
 
     const isVisible = function (el) {
@@ -424,21 +430,23 @@
             this.bus.emit('CONFIG_CHANGE', { key: k, value: c[k], config: c, local: true });
         }
 
-        update(patch) {
+        _applyPatch(patch, emit) {
             if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return;
             const c = this.load();
             Object.assign(c, patch);
             this._normalize();
             this.save();
-            this.bus.emit('CONFIG_CHANGE', { batch: true, config: this.load(), local: true });
+            if (emit) {
+                this.bus.emit('CONFIG_CHANGE', { batch: true, config: this.load(), local: true });
+            }
+        }
+
+        update(patch) {
+            this._applyPatch(patch, true);
         }
 
         silentUpdate(patch) {
-            if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return;
-            const c = this.load();
-            Object.assign(c, patch);
-            this._normalize();
-            this.save();
+            this._applyPatch(patch, false);
         }
 
         exportJSON() {
@@ -1419,6 +1427,7 @@
 
         _patrol() {
             if (Scheduler.isHidden()) return;
+            if (!DOC) return;
 
             try {
                 if (
@@ -1898,6 +1907,7 @@
 
             try {
                 if (
+                    typeof SessionManager !== 'undefined' &&
                     SessionManager.hasActiveSessions() &&
                     !v.__vaSession &&
                     !sig.gesture
@@ -2106,7 +2116,7 @@
                     let user = false;
 
                     if (ConfigManager.get('userIntentFirst')) {
-                        user = UserGesture.recent(VA_BUFFER.USER_GESTURE_WINDOW_MS) || (NOW() - this._lastUserGestureAt < VA_BUFFER.USER_GESTURE_WINDOW_MS);
+                        user = UserGesture.recent(VA_BUFFER.USER_GESTURE_WINDOW_MS);
                     }
 
                     if (user) {
@@ -2180,8 +2190,8 @@
             L.add(v, 'waiting', this._onWaiting);
             L.add(v, 'pause', this._onPause);
             L.add(v, 'play', this._onPlay);
-            L.add(v, 'click', this._onClick, true);
-            L.add(v, 'error', this._onError, true);
+            L.add(v, 'click', this._onClick);
+            L.add(v, 'error', this._onError);
         }
 
         _maybeAutoPlay() {
@@ -2378,7 +2388,7 @@
             }
 
             const back = this._backBuffer();
-            if (back > VA_BUFFER.BACK_BUFFER_MAX_S) Adaptor.trimBack(v, VA_TUNING.BACK_BUFFER_TRIM_S);
+            if (back > VA_BUFFER.BACK_BUFFER_MAX_S) Adaptor.trimBack(v, VA_BUFFER.BACK_BUFFER_TRIM_S);
         }
 
         _stallCheck() {
@@ -2775,6 +2785,7 @@
                     if (video.ownerDocument === DOC && Detector._viewportObs) {
                         Detector.watchViewport(video);
                     }
+                    this.seen.add(video);
                     return;
                 }
             }
@@ -3810,7 +3821,7 @@
             if (!entry) return;
 
             this._logs.push(entry);
-            if (this._logs.length > 250) this._logs.shift();
+            if (this._logs.length > VA_BUFFER.LOG_LINE_LIMIT) this._logs.shift();
 
             if (this._visible && this._matchesFilter(entry)) {
                 this._renderLogLine(entry);
@@ -4014,7 +4025,7 @@
             }
 
             const now = NOW();
-            if (now - this._lastTimelineRender > VA_TUNING.TIMELINE_RENDER_THROTTLE_MS) {
+            if (now - this._lastTimelineRender > VA_BUFFER.TIMELINE_RENDER_THROTTLE_MS) {
                 this._lastTimelineRender = now;
                 this._renderTimeline();
             }

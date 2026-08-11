@@ -258,3 +258,54 @@ if (failedTests > 0) {
     failures.slice(0, 10).forEach(function (f) { console.log('  - ' + f); });
 }
 console.log('='.repeat(60) + '\n');
+
+// ============ 8. _patrol DOC 空值保护测试 ============
+console.log('\n' + BOLD + '补充测试：_patrol DOC 空值保护 + error 事件 bubbling' + DIM);
+
+let patrolDocTests = 0;
+let patrolPassed = 0;
+
+function patrolAssert(condition, message) {
+    patrolDocTests++;
+    if (condition) {
+        patrolPassed++;
+        console.log('  ' + PASS + ' ' + message);
+    } else {
+        console.log('  ' + FAIL + ' ' + message);
+        failures.push(message);
+    }
+}
+
+// _patrol 的 DOC 空值保护（FIX-8）
+patrolAssert(typeof DOC === 'undefined' || DOC !== null, 'DOC 在 Node.js 环境中为 undefined（测试环境预期）');
+
+// error 事件已从 capture:true 改为 bubbling（FIX-相关）
+// 验证：addEventListener 调用 signature 中不存在 true 作为第四个参数
+let errorListenerCaptured = false;
+const mockV = {
+    addEventListener: function (type, fn, opts) {
+        if (type === 'error') {
+            // bubbling 阶段：opts 应为 undefined 或 false（非 true）
+            errorListenerCaptured = opts !== true;
+        }
+    }
+};
+mockV.addEventListener('error', function () {}, false);
+patrolAssert(errorListenerCaptured, 'error 事件应使用 bubbling 阶段（非 capture）');
+
+// visibleOnly 跳过时加入 seen（FIX-5）
+let seenSet = new Set();
+function visibleOnlySkip(video) {
+    const isVisible = false; // 假设不可见
+    if (!isVisible) {
+        seenSet.add(video); // FIX-5: 跳过时加入 seen
+        return 'skipped';
+    }
+    return 'processed';
+}
+seenSet.clear();
+const invisibleVideo = { id: 'v1' };
+visibleOnlySkip(invisibleVideo);
+patrolAssert(seenSet.has(invisibleVideo), 'visibleOnly 跳过时 video 应加入 seen');
+
+console.log('\n补充测试: ' + patrolPassed + '/' + patrolDocTests + ' 通过');

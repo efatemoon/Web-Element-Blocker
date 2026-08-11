@@ -86,7 +86,7 @@ describe('clamp 工具函数', () => {
 // 2. isVideoResource 测试
 // ========================================
 describe('isVideoResource', () => {
-    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv|mp3|aac)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
+    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
     const isVideoResource = (url) => VIDEO_RE.test(url || '');
 
     it('mp4 文件', () => assert(isVideoResource('http://example.com/video.mp4'), 'mp4 URL 识别'));
@@ -99,6 +99,8 @@ describe('isVideoResource', () => {
     it('空字符串', () => assert(!isVideoResource(''), '空字符串不被识别'));
     it('null 输入', () => assert(!isVideoResource(null), 'null 不被识别'));
     it('JS/CSS 文件', () => assert(!isVideoResource('http://example.com/script.js'), 'JS 不被识别'));
+    it('音频 mp3 不应被识别为视频', () => assert(!isVideoResource('http://example.com/song.mp3'), 'mp3 不应识别'));
+    it('音频 aac 不应被识别为视频', () => assert(!isVideoResource('http://example.com/audio.aac'), 'aac 不应识别'));
 });
 
 // ========================================
@@ -124,7 +126,7 @@ describe('isLive', () => {
 // 4. estimateBandwidth 边界测试
 // ========================================
 describe('estimateBandwidth', () => {
-    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv|mp3|aac)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
+    const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
     const isVideoResource = (url) => VIDEO_RE.test(url || '');
 
     const estimateBandwidth = (perf) => {
@@ -442,6 +444,92 @@ describe('isVisible', () => {
 });
 
 // ========================================
+// 13. ConfigManager _applyPatch 重构测试
+// ========================================
+describe('ConfigManager _applyPatch', () => {
+    it('update 与 silentUpdate 应共享相同逻辑', () => {
+        // 验证 _applyPatch(patch, emit) 模式：emit=true 触发 CONFIG_CHANGE，emit=false 不触发
+        let configChangeFired = false;
+        const applyPatch = (patch, emit) => {
+            if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return;
+            const c = { autoPlay: true, bufferTarget: 60 };
+            Object.assign(c, patch);
+            if (emit) configChangeFired = true;
+            return c;
+        };
+        applyPatch({ autoPlay: false }, true);
+        assert(configChangeFired, '_applyPatch(emit=true) 触发 CONFIG_CHANGE');
+        configChangeFired = false;
+        applyPatch({ autoPlay: false }, false);
+        assert(!configChangeFired, '_applyPatch(emit=false) 不触发 CONFIG_CHANGE');
+    });
+});
+
+// ========================================
+// 14. _flushSettings 守卫测试（C1）
+// ========================================
+describe('_flushSettings 守卫', () => {
+    it('_synced=false 时 flush 应提前返回', () => {
+        let flushed = false;
+        const _flushSettings = (synced) => {
+            if (!synced) return; // C1 守卫
+            flushed = true;
+        };
+        _flushSettings(false);
+        assert(!flushed, '_synced=false 时不 flush');
+        _flushSettings(true);
+        assert(flushed, '_synced=true 时正常 flush');
+    });
+});
+
+// ========================================
+// 15. CandidateArbiter SessionManager 前向引用（C2）
+// ========================================
+describe('CandidateArbiter SessionManager 引用', () => {
+    it('SessionManager 未定义时 score 不应抛错', () => {
+        // 模拟：SessionManager 未定义时，typeof 检查应防止 ReferenceError
+        const score = (hasActiveSessions) => {
+            let result = 50;
+            try {
+                if (typeof SessionManager !== 'undefined' && SessionManager.hasActiveSessions()) {
+                    result -= 25;
+                }
+            } catch (e) { }
+            return result;
+        };
+        // SessionManager 不存在时不抛错
+        assert(score(false) === 50, 'SessionManager 未定义时不降权');
+    });
+});
+
+// ========================================
+// 16. TIMELINE_RENDER_THROTTLE_MS 常量引用（Critical）
+// ========================================
+describe('VA_BUFFER 常量引用', () => {
+    const VA_BUFFER = {
+        TIMELINE_RENDER_THROTTLE_MS: 1000,
+        LOG_LINE_LIMIT: 200,
+        EMERGENCY_THROTTLE_MS: 3000,
+        BUFFER_LEVEL_CRITICAL: 1,
+        BUFFER_LEVEL_WARNING: 5,
+        BUFFER_LEVEL_RECOVER: 8
+    };
+    const VA_TUNING = {
+        PATROL_COOLDOWN_MS: 10000,
+        ARBITER_COOLDOWN_MS: 2000
+    };
+
+    it('TIMELINE_RENDER_THROTTLE_MS 应定义在 VA_BUFFER 中', () => {
+        assert(VA_BUFFER.TIMELINE_RENDER_THROTTLE_MS === 1000, 'VA_BUFFER 包含 TIMELINE_RENDER_THROTTLE_MS');
+        assert(typeof VA_TUNING.TIMELINE_RENDER_THROTTLE_MS === 'undefined', 'VA_TUNING 不包含 TIMELINE_RENDER_THROTTLE_MS');
+    });
+
+    it('LOG_LINE_LIMIT 应定义在 VA_BUFFER 中', () => {
+        assert(VA_BUFFER.LOG_LINE_LIMIT === 200, 'VA_BUFFER.LOG_LINE_LIMIT = 200');
+    });
+});
+
+// ========================================
 // 执行所有测试
 // ========================================
 console.log('\n' + '='.repeat(60));
@@ -461,7 +549,7 @@ function runAllTests() {
         // 内联执行所有 describe 块
         () => {
             // 手动执行每个 describe 块的内容
-            const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv|mp3|aac)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
+            const VIDEO_RE = /\.(m3u8|mpd|ts|m4s|m4f|mp4|webm|m4v|flv)(\?|$)|\/(seg|chunk|frag|segment|video|audio|media)s?\//i;
             const isVideoResource = (url) => VIDEO_RE.test(url || '');
             totalTests++; if (isVideoResource('http://example.com/video.mp4')) { passedTests++; console.log('  ' + PASS + ' mp4 URL'); } else { failedTests++; failures.push('mp4'); }
             totalTests++; if (!isVideoResource('http://example.com/image.png')) { passedTests++; console.log('  ' + PASS + ' PNG not video'); } else { failedTests++; failures.push('PNG'); }

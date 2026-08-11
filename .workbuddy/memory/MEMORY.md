@@ -35,7 +35,6 @@
 - `_observeFrameChildren(iframe, depth)`：为同源帧设 MutationObserver，新 iframe 出现时 2s 去抖补报（存 timer，去抖），最多3次
 
 ## v0.10.0 修复记录（2026-08-10）
-
 ### 已修复 Bug 清单（H1-H16）
 | Bug | 修复 | 状态 |
 |-----|------|------|
@@ -74,7 +73,10 @@
 - Brooks-lint 全部 MANUAL 项已修复：C1 跨域双文档守卫、W9 _evaluateStale() 死代码实现
 - 测试套件：122/122（unit）+ 50/50（core-module）= 172/172 全部通过
 - 架构优化：提取 `static _configMap`（25项）消除 3× 重复配置代码，删除透明包装 `_mount()`
-- 当前文件：4008 行
+- 当前文件：4065 行
+- **本次修复（11:24）**：8 项五轴审查修复，文件增至 4070 行
+- **本次修复（11:20）**：补充 VA_BUFFER 缺失的 5 个常量（STALL_LEVEL/RECOVERY_TIMEOUT），修复 BACK_BUFFER_TRIM_S 引用错误
+- **五轴审查修复（11:24）**：8 项修复（见下方详细记录）
 
 ## web-element-blocker.user.js 深度扫描 v3.0（2026-08-11）
 - 健康评分: 69/100 (C+)
@@ -82,3 +84,22 @@
 - 测试套件: 13 个文件, 44 个测试用例 (ad-block-test/)
 - 待修复 P0: OverlayAdScanner 4766 行需拆分, 138 魔法数字需提取常量
 - 报告: ad-block-test/HEALTH_REPORT.md
+
+## video-accelerator.user.js 五轴审查修复（2026-08-11 11:24）
+
+### 修复清单
+| 编号 | 级别 | 行号 | 问题 | 修复 |
+|------|------|------|------|------|
+| FIX-1 | Critical | L4023 | `VA_TUNING.TIMELINE_RENDER_THROTTLE_MS` 应为 `VA_BUFFER` | 修正常量引用 |
+| FIX-2 | Important | L1910 | `SessionManager` 前向引用无 typeof 守卫 | 加 `typeof SessionManager !== 'undefined'` |
+| FIX-3 | Medium | L55 | `VIDEO_RE` 包含 `mp3|aac` 音频误匹配 | 移除音频扩展名 |
+| FIX-4 | Medium | L3824 | 日志阈值硬编码 250 与 `VA_BUFFER.LOG_LINE_LIMIT=200` 不一致 | 统一为常量 |
+| FIX-5 | Medium | L2788 | `visibleOnly` 跳过时未加入 `this.seen` | 补充 `seen.add(video)` |
+| FIX-6 | Minor | L433-450 | `update()`/`silentUpdate()` 重复代码 | 提取 `_applyPatch(patch, emit)` |
+| FIX-7 | Minor | L2193 | click 事件用 capture:true 导致 `e.target.closest()` 行为异常 | 改 bubbling |
+| FIX-8 | Minor | L1430 | `_patrol()` 未检查 `DOC` 是否为 null | 加 `if (!DOC) return` |
+
+### 验证
+- 语法检查：通过
+- 文件行数：4065 → 4070
+- 已知遗留：M3/M4/P1（低优先级，可选优化）

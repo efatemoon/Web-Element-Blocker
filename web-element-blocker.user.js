@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      0.12.0
+// @version      2.0.0
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -5271,17 +5271,17 @@
                 document.removeEventListener('keydown', this._keydownHandler);
                 this._keydownHandler = null;
             }
-            document.removeEventListener('pointerdown', this._handlePointerDown, { capture: true });
-            document.removeEventListener('mousedown', this._handleMouseDown, { capture: true });
+            document.removeEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
+            document.removeEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
             document.removeEventListener('mouseover', this._handleMouseOver, { capture: true });
-            document.removeEventListener('click', this._handleClick, { capture: true });
+            document.removeEventListener('click', this._handleClick, { capture: true, passive: false });
             if (this._contextmenuHandler) {
                 document.removeEventListener('contextmenu', this._contextmenuHandler, { capture: true });
                 this._contextmenuHandler = null;
             }
-            if (this._handleTouchStart) document.removeEventListener('touchstart', this._handleTouchStart, { capture: true });
-            if (this._handleTouchMove) document.removeEventListener('touchmove', this._handleTouchMove, { capture: true });
-            if (this._handleTouchEnd) document.removeEventListener('touchend', this._handleTouchEnd, { capture: true });
+            if (this._handleTouchStart) document.removeEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
+            if (this._handleTouchMove) document.removeEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
+            if (this._handleTouchEnd) document.removeEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
             if (this._handleAuxClick) document.removeEventListener('auxclick', this._handleAuxClick, { capture: true });
             if (this.highlightEl) {
                 this.highlightEl.classList.remove('pro-blocker-highlight');

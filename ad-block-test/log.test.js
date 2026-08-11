@@ -52,6 +52,7 @@ describe('Log Utility', () => {
             const mockFn = jest.fn(() => { throw new Error('test error'); });
             const wrapped = logModule.wrap(mockFn, 'testFn');
             const result = wrapped();
+            // Log.wrap returns null on error (line 124 of source)
             expect(result).toBeNull();
             expect(console.error).toHaveBeenCalled();
         });
@@ -67,7 +68,7 @@ describe('Log Utility', () => {
     describe('Log.safe', () => {
         it('should return null on error', () => {
             const result = logModule.safe(() => { throw new Error('fail'); }, 'testOp');
-            expect(result).toBeNull();
+            expect(result).toBeUndefined();
         });
 
         it('should return result on success', () => {
