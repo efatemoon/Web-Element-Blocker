@@ -1,0 +1,71 @@
+<svg viewBox="0 0 680 760" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .bg{fill:#16161e}
+  .lbl{font-family:sans-serif;font-size:12px;fill:#e8e8f0;text-anchor:middle}
+  .lblS{font-family:sans-serif;font-size:10px;fill:#b9b9c8;text-anchor:middle}
+  .lblW{font-family:sans-serif;font-size:11px;fill:#fff;text-anchor:middle;font-weight:700}
+  .title{font-family:sans-serif;font-size:15px;fill:#fff;text-anchor:middle;font-weight:700}
+  .lbox{fill:#1b1b26;stroke:#5a5a72;stroke-width:1.4;stroke-dasharray:7 4}
+  .lcap{font-family:sans-serif;font-size:11px;fill:#9aa0b5;font-weight:700}
+  .dep{stroke:#9aa0b5;stroke-width:1.8;fill:none;marker-end:url(#arN)}
+  .ebus{stroke:#4caf80;stroke-width:1.8;stroke-dasharray:5 4;fill:none;marker-end:url(#arG)}
+  .nBlue{fill:#21323f;stroke:#4a9fd4;stroke-width:1.6}
+  .nGreen{fill:#1f3a2e;stroke:#4caf80;stroke-width:1.6}
+  .nPurple{fill:#2a2440;stroke:#8b6fd4;stroke-width:1.6}
+  .nAmber{fill:#3a2a1f;stroke:#d49f4a;stroke-width:1.6}
+  .nRed{fill:#3a1f1f;stroke:#e05a5a;stroke-width:1.6}
+  .leg{font-family:sans-serif;font-size:10px;fill:#cfcfdd}
+  .legT{font-family:sans-serif;font-size:11px;fill:#fff;font-weight:700}
+</style>
+<defs>
+  <marker id="arN" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9aa0b5"/></marker>
+  <marker id="arG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#4caf80"/></marker>
+</defs>
+<rect class="bg" x="0" y="0" width="680" height="760"/>
+<text class="title" x="340" y="22">修改后 · 目标架构（分层 · 依赖单向向下 · 功能不变）</text>
+
+<rect class="lbox" x="28" y="36" width="624" height="116" rx="12"/>
+<text class="lcap" x="40" y="52">第1层 · 用户界面 UI</text>
+<rect class="nAmber" x="44" y="80" width="172" height="46" rx="6"/><text class="lbl" x="130" y="100">UIManager 协调器</text><text class="lblS" x="130" y="116">getUI·_safeCall·toast</text>
+<rect class="nAmber" x="234" y="80" width="150" height="46" rx="6"/><text class="lbl" x="309" y="100">PanelRegistry</text><text class="lblS" x="309" y="116">依赖注入映射</text>
+<rect class="nAmber" x="402" y="80" width="230" height="46" rx="6"/><text class="lbl" x="517" y="98">9 面板模块</text><text class="lblS" x="517" y="114">Selection/Regex/Domain/Overlay/Manager/Iframe/Export/Import</text>
+
+<rect class="lbox" x="28" y="178" width="624" height="132" rx="12"/>
+<text class="lcap" x="40" y="194">第2层 · 服务 Services（用例编排 · 唯一写入方）</text>
+<rect class="nGreen" x="44" y="222" width="180" height="44" rx="6"/><text class="lbl" x="134" y="242">StorageService</text><text class="lblS" x="134" y="258">封装 StorageManager+Facade</text>
+<rect class="nGreen" x="250" y="222" width="180" height="44" rx="6"/><text class="lbl" x="340" y="242">OverlayService</text><text class="lblS" x="340" y="258">Detector+ScanEngine+Suggester</text>
+<rect class="nGreen" x="456" y="222" width="180" height="44" rx="6"/><text class="lbl" x="546" y="242">IframeGuard</text><text class="lblS" x="546" y="258">分类/拦截·invalidate()</text>
+<rect class="nGreen" x="250" y="280" width="180" height="22" rx="6"/><text class="lblS" x="340" y="295">DomainScanner / WhitelistStore</text>
+
+<rect class="lbox" x="28" y="338" width="624" height="118" rx="12"/>
+<text class="lcap" x="40" y="354">第3层 · 引擎 Engines（纯检测/拦截逻辑）</text>
+<rect class="nPurple" x="44" y="380" width="148" height="44" rx="6"/><text class="lbl" x="118" y="400">BlockEngine</text><text class="lblS" x="118" y="416">+Selector/Hider/Regex</text>
+<rect class="nPurple" x="206" y="380" width="148" height="44" rx="6"/><text class="lbl" x="280" y="400">NetworkInterceptor</text><text class="lblS" x="280" y="416">fetch/xhr/open</text>
+<rect class="nPurple" x="368" y="380" width="148" height="44" rx="6"/><text class="lbl" x="442" y="400">ContentClassifier</text>
+<rect class="nPurple" x="530" y="380" width="110" height="44" rx="6"/><text class="lbl" x="585" y="400">FrameDetector</text>
+<rect class="nPurple" x="44" y="432" width="148" height="18" rx="6"/><text class="lblS" x="118" y="445">IframeDeepScanner</text>
+
+<rect class="lbox" x="28" y="484" width="624" height="116" rx="12"/>
+<text class="lcap" x="40" y="500">第4层 · 基础设施 Foundation（不依赖上层）</text>
+<rect class="nBlue" x="44" y="528" width="150" height="46" rx="6"/><text class="lbl" x="119" y="548">EventBus</text><text class="lblS" x="119" y="564">解耦骨干</text>
+<rect class="nBlue" x="210" y="528" width="170" height="46" rx="6"/><text class="lbl" x="295" y="548">Log·CONFIG·TIMING</text>
+<rect class="nBlue" x="396" y="528" width="150" height="46" rx="6"/><text class="lbl" x="471" y="548">PathInvertedIndex</text>
+<rect class="nBlue" x="562" y="528" width="78" height="46" rx="6"/><text class="lblS" x="601" y="552">关键词集</text><text class="lblS" x="601" y="566">+ResSel</text>
+<rect class="nBlue" x="44" y="582" width="170" height="18" rx="6"/><text class="lblS" x="129" y="595">DomainBlockExecutor</text>
+
+<rect class="lbox" x="28" y="628" width="624" height="96" rx="12"/>
+<text class="lcap" x="40" y="644">第5层 · 启动 Bootstrap</text>
+<rect class="nGreen" x="44" y="668" width="220" height="44" rx="6"/><text class="lbl" x="154" y="688">_buildMenu(MENU_ITEMS)</text><text class="lblS" x="154" y="704">v8.2 已抽离·可测</text>
+<rect class="nAmber" x="284" y="668" width="344" height="44" rx="6"/><text class="lbl" x="456" y="688">init() 分层有序 + HTMLElement 守卫</text><text class="lblS" x="456" y="704">底层→上层 单点启动·可 node require</text>
+
+<line class="dep" x1="340" y1="152" x2="340" y2="176"/>
+<line class="dep" x1="340" y1="310" x2="340" y2="336"/>
+<line class="dep" x1="340" y1="456" x2="340" y2="482"/>
+<line class="dep" x1="340" y1="600" x2="340" y2="626"/>
+
+<line class="ebus" x1="654" y1="120" x2="654" y2="600"/>
+<text class="lblS" x="654" y="365" transform="rotate(90 654 365)" fill="#4caf80">EventBus 事件总线 · 双向解耦</text>
+
+<rect x="24" y="734" width="632" height="22" rx="6" fill="#20202c" stroke="#3a3a4e"/>
+<text class="leg" x="36" y="749">■ 棕 UI协调　■ 绿 服务/存储　■ 紫 引擎　■ 蓝 基础设施　│ ─▶ 依赖(向下)　⤡ EventBus总线</text>
+</svg>

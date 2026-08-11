@@ -220,6 +220,9 @@ describe('9. UIManager._flushSettings（minVideoArea=0 端到端保留，验证�
     assert(CM.get('minVideoArea') === 0, 'minVideoArea=0 经 _flushSettings 后保留（修复生效）');
     assert(CM.get('bufferTarget') === 120, 'bufferTarget=120 正确写入');
     assert(CM.get('autoPlay') === true, 'checkbox autoPlay 正确写入');
+
+    // 复位 ConfigManager（_flushSettings 会写入全局缓存），避免污染后续用例的 recoveryBudget 等
+    CM._cache = Object.assign({}, CM.defaults);
 });
 
 // ───────────────────────── 10. 扫描优化：浅扫跳过 shadow 全量查询 ─────────────────────────
@@ -266,6 +269,95 @@ describe('10. Detector 扫描优化（浅扫跳过 shadowRoot 全量查询）', 
     assert(seq[0] === true && seq[5] === true, '巡逻节奏：第 1、6 次为深扫');
     assert(seq.slice(1, 5).every((x) => !x) && seq.slice(6, 10).every((x) => !x), '巡逻节奏：其余为浅扫');
     D._shadowRescanCounter = 0;
+});
+
+// ───────────────────────── 11. RecoveryOrchestrator 预算/冷却门禁（Phase 4 安全网） ─────────────────────────
+describe('11. RecoveryOrchestrator 恢复预算/冷却门禁（关掉"双恢复路径"真 bug 入口的安全网）', () => {
+    const RO = VA.RecoveryOrchestrator;
+
+    function fakeSession(over) {
+        return Object.assign({
+            _dead: false, _userPaused: false, isSeeking: false,
+            state: 0, id: 1, _lastBoost: 0,
+            video: { paused: false, ended: false },
+            _boostLoad() {}, _setState() {}, _nudge() {}, _reloadSegment() {}, engineRecover() {}
+        }, over || {});
+    }
+
+    // 1) 预算耗尽：count >= recoveryBudget(默认 8) → 拒绝
+    const s1 = fakeSession();
+    RO._getBudget(s1).count = (VA.ConfigManager.get('recoveryBudget') || 8);
+    assert(RO._canAttempt(s1) === false, '预算耗尽(count>=8) → _canAttempt 返回 false');
+
+    // 2) 冷却中：cooldownUntil 在未来 → 拒绝
+    const s2 = fakeSession();
+    RO._getBudget(s2).cooldownUntil = 1e15;
+    assert(RO._canAttempt(s2) === false, '冷却中(cooldownUntil 未来) → _canAttempt 返回 false');
+
+    // 3) 60s 内 3 次时间戳 → 拒绝（节流，防无限重试）
+    const s3 = fakeSession();
+    const now = Date.now();
+    RO._getBudget(s3).timestamps = [now, now, now];
+    assert(RO._canAttempt(s3) === false, '60s 内 3 次时间戳 → _canAttempt 返回 false（节流）');
+
+    // 4) 用户暂停 → 阻止恢复（用户意图保护）
+    const s4 = fakeSession({ _userPaused: true });
+    assert(RO._canAttempt(s4) === false, '_userPaused → _canAttempt 返回 false');
+
+    // 5) 健康会话 + watchdog 开 → 允许（基线）
+    const s5 = fakeSession();
+    assert(RO._canAttempt(s5) === true, '健康会话(watchdog 开、无冷却、未暂停) → _canAttempt 返回 true');
+
+    // 6) watchdog 关闭 → 拒绝
+    const prev = VA.ConfigManager.get('watchdog');
+    VA.ConfigManager.set('watchdog', false);
+    const s6 = fakeSession();
+    assert(RO._canAttempt(s6) === false, 'watchdog 关闭 → _canAttempt 返回 false');
+    VA.ConfigManager.set('watchdog', prev);
+});
+
+// ───────────────────────── 12. 解码错误恢复收敛（关掉「双恢复路径」真 bug 入口） ─────────────────────────
+describe('12. 解码错误恢复收敛（_onError → RecoveryOrchestrator 单一预算闸门）', () => {
+    const RO = VA.RecoveryOrchestrator;
+    const SS = VA.SessionState;
+    const budget = VA.ConfigManager.get('recoveryBudget') || 8;
+
+    // 解码错误：媒体处于 paused/error 态，必须用 _canAttemptDecode（不要求正在播放）
+    const s = {
+        _dead: false, _userPaused: false, state: SS.ATTACHED, id: 1,
+        _recoveryLevel: 0, _recoveryStartedAt: 0,
+        video: { paused: true, ended: false, error: { code: 3 } },
+        _emergencyLoad() { this._calls = (this._calls || 0) + 1; }
+    };
+    // 绕过冷却与节流，仅验证「预算封顶」：最多 recoveryBudget 次，杜绝无限重试
+    for (let i = 0; i < 12; i++) {
+        RO._getBudget(s).cooldownUntil = 0;
+        RO._getBudget(s).timestamps = [];
+        RO.handleDecodeError(s);
+    }
+    assert(s._calls === budget, '解码错误受预算约束(≤' + budget + '次 emergencyLoad，防无限重试)');
+
+    // 用户暂停 → 解码错误不恢复（用户意图保护）
+    const s2 = { _dead: false, _userPaused: true, state: SS.ATTACHED, id: 2, video: { paused: true, ended: false, error: { code: 3 } }, _emergencyLoad() {} };
+    RO._getBudget(s2).cooldownUntil = 0;
+    RO._getBudget(s2).timestamps = [];
+    assert(RO._canAttemptDecode(s2) === false, '_userPaused → 解码错误不恢复');
+
+    // 60s 内 3 次 → 节流（与 group 11 一致，防高频重试）
+    const s3 = { _dead: false, _userPaused: false, state: SS.ATTACHED, id: 3, video: { paused: true, ended: false, error: { code: 4 } }, _emergencyLoad() {} };
+    const now3 = Date.now();
+    RO._getBudget(s3).timestamps = [now3, now3, now3];
+    assert(RO._canAttemptDecode(s3) === false, '解码错误 60s 内 3 次 → 节流阻止');
+
+    // 状态 FAILED → 放弃恢复（不再折腾已判死的会话）
+    const s4 = { _dead: false, _userPaused: false, state: SS.FAILED, id: 4, video: { paused: true, ended: false, error: { code: 3 } }, _emergencyLoad() {} };
+    RO._getBudget(s4).cooldownUntil = 0;
+    RO._getBudget(s4).timestamps = [];
+    assert(RO._canAttemptDecode(s4) === false, '状态 FAILED → 放弃解码恢复');
+
+    // 健康解码错误会话（watchdog 开、无冷却、未暂停）→ 允许恢复（基线）
+    const s5 = { _dead: false, _userPaused: false, state: SS.ATTACHED, id: 5, video: { paused: true, ended: false, error: { code: 3 } }, _emergencyLoad() {} };
+    assert(RO._canAttemptDecode(s5) === true, '健康解码错误会话 → 允许恢复（基线）');
 });
 
 // ───────────────────────── 汇总 ─────────────────────────

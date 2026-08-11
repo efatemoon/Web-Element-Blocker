@@ -1,0 +1,64 @@
+<svg viewBox="0 0 680 700" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .bg{fill:#16161e}
+  .lbl{font-family:sans-serif;font-size:12px;fill:#e8e8f0;text-anchor:middle}
+  .lblS{font-family:sans-serif;font-size:10px;fill:#b9b9c8;text-anchor:middle}
+  .lblW{font-family:sans-serif;font-size:11px;fill:#fff;text-anchor:middle;font-weight:700}
+  .title{font-family:sans-serif;font-size:15px;fill:#fff;text-anchor:middle;font-weight:700}
+  .container{fill:#1b1b26;stroke:#5a5a72;stroke-width:1.4;stroke-dasharray:7 4}
+  .edgeR{stroke:#e05a5a;stroke-width:2.2;fill:none;marker-end:url(#arR)}
+  .edgeY{stroke:#e0c04a;stroke-width:2;fill:none;marker-end:url(#arY)}
+  .nBlue{fill:#21323f;stroke:#4a9fd4;stroke-width:1.6}
+  .nGreen{fill:#1f3a2e;stroke:#4caf80;stroke-width:1.6}
+  .nPurple{fill:#2a2440;stroke:#8b6fd4;stroke-width:1.6}
+  .nRed{fill:#3a1f1f;stroke:#e05a5a;stroke-width:2.2}
+  .nYellow{fill:#3a351f;stroke:#e0c04a;stroke-width:1.9}
+  .nAmber{fill:#3a2a1f;stroke:#d49f4a;stroke-width:1.6}
+  .badge{font-family:sans-serif;font-size:11px;fill:#fff;text-anchor:middle;font-weight:700}
+  .leg{font-family:sans-serif;font-size:10.5px;fill:#cfcfdd}
+  .legT{font-family:sans-serif;font-size:11px;fill:#fff;font-weight:700}
+</style>
+<defs>
+  <marker id="arR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e05a5a"/></marker>
+  <marker id="arY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e0c04a"/></marker>
+</defs>
+<rect class="bg" x="0" y="0" width="680" height="700"/>
+<text class="title" x="340" y="24">修改前 · 当前架构（单 IIFE · 扁平命名空间 · 9940 行）</text>
+<rect class="container" x="16" y="38" width="648" height="582" rx="14"/>
+
+<rect class="nBlue" x="34" y="84" width="150" height="40" rx="6"/><text class="lbl" x="109" y="108">Log · CONFIG · TIMING</text>
+<rect class="nGreen" x="34" y="146" width="150" height="40" rx="6"/><text class="lbl" x="109" y="164">EventBus 解耦骨干</text><text class="lblS" x="109" y="178">24 调用 · clean</text>
+<rect class="nBlue" x="34" y="208" width="150" height="40" rx="6"/><text class="lbl" x="109" y="226">PathInvertedIndex · 词集</text>
+<rect class="nGreen" x="34" y="278" width="150" height="52" rx="6"/><text class="lbl" x="109" y="298">StorageManager</text><text class="lblS" x="109" y="314">→ RuleStore / ConfigStore</text>
+
+<rect class="nPurple" x="232" y="84" width="196" height="40" rx="6"/><text class="lbl" x="330" y="108">BlockEngine</text>
+<rect class="nPurple" x="232" y="144" width="196" height="40" rx="6"/><text class="lbl" x="330" y="168">IframeGuard</text>
+<rect class="nRed" x="232" y="204" width="196" height="54" rx="6"/><text class="lblW" x="330" y="226">OverlayAdScanner IIFE</text><text class="lblS" x="330" y="244">★ 826 行 · 第二上帝模块</text>
+<rect class="nYellow" x="232" y="274" width="196" height="40" rx="6"/><text class="lbl" x="330" y="298">OverlayDetector 适配器</text>
+<rect class="nPurple" x="232" y="334" width="196" height="46" rx="6"/><text class="lbl" x="330" y="352">其他引擎 ×5</text><text class="lblS" x="330" y="368">帧/域/网络/分类/深扫</text>
+
+<rect class="nRed" x="458" y="84" width="196" height="206" rx="8"/><text class="lblW" x="556" y="112">UIManager 上帝模块</text>
+<text class="lblS" x="556" y="134">3935 行 · 52 方法</text>
+<text class="lblS" x="556" y="152">9 面板 + 选择模式</text>
+<text class="lblS" x="556" y="170">+ toast + 监听器 + 统计</text>
+<text class="lblS" x="556" y="188">直连 BlockEngine 79×</text>
+<text class="lblS" x="556" y="206">直连 storage 60×</text>
+<text class="lblS" x="556" y="224">直连 IframeGuard 29×</text>
+<text class="lblS" x="556" y="246">直连 OverlayAdScanner 6×</text>
+<rect class="nGreen" x="458" y="540" width="196" height="54" rx="6"/><text class="lbl" x="556" y="560">MENU_ITEMS / _buildMenu</text><text class="lblS" x="556" y="576">v8.2 已抽离 · 可测</text>
+
+<line class="edgeR" x1="458" y1="110" x2="430" y2="110"/>
+<line class="edgeR" x1="458" y1="170" x2="430" y2="170"/>
+<line class="edgeR" x1="458" y1="230" x2="430" y2="230"/>
+<polyline class="edgeY" points="476,290 476,470 109,470 109,330"/>
+
+<circle cx="444" cy="110" r="9" fill="#e05a5a"/><text class="badge" x="444" y="114">1</text>
+<circle cx="444" cy="170" r="9" fill="#e05a5a"/><text class="badge" x="444" y="174">2</text>
+<circle cx="444" cy="230" r="9" fill="#e05a5a"/><text class="badge" x="444" y="234">3</text>
+<circle cx="292" cy="470" r="9" fill="#e0c04a"/><text class="badge" x="292" y="474">4</text>
+
+<rect x="24" y="628" width="632" height="62" rx="8" fill="#20202c" stroke="#3a3a4e"/>
+<text class="legT" x="36" y="646">跨层违规清单</text>
+<text class="leg" x="36" y="664">① UIManager → OverlayAdScanner：绕过 OverlayDetector 适配器（6×）</text>
+<text class="leg" x="36" y="680">② → IframeGuard 直写私有 _iframeBlockRules　③ → BlockEngine 79× 紧耦合　④ → storage 60× 直存</text>
+</svg>

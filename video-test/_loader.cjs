@@ -12,9 +12,10 @@ const inject = `
     try {
         globalThis.__VA_EXPORTS__ = {
             VERSION, clamp, isVideoResource, isLive, isVisible, videoArea, getHost,
-            VA_TUNING, VA_BUFFER, ConfigManager, SessionManager, CandidateArbiter,
+            VA_TUNING, VA_BUFFER, ConfigManager, ConfigSyncClass, SessionManager, CandidateArbiter,
             VideoSession, UIManager, RecoveryOrchestrator, Detector, Scheduler,
-            Bus, FrameMesh, Logger, Storage, estimateBandwidth, tryPlay
+            Bus, FrameMesh, Logger, Storage, estimateBandwidth, tryPlay,
+            scoreCandidate, normalizeConfig, mergeConfig, SessionState
         };
     } catch (e) { globalThis.__VA_EXPORT_ERR__ = String(e && e.stack || e); }
 `;

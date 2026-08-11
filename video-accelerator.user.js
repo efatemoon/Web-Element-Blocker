@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.0.2
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -338,6 +338,46 @@
     const STORAGE_KEY = 'va_config_v19_0';
     const STORAGE_KEY_V18 = 'va_config_v18_0';
 
+    // ── 阶段1 抽取：纯配置逻辑（无 DOM，可独立单测）──────────────
+    // 安全合并配置：跳过 __proto__/constructor/prototype 等元键，阻断原型污染。
+    function mergeConfig(base, override) {
+        const out = Object.assign({}, base);
+        if (override && typeof override === 'object' && !Array.isArray(override)) {
+            for (const k of Object.keys(override)) {
+                if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+                out[k] = override[k];
+            }
+        }
+        return out;
+    }
+
+    // 归一化：把任意缓存对象对齐到合法范围/类型。tuning 由调用方注入（默认为 VA_TUNING）。
+    function normalizeConfig(c, tuning) {
+        const T = tuning || VA_TUNING;
+        c.bufferTarget = clamp(parseInt(c.bufferTarget, 10) || 60, 10, 300);
+        c.minPreBuffer = clamp(parseInt(c.minPreBuffer, 10) || 2, 1, 30);
+        c.seekTimeout = clamp(parseInt(c.seekTimeout, 10) || 5000, 2000, 15000);
+        c.recoveryBudget = clamp(parseInt(c.recoveryBudget, 10) || 8, 1, 20);
+
+        const mva = parseInt(c.minVideoArea, 10);
+        c.minVideoArea = isNaN(mva)
+            ? T.MIN_VIDEO_AREA_DEFAULT
+            : clamp(mva, 0, T.MIN_VIDEO_AREA_MAX);
+
+        const levels = ['debug', 'info', 'warn', 'error'];
+        if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
+
+        const boolKeys = [
+            'autoPlay', 'bigBuffer', 'seekGuard', 'watchdog', 'autoDowngrade',
+            'showToast', 'showDetect', 'fastDetect', 'fetchPriority', 'visibleOnly',
+            'protoHook', 'earlyPointer', 'preconnect', 'rvfcMonitor', 'instantPlay',
+            'qualityManage', 'userIntentFirst', 'standbyMode', 'adGuard', 'frameMesh'
+        ];
+        boolKeys.forEach(function (k) { c[k] = !!c[k]; });
+        return c;
+    }
+    // ─────────────────────────────────────────────────────
+
     class ConfigManagerClass {
         constructor(bus) {
             this.bus = bus;
@@ -414,42 +454,12 @@
         }
 
         _normalize() {
-            const c = this._cache;
-
-            c.bufferTarget = clamp(parseInt(c.bufferTarget, 10) || 60, 10, 300);
-            c.minPreBuffer = clamp(parseInt(c.minPreBuffer, 10) || 2, 1, 30);
-            c.seekTimeout = clamp(parseInt(c.seekTimeout, 10) || 5000, 2000, 15000);
-            c.recoveryBudget = clamp(parseInt(c.recoveryBudget, 10) || 8, 1, 20);
-
-            const mva = parseInt(c.minVideoArea, 10);
-            c.minVideoArea = isNaN(mva)
-                ? VA_TUNING.MIN_VIDEO_AREA_DEFAULT
-                : clamp(mva, 0, VA_TUNING.MIN_VIDEO_AREA_MAX);
-
-            const levels = ['debug', 'info', 'warn', 'error'];
-            if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
-
-            const boolKeys = [
-                'autoPlay', 'bigBuffer', 'seekGuard', 'watchdog', 'autoDowngrade',
-                'showToast', 'showDetect', 'fastDetect', 'fetchPriority', 'visibleOnly',
-                'protoHook', 'earlyPointer', 'preconnect', 'rvfcMonitor', 'instantPlay',
-                'qualityManage', 'userIntentFirst', 'standbyMode', 'adGuard', 'frameMesh'
-            ];
-            boolKeys.forEach(function (k) { c[k] = !!c[k]; });
+            normalizeConfig(this._cache, VA_TUNING);
         }
 
-        // 安全合并配置：跳过 __proto__/constructor/prototype 等元键，
-        // 阻断通过导入 JSON 或跨帧配置注入的原型污染（纵深防御）。
-        // override 为 null/undefined 时仅返回 defaults 的副本。
+        // 委托给阶段1抽取的纯函数 mergeConfig（见文件顶部工具区）。
         _mergeConfig(base, override) {
-            const out = Object.assign({}, base);
-            if (override && typeof override === 'object' && !Array.isArray(override)) {
-                for (const k of Object.keys(override)) {
-                    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
-                    out[k] = override[k];
-                }
-            }
-            return out;
+            return mergeConfig(base, override);
         }
 
         save() {
@@ -542,6 +552,101 @@
     }
 
     const ConfigManager = new ConfigManagerClass(Bus);
+
+    // ── 阶段2 抽取：ConfigSync（DOM 桥，无存储逻辑）──────────────
+    // 仅负责「表单 DOM ↔ ConfigStore」的双向绑定；存储/归一/合并全部留在 ConfigManager。
+    // UIManager 持有本类实例并委托，从而把 DOM 表单逻辑与配置存储解耦。
+    class ConfigSyncClass {
+        static _configMap = [
+            { id: 'va-proto', key: 'protoHook', type: 'chk' },
+            { id: 'va-pointer', key: 'earlyPointer', type: 'chk' },
+            { id: 'va-fast', key: 'fastDetect', type: 'chk' },
+            { id: 'va-visible', key: 'visibleOnly', type: 'chk' },
+            { id: 'va-userintent', key: 'userIntentFirst', type: 'chk' },
+            { id: 'va-standby', key: 'standbyMode', type: 'chk' },
+            { id: 'va-adguard', key: 'adGuard', type: 'chk' },
+            { id: 'va-area', key: 'minVideoArea', type: 'num', def: 0 },
+            { id: 'va-fetch', key: 'fetchPriority', type: 'chk' },
+            { id: 'va-preconnect', key: 'preconnect', type: 'chk' },
+            { id: 'va-instant', key: 'instantPlay', type: 'chk' },
+            { id: 'va-big', key: 'bigBuffer', type: 'chk' },
+            { id: 'va-btgt', key: 'bufferTarget', type: 'num', def: 60 },
+            { id: 'va-prebuf', key: 'minPreBuffer', type: 'num', def: 2 },
+            { id: 'va-quality', key: 'qualityManage', type: 'chk' },
+            { id: 'va-autodown', key: 'autoDowngrade', type: 'chk' },
+            { id: 'va-auto', key: 'autoPlay', type: 'chk' },
+            { id: 'va-seek', key: 'seekGuard', type: 'chk' },
+            { id: 'va-seekto', key: 'seekTimeout', type: 'num', def: 5000 },
+            { id: 'va-watchdog', key: 'watchdog', type: 'chk' },
+            { id: 'va-rvfc', key: 'rvfcMonitor', type: 'chk' },
+            { id: 'va-budget', key: 'recoveryBudget', type: 'num', def: 8 },
+            { id: 'va-toast', key: 'showToast', type: 'chk' },
+            { id: 'va-detect', key: 'showDetect', type: 'chk' },
+            { id: 'va-loglevel', key: 'logLevel', type: 'str' },
+        ];
+
+        constructor(bus, store) {
+            this.bus = bus;
+            this.store = store;   // ConfigManager（注入，无 DOM）
+            this._depEl = null;
+        }
+
+        bindSettings(panel) {
+            const bus = this.bus;
+            ConfigSyncClass._configMap.forEach(function (cfg) {
+                const el = panel.querySelector('#' + cfg.id);
+                if (!el) return;
+
+                const handler = function () {
+                    let value;
+                    if (cfg.type === 'num') { const n = parseInt(el.value, 10); value = isNaN(n) ? cfg.def : n; }
+                    else if (cfg.type === 'str') value = el.value;
+                    else value = el.checked;
+                    bus.emit('CONFIG_SET', { key: cfg.key, value: value });
+                };
+
+                // 统一用 change（详见 _bindSettings 原注释：避免读到旧值 / 输入被 clamp 回填空）
+                el.addEventListener('change', handler);
+            });
+        }
+
+        sync(panel) {
+            ConfigSyncClass._configMap.forEach(function (cfg) {
+                const el = panel.querySelector('#' + cfg.id);
+                if (!el) return;
+                const v = this.store.get(cfg.key);
+                if (cfg.type === 'num') el.value = v != null ? v : cfg.def;
+                else if (cfg.type === 'str') el.value = v || cfg.def || '';
+                else el.checked = !!v;
+            }, this);
+            this._updateDependency(panel);
+        }
+
+        flush(panel) {
+            const patch = {};
+            ConfigSyncClass._configMap.forEach(function (cfg) {
+                const el = panel.querySelector('#' + cfg.id);
+                if (!el) return;
+                let value;
+                if (cfg.type === 'num') { const n = parseInt(el.value, 10); value = isNaN(n) ? cfg.def : n; }
+                else if (cfg.type === 'str') value = el.value;
+                else value = el.checked;
+                patch[cfg.key] = value;
+            }, this);
+
+            this.store.silentUpdate(patch);
+            this._updateDependency(panel);
+        }
+
+        _updateDependency(panel) {
+            // 缓存查找结果；首次调用时局部 el 可能为 null，需回读（详见 _updateDependency 原注释）
+            if (!this._depEl) this._depEl = panel.querySelector('#va-dep-down');
+            const el = this._depEl;
+            if (!el) return;
+            const show = this.store.get('autoDowngrade') && !this.store.get('qualityManage');
+            el.style.display = show ? 'block' : 'none';
+        }
+    }
 
     /* ═══════════════════════════════════════════════════════════
        Logger
@@ -1716,6 +1821,64 @@
        CandidateArbiter
     ═══════════════════════════════════════════════════════════ */
 
+    // ── 阶段1 抽取：纯评分函数（无副作用，可注入、可单测）────────
+    // deps: { minVideoArea, profile, hasActiveSessions, tuning }
+    // 与原 CandidateArbiter.score 行为逐字节等价；调用方负责从闭包全局采集 deps。
+    function scoreCandidate(c, deps) {
+        const v = c.video;
+        const ctx = c.context;
+        const sig = c.signals;
+        const T = deps.tuning;
+
+        let score = 0;
+
+        let minArea = deps.minVideoArea;
+        const profile = deps.profile;
+
+        if (v.isConnected) score += 20;
+        if (ctx.visible) score += 12;
+        if (ctx.inViewport) score += 18;
+        if (ctx.area >= minArea) score += 15;
+        if (ctx.area > T.LARGE_AREA_PX) score += 6;
+
+        if (ctx.hasSrc) score += 10;
+        if (ctx.mediaUrl) score += 12;
+        if (ctx.blob) score += 8;
+
+        if (sig.protoSrc) score += 8;
+        if (sig.protoLoad) score += 5;
+        if (sig.protoPlay) score += 14;
+        if (sig.gesture) score += T.GESTURE_BONUS;
+
+        if (ctx.playing) score += 20;
+        if (ctx.duration > T.LONG_DURATION_S || ctx.live) score += 10;
+        if (ctx.duration > 0 && ctx.duration < T.AD_DURATION_MAX_S && ctx.muted && ctx.loop) score -= T.AD_LIKE_SHORT_PENALTY;
+        if (ctx.adLike) score -= T.AD_LIKE_PENALTY;
+
+        try {
+            if (deps.hasActiveSessions && !v.__vaSession && !sig.gesture) {
+                score -= 25;
+            }
+        } catch (e) { }
+
+        if (profile) {
+            if (profile.primarySelector && v.closest) {
+                try {
+                    if (v.closest(profile.primarySelector)) score += T.PRIMARY_MATCH_BONUS;
+                } catch (e) { }
+            }
+
+            if (profile.ignoreSelectors && profile.ignoreSelectors.length && v.closest) {
+                try {
+                    if (v.closest(profile.ignoreSelectors.join(','))) score -= T.IGNORE_MATCH_PENALTY;
+                } catch (e) { }
+            }
+        }
+
+        return score;
+    }
+    // ─────────────────────────────────────────────────────
+
     class CandidateArbiterClass {
         constructor(bus) {
             this.bus = bus;
@@ -1913,62 +2076,18 @@
         }
 
         score(c) {
-            const v = c.video;
-            const ctx = c.context;
-            const sig = c.signals;
-
-            let score = 0;
-
+            // 阶段1：采集依赖后委托给纯函数 scoreCandidate（行为不变）
             let minArea = ConfigManager.get('minVideoArea') || 0;
             const profile = getSiteProfile();
             if (profile && profile.minVideoArea) minArea = profile.minVideoArea;
+            const hasActiveSessions = (typeof SessionManager !== 'undefined') && SessionManager.hasActiveSessions();
 
-            if (v.isConnected) score += 20;
-            if (ctx.visible) score += 12;
-            if (ctx.inViewport) score += 18;
-            if (ctx.area >= minArea) score += 15;
-            if (ctx.area > VA_TUNING.LARGE_AREA_PX) score += 6;
-
-            if (ctx.hasSrc) score += 10;
-            if (ctx.mediaUrl) score += 12;
-            if (ctx.blob) score += 8;
-
-            if (sig.protoSrc) score += 8;
-            if (sig.protoLoad) score += 5;
-            if (sig.protoPlay) score += 14;
-            if (sig.gesture) score += VA_TUNING.GESTURE_BONUS;
-
-            if (ctx.playing) score += 20;
-            if (ctx.duration > VA_TUNING.LONG_DURATION_S || ctx.live) score += 10;
-            if (ctx.duration > 0 && ctx.duration < VA_TUNING.AD_DURATION_MAX_S && ctx.muted && ctx.loop) score -= VA_TUNING.AD_LIKE_SHORT_PENALTY;
-            if (ctx.adLike) score -= VA_TUNING.AD_LIKE_PENALTY;
-
-            try {
-                if (
-                    typeof SessionManager !== 'undefined' &&
-                    SessionManager.hasActiveSessions() &&
-                    !v.__vaSession &&
-                    !sig.gesture
-                ) {
-                    score -= 25;
-                }
-            } catch (e) { }
-
-            if (profile) {
-                if (profile.primarySelector && v.closest) {
-                    try {
-                        if (v.closest(profile.primarySelector)) score += VA_TUNING.PRIMARY_MATCH_BONUS;
-                    } catch (e) { }
-                }
-
-                if (profile.ignoreSelectors && profile.ignoreSelectors.length && v.closest) {
-                    try {
-                        if (v.closest(profile.ignoreSelectors.join(','))) score -= VA_TUNING.IGNORE_MATCH_PENALTY;
-                    } catch (e) { }
-                }
-            }
-
-            return score;
+            return scoreCandidate(c, {
+                minVideoArea: minArea,
+                profile: profile,
+                hasActiveSessions: hasActiveSessions,
+                tuning: VA_TUNING
+            });
         }
     }
 
@@ -2204,8 +2323,9 @@
                         NOW() - this._lastEmergency > VA_TUNING.ERROR_RECOVER_THROTTLE_MS
                     ) {
                         this._lastEmergency = NOW();
-                        this._emergencyLoad();
-                        Logger.warn('Session', '视频错误，触发紧急恢复 #' + this.id);
+                        // Phase 4 收敛：解码错误改走 RecoveryOrchestrator 单一权威，
+                        // 与 STALL/BUFFER 共用预算闸门，杜绝「无限重试」类 bug
+                        RecoveryOrchestrator.handleDecodeError(this);
                     }
                 } catch (e) { }
             };
@@ -3044,6 +3164,45 @@
             return true;
         }
 
+        // 解码错误专用门禁（Phase 4 收敛：关掉「双恢复路径」真 bug 入口）
+        // 解码错误发生时媒体处于 paused/error 态，不要求「正在播放」，也不检查
+        // isSeeking/RECOVERING；但必须与 STALL/BUFFER 恢复共用同一套「预算/冷却/节流」
+        // 闸门，否则持久解码错误会绕过预算无限重试 _emergencyLoad。
+        _canAttemptDecode(session) {
+            if (!session || session._dead) return false;
+            if (!ConfigManager.get('watchdog')) return false;
+            if (session._userPaused) return false;
+            if (session.state === SessionState.FAILED) return false;
+
+            const v = session.video;
+            if (!v || v.ended) return false;
+
+            const b = this._getBudget(session);
+            const now = NOW();
+
+            if (b.count >= (ConfigManager.get('recoveryBudget') || 8)) return false;
+            if (now < b.cooldownUntil) return false;
+
+            b.timestamps = b.timestamps.filter(function (t) { return now - t < 60000; });
+            if (b.timestamps.length >= 3) return false;
+
+            return true;
+        }
+
+        // 解码错误恢复：唯一权威入口（与 STALL/BUFFER 共用 RecoveryOrchestrator 预算）
+        handleDecodeError(session) {
+            if (!session || session._dead) return;
+
+            if (!this._canAttemptDecode(session)) {
+                this.bus.emit('RECOVERY_BLOCKED', { sessionId: session.id, level: 4, reason: 'decode-error' });
+                return;
+            }
+
+            this._record(session, 4); // level 4 = 解码错误，冷却 20000ms（见 _record cooldowns）
+            try { session._emergencyLoad(); } catch (e) { }
+            this.bus.emit('RECOVERY_ATTEMPT', { sessionId: session.id, level: 4, reason: 'decode-error' });
+        }
+
         _record(session, level) {
             const b = this._getBudget(session);
             const now = NOW();
@@ -3342,7 +3501,7 @@
             this._lastRecoveries = 0;
             this._lastTimelineRender = 0;
             this._toastT = null;
-            this._depEl = null;
+            this._configSync = new ConfigSyncClass(this.bus, ConfigManager);
 
             this._build();
             this._mountWhenReady();
@@ -3681,109 +3840,21 @@
             PW.addEventListener('beforeunload', flushHandler);
         }
 
-        /**
-         * 配置映射表：单一定义，三个方法共享，消除 3× 重复（R5 认知负荷优化）
-         */
-        static _configMap = [
-            { id: 'va-proto', key: 'protoHook', type: 'chk' },
-            { id: 'va-pointer', key: 'earlyPointer', type: 'chk' },
-            { id: 'va-fast', key: 'fastDetect', type: 'chk' },
-            { id: 'va-visible', key: 'visibleOnly', type: 'chk' },
-            { id: 'va-userintent', key: 'userIntentFirst', type: 'chk' },
-            { id: 'va-standby', key: 'standbyMode', type: 'chk' },
-            { id: 'va-adguard', key: 'adGuard', type: 'chk' },
-            { id: 'va-area', key: 'minVideoArea', type: 'num', def: 0 },
-            { id: 'va-fetch', key: 'fetchPriority', type: 'chk' },
-            { id: 'va-preconnect', key: 'preconnect', type: 'chk' },
-            { id: 'va-instant', key: 'instantPlay', type: 'chk' },
-            { id: 'va-big', key: 'bigBuffer', type: 'chk' },
-            { id: 'va-btgt', key: 'bufferTarget', type: 'num', def: 60 },
-            { id: 'va-prebuf', key: 'minPreBuffer', type: 'num', def: 2 },
-            { id: 'va-quality', key: 'qualityManage', type: 'chk' },
-            { id: 'va-autodown', key: 'autoDowngrade', type: 'chk' },
-            { id: 'va-auto', key: 'autoPlay', type: 'chk' },
-            { id: 'va-seek', key: 'seekGuard', type: 'chk' },
-            { id: 'va-seekto', key: 'seekTimeout', type: 'num', def: 5000 },
-            { id: 'va-watchdog', key: 'watchdog', type: 'chk' },
-            { id: 'va-rvfc', key: 'rvfcMonitor', type: 'chk' },
-            { id: 'va-budget', key: 'recoveryBudget', type: 'num', def: 8 },
-            { id: 'va-toast', key: 'showToast', type: 'chk' },
-            { id: 'va-detect', key: 'showDetect', type: 'chk' },
-            { id: 'va-loglevel', key: 'logLevel', type: 'str' },
-        ];
-
+        // 阶段2：表单 DOM ↔ ConfigManager 的双向绑定已抽取到 ConfigSync（见 ConfigSyncClass）。
+        // 此处仅保留对外公开方法（保持 UIManager API 不变），实际工作委托给 ConfigSync。
         _bindSettings() {
-            const bus = this.bus;
-            const panel = this._panel;
-
-            UIManager._configMap.forEach(function (cfg) {
-                const el = panel.querySelector('#' + cfg.id);
-                if (!el) return;
-
-                const handler = function () {
-                    let value;
-                    if (cfg.type === 'num') { const n = parseInt(el.value, 10); value = isNaN(n) ? cfg.def : n; }
-                    else if (cfg.type === 'str') value = el.value;
-                    else value = el.checked;
-                    bus.emit('CONFIG_SET', { key: cfg.key, value: value });
-                };
-
-                // 统一用 change：
-                // - checkbox：input 在 checked 更新前触发，会读到旧值写入 storage
-                // - number：input 每敲一个字符就写入，_normalize 立刻 clamp 并回填输入框，
-                //   导致「输入 5000 时打到 5 就被改成 2000」，用户无法正常键入（W4）
-                el.addEventListener('change', handler);
-            });
+            this._configSync.bindSettings(this._panel);
         }
 
         _flushSettings() {
-            // 未打开过面板（_syncSettings 未执行）时，输入框停在 HTML 默认态，
-            // 若强行 flush 会把全部配置写成 false 并持久化，导致功能被静默清空（C1）
+            // _synced 守卫保留在 UIManager（原语义：未同步过面板时不静默清空配置，见 C1）
             if (!this._synced) return;
-
-            const panel = this._panel;
-            const patch = {};
-
-            UIManager._configMap.forEach(function (cfg) {
-                const el = panel.querySelector('#' + cfg.id);
-                if (!el) return;
-                let value;
-                if (cfg.type === 'num') { const n = parseInt(el.value, 10); value = isNaN(n) ? cfg.def : n; }
-                else if (cfg.type === 'str') value = el.value;
-                else value = el.checked;
-                patch[cfg.key] = value;
-            });
-
-            ConfigManager.silentUpdate(patch);
-            this._updateDependency();
+            this._configSync.flush(this._panel);
         }
 
         _syncSettings() {
-            const panel = this._panel;
             this._synced = true;
-
-            UIManager._configMap.forEach(function (cfg) {
-                const el = panel.querySelector('#' + cfg.id);
-                if (!el) return;
-                const v = ConfigManager.get(cfg.key);
-                if (cfg.type === 'num') el.value = v != null ? v : cfg.def;
-                else if (cfg.type === 'str') el.value = v || cfg.def || '';
-                else el.checked = !!v;
-            });
-
-            this._updateDependency();
-        }
-
-        _updateDependency() {
-            // 缓存查找结果；注意必须回读到局部变量，
-            // 否则首次调用时局部 el 仍为 null，后面 el.style 会抛 TypeError（C1）
-            if (!this._depEl) this._depEl = this._panel.querySelector('#va-dep-down');
-
-            const el = this._depEl;
-            if (!el) return;
-
-            const show = ConfigManager.get('autoDowngrade') && !ConfigManager.get('qualityManage');
-            el.style.display = show ? 'block' : 'none';
+            this._configSync.sync(this._panel);
         }
 
         _ensureTextarea() {

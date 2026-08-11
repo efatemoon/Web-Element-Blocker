@@ -4659,10 +4659,2396 @@
     })();
 
 
+    // ═══════════════════════════════════════════════════════════════
+    // 服务层端口（L2）：UI 只依赖端口，不直连引擎/存储具体实现
+    // （《整洁架构》Ch.5 DIP；《PoEAA》Repository 单一写入方）
+    // ═══════════════════════════════════════════════════════════════
+
+    // OverlayService：覆盖层扫描用例编排端口。消除 UIManager→OverlayAdScanner 跨层直调（R3-1 违规①）
+    const OverlayService = {
+        scan(root, options) { return OverlayDetector.scan(root, options); },
+        deepScan(options) { return OverlayDetector.deepScan(options); },
+        enableNavigationInterceptor(domains) { return OverlayAdScanner.enableNavigationInterceptor(domains); },
+        scanInvisibleOverlays(options) { return BlockEngine.scanInvisibleOverlays(options); }
+    };
+
+    // StorageService：持久化唯一写入端口。UI 层经此读写，不直接触碰 storage 实例；
+    // 缓存失效（iframe 规则）内聚到 invalidateIframeRules，消除散落直写（TD-01/R3 残留）
+    const StorageService = new Proxy({}, {
+        get(_t, prop) {
+            if (prop === 'invalidateIframeRules') {
+                return () => {
+                    if (typeof IframeGuard !== 'undefined' && typeof IframeGuard.invalidateBlockRules === 'function') {
+                        IframeGuard.invalidateBlockRules();
+                    }
+                };
+            }
+            const target = storage || {};
+            const v = target[prop];
+            return (typeof v === 'function') ? v.bind(target) : v;
+        }
+    });
+
+    // PanelRegistry：面板 key→UIManager 方法的注册表（OCP 接缝）。
+    // 新增第 10 个面板 = 注册一行 + MENU_ITEMS 加一项，_buildMenu 分派逻辑零改动（《敏捷软件开发》OCP）
+    const PanelRegistry = {
+        selection: 'startSelection',
+        regex: 'showRegexPanel',
+        domain: 'showGlobalDomainPanel',
+        overlay: 'showOverlayScanPanel',
+        manager: 'showManager',
+        iframe: 'showIframePanel',
+        export: 'showExportPanel',
+        adguard: 'showAdGuardExportPanel',
+        import: 'showImportPanel'
+    };
+
     /**
      * 用户交互界面：基于 Shadow DOM 隔离
      */
-    class UIManager {
+        // ── Phase B 面板模块（物理抽离自 UIManager · 独立可测） ──
+    // 每个面板为独立函数模块，经 XPanel.call(this) 注入 UIManager 协调器为 this；行为等价（SRP/OCP）。
+    function SelectionPanel() {
+            this.stopSelection();
+            this.injectHighlightStyle();
+            this._showSelectionBanner();
+            // 选择模式下完全冻结页面导航：广告常通过 window.open / location.href / form.submit
+            // 在 touchstart/click 触发瞬间跳转，仅靠事件 capture 无法兜底，必须从 API 层拦截
+            this._freezeNavigation();
+            this._contextmenuHandler = (e) => {
+                e.preventDefault();
+                this.stopSelection();
+            };
+            this._keydownHandler = (e) => {
+                if (e.key === 'Escape') this.stopSelection();
+            };
+            this._trackDoc('keydown', this._keydownHandler);
+            // 拦截事件必须尽可能早地阻止广告跳转：
+            // ① pointerdown：在 mousedown/touchstart 之前触发，是最早可拦截的人机交互事件
+            // ② document 级 capture：确保在所有目标阶段处理之前拦截（无论 body 是否被广告脚本清空）
+            // ③ 同时拦截 mouseover/click/touch*/auxclick：覆盖鼠标 + 触屏 + pointer + 中键四种交互模型
+            const registerOnDoc = () => {
+                this._trackDoc('pointerdown', this._handlePointerDown, { capture: true, passive: false });
+                this._trackDoc('mousedown', this._handleMouseDown, { capture: true, passive: false });
+                this._trackDoc('mouseover', this._handleMouseOver, { capture: true });
+                this._trackDoc('click', this._handleClick, { capture: true, passive: false });
+                this._trackDoc('contextmenu', this._contextmenuHandler, { capture: true });
+                this._trackDoc('touchstart', this._handleTouchStart, { capture: true, passive: false });
+                this._trackDoc('touchmove', this._handleTouchMove, { capture: true, passive: false });
+                this._trackDoc('touchend', this._handleTouchEnd, { capture: true, passive: false });
+                // 拦截 auxclick（中键点击打开新标签、右键点击）：防止绕过 click 拦截触发跳转
+                this._trackDoc('auxclick', this._handleAuxClick, { capture: true });
+            };
+            registerOnDoc();
+        }
+
+    function GlobalDomainPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            // 双引擎采集：BlockEngine.extractResourceDomains（DOM 资源来源）+ GlobalDomainScanner（6通道+12维+博彩色情）
+            // 合并策略：按 hostname 合并，分数取较高者，附加 viceToken/adToken/level 标记
+            // 过滤策略：已在域名黑名单中的域名不再展示（Bug3）
+            const blockedDomainSet = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+            const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
+            let gdsResult = { results: [], elapsed: '0', total: 0 };
+            try { gdsResult = GlobalDomainScanner.scan(); } catch (e) { Log.warn(e.message || e); }
+            const gdsMap = new Map();
+            for (const r of (gdsResult.results || [])) gdsMap.set(r.hostname, r);
+
+            // 合并：existing scoredDomains 为基线，叠加 GDS 的 12 维评分与博彩色情标记，过滤已封杀域名
+            let allDomains = scoredDomains.filter(d => !blockedDomainSet.has(d.host)).map(d => {
+                const g = gdsMap.get(d.host);
+                if (!g) return d;
+                // 取较高分（GDS 12维更精细，但保留原有 sources/reasons）
+                const mergedScore = Math.max(d.score, g.score);
+                return {
+                    ...d,
+                    score: mergedScore,
+                    viceToken: g.viceToken || null,
+                    adToken: g.adToken || null,
+                    level: g.level || null,
+                    gdsReasons: g.reasons || [],
+                    signals: g.signals || 0
+                };
+            });
+            // 补充 GDS 独有域名（extractResourceDomains 未覆盖的 Performance API / 链接跳转目标），过滤已封杀
+            // 冗余-3：用 Set O(1) 查找替代 allDomains.find O(n) 线性查找
+            const existingHosts = new Set(allDomains.map(d => d.host));
+            for (const [host, g] of gdsMap) {
+                if (blockedDomainSet.has(host)) continue;
+                if (!existingHosts.has(host)) {
+                    allDomains.push({
+                        host, score: g.score, count: g.freq || 1,
+                        sources: ['performance-api'], reasons: g.reasons || [],
+                        viceToken: g.viceToken || null, adToken: g.adToken || null,
+                        level: g.level || null, gdsReasons: g.reasons || [], signals: g.signals || 0
+                    });
+                    existingHosts.add(host);
+                }
+            }
+            // 按分数降序，确保高分广告域置顶
+            allDomains.sort((a, b) => b.score - a.score);
+
+            let selectedHosts = new Set(allDomains.filter(d => d.score >= 35 || d.viceToken).map(d => d.host));
+            let filterText = '';
+            let onlyAds = true;
+
+            const isAdLike = (d) => isAdKeywordHost(d.host) || d.score >= 40 || !!d.viceToken || !!d.adToken || d.level === 'ad' || d.level === 'suspect';
+
+            const getScoreClass = (score) => score >= 50 ? 'high' : score >= 25 ? 'mid' : 'low';
+            const sourceLabel = (src) => ({ 'attr': '属性', 'srcset': '响应图', 'inline-style': '内联样式', 'stylesheet': '样式表', 'data-attr': '数据属性', 'script-text': '脚本文本', 'script-var': '脚本变量', 'performance-api': '性能API', 'image-link': '图片链接', 'link': '跳转链接' }[src] || src);
+
+            const renderDomains = () => {
+                const box = panel.querySelector('#global-domains');
+                const stats = panel.querySelector('#gd-stats');
+                if (!box) return;
+
+                const filtered = allDomains.filter(d => {
+                    if (filterText && !d.host.includes(filterText)) return false;
+                    if (onlyAds && !isAdLike(d)) return false;
+                    return true;
+                });
+
+                if (stats) {
+                    const viceCount = allDomains.filter(d => d.viceToken).length;
+                    const adCount = allDomains.filter(d => d.level === 'ad').length;
+                    stats.textContent = `共 ${allDomains.length} 个第三方域名 · 🚫博彩/色情 ${viceCount} · 广告级 ${adCount} · 已选 ${selectedHosts.size} · 显示 ${filtered.length}`;
+                }
+
+                if (filtered.length === 0) {
+                    box.innerHTML = '<div class="empty-tip">未匹配到域名，请尝试取消“只看广告相关”或手动添加。</div>';
+                } else {
+                    box.innerHTML = filtered.map(d => {
+                        const checked = selectedHosts.has(d.host);
+                        // 博彩/色情标记（最高优先级）
+                        const viceBadge = d.viceToken ? `<span class="tag" style="background:rgba(255,0,80,0.7);" title="博彩/色情词元：${escapeHTML(d.viceToken)}">🚫${escapeHTML(d.viceToken)}</span>` : '';
+                        const adBadge = d.adToken ? `<span class="tag" style="background:rgba(255,149,0,0.55);">广告</span>` : '';
+                        const levelBadge = d.level === 'ad' ? '<span class="tag" style="background:rgba(255,59,48,0.7);">广告级</span>'
+                            : d.level === 'suspect' ? '<span class="tag" style="background:rgba(255,149,0,0.55);">可疑</span>'
+                                : d.level === 'watch' ? '<span class="tag" style="background:rgba(120,144,156,0.5);">关注</span>' : '';
+                        const reasons = (d.gdsReasons && d.gdsReasons.length) ? d.gdsReasons.slice(0, 3).join(', ')
+                            : (d.reasons.length ? d.reasons.slice(0, 3).join(', ') : '');
+                        const sources = d.sources.map(sourceLabel).join('、');
+                        return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-host="${escapeHTML(d.host)}">
+                            <div class="gd-left">
+                                <div class="gd-check">${checked ? '✓' : ''}</div>
+                                <div>
+                                    <div class="gd-host">${escapeHTML(d.host)} ${viceBadge}${adBadge}${levelBadge}</div>
+                                    <div class="gd-meta">来源：${sources}${reasons ? ' · ' + escapeHTML(reasons) : ''}</div>
+                                </div>
+                            </div>
+                            <div class="gd-score ${getScoreClass(d.score)}">${d.score}</div>
+                        </div>`;
+                    }).join('');
+                }
+
+                const btnBlock = panel.querySelector('#btn-block-global');
+                if (btnBlock) {
+                    btnBlock.disabled = selectedHosts.size === 0;
+                    btnBlock.textContent = selectedHosts.size > 0
+                        ? `🔥 彻底封杀 ${selectedHosts.size} 个域名（推荐）`
+                        : '🔥 未选择可封杀域名';
+                }
+            };
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">🌐 全局域名深度检索</h3>
+                <p>双引擎采集：DOM 资源来源 + 6通道性能API + 12维特征评分 + 博彩/色情词库。红色🚫为博彩/色情域，建议优先封杀。</p>
+                <div class="gd-toolbar">
+                    <input type="text" id="gd-filter" placeholder="输入域名关键字过滤..." />
+                    <label><input type="checkbox" id="gd-only-ads" checked /> 只看广告相关</label>
+                    <button class="btn-outline" id="gd-select-all">全选</button>
+                    <button class="btn-outline" id="gd-select-none">清空</button>
+                </div>
+                <div class="gd-stats" id="gd-stats"></div>
+                <div class="gd-scroll-area" id="global-domains"></div>
+                <div class="gd-manual">
+                    <input type="text" id="gd-manual-input" placeholder="手动输入域名，例如：ads.example.com" />
+                    <button class="btn-outline" id="gd-manual-add">+ 添加</button>
+                </div>
+                <div class="btn-group">
+                    <button class="btn-danger" id="btn-block-global" style="flex:100%; font-weight:bold;">🔥 彻底封杀广告域名（推荐）</button>
+                </div>
+                <div class="section-divider"></div>
+                <div class="btn-group">
+                    <button class="btn-info" id="btn-deep-scan" title="运行双引擎联合扫描">🤖 深度扫描</button>
+                    <button class="btn-warning" id="btn-preview-global">🔍 预览效果</button>
+                    <button class="btn-outline" id="btn-cancel-global">取消</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+            renderDomains();
+
+            panel.querySelector('#global-domains').addEventListener('click', (e) => {
+                const row = e.target.closest('.gd-domain-row');
+                if (!row) return;
+                const host = row.dataset.host.toLowerCase();
+                if (selectedHosts.has(host)) selectedHosts.delete(host);
+                else selectedHosts.add(host);
+                updateGlobalPreview();
+                renderDomains();
+            });
+
+            panel.querySelector('#gd-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderDomains(); });
+            panel.querySelector('#gd-only-ads').addEventListener('change', (e) => { onlyAds = e.target.checked; renderDomains(); });
+            panel.querySelector('#gd-select-all').addEventListener('click', () => {
+                allDomains.forEach(d => selectedHosts.add(d.host));
+                updateGlobalPreview();
+                renderDomains();
+            });
+            panel.querySelector('#gd-select-none').addEventListener('click', () => {
+                selectedHosts.clear();
+                updateGlobalPreview();
+                renderDomains();
+            });
+            panel.querySelector('#gd-manual-add').addEventListener('click', () => {
+                const input = panel.querySelector('#gd-manual-input');
+                const host = input.value.trim().toLowerCase();
+                if (!host) return;
+                // 域名格式校验：拒绝带协议、路径、空格等非法输入(BUG-M5)
+                if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
+                    this.showToast(`域名格式无效："${host}"，请输入纯域名（如 ad.example.com，不含 http://）。`, 'warning');
+                    return;
+                }
+                // 拒绝添加已封杀域名：避免UI误导用户以为该域名未封杀（Bug1）
+                const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+                if (currentBlocked.has(host)) {
+                    this.showToast(`域名 ${host} 已在黑名单中，无需重复添加。`, 'info');
+                    input.value = '';
+                    return;
+                }
+                // 冗余-3：用 some 替代 find（仅需判断存在性，无需返回元素），语义更清晰
+                if (!allDomains.some(d => d.host === host)) {
+                    allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1, viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 });
+                }
+                selectedHosts.add(host);
+                input.value = '';
+                updateGlobalPreview();
+                renderDomains();
+            });
+
+            // 深度扫描：真·深度域名挖掘（v0.7.0 重构）
+            // 双引擎：BlockEngine.extractResourceDomains（DOM 资源）+ GlobalDomainScanner.deepScan（GDS 6通道+12维+真·深度）
+            // 真·深度：CSS 伪元素穿透 / Service Worker / WebSocket / Blob URL 溯源 / SVG 引用
+            // 时间分片：requestIdleCallback 包裹高开销探测，避免主线程卡顿(BUG-4)
+            panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
+                const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
+                const origText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ 深度挖掘中...';
+                // 高开销探测包裹 requestIdleCallback，避免主线程卡死（方案六.2 性能保护）
+                const runDeep = () => {
+                    try {
+                        const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+                        allDomains = allDomains.filter(d => !currentBlocked.has(d.host));
+                        // BUG-4 修复：补齐双引擎——extractResourceDomains DOM 资源 + GDS.deepScan 真·深度
+                        const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
+                        const deepResult = GlobalDomainScanner.deepScan({ deep: true });
+                        // 冗余-3 修复：用 Map O(1) 查找合并，替代 allDomains.find O(n) 线性查找
+                        const existingMap = new Map();
+                        for (const d of allDomains) existingMap.set(d.host, d);
+                        // 合并 extractResourceDomains 结果
+                        for (const sd of scoredDomains) {
+                            if (currentBlocked.has(sd.host)) continue;
+                            const exist = existingMap.get(sd.host);
+                            if (exist) {
+                                exist.score = Math.max(exist.score, sd.score);
+                                if (!exist.sources.includes('dom-resource')) exist.sources.push('dom-resource');
+                            } else {
+                                const newD = { host: sd.host, score: sd.score, count: sd.count || 1, sources: sd.sources || ['dom-resource'], reasons: sd.reasons || [], viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 };
+                                existingMap.set(sd.host, newD);
+                                allDomains.push(newD);
+                            }
+                        }
+                        // 合并 GDS.deepScan 结果（含真·深度新增的隐藏域名）
+                        for (const g of deepResult.results) {
+                            if (currentBlocked.has(g.hostname)) continue;
+                            const exist = existingMap.get(g.hostname);
+                            if (exist) {
+                                exist.score = Math.max(exist.score, g.score);
+                                exist.viceToken = g.viceToken || exist.viceToken;
+                                exist.adToken = g.adToken || exist.adToken;
+                                exist.level = g.level || exist.level;
+                                exist.gdsReasons = g.reasons || exist.gdsReasons;
+                                exist.signals = Math.max(exist.signals, g.signals || 0);
+                            } else {
+                                const newD = { host: g.hostname, score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals };
+                                existingMap.set(g.hostname, newD);
+                                allDomains.push(newD);
+                            }
+                        }
+                        allDomains.sort((a, b) => b.score - a.score);
+                        // 同步 selectedHosts：移除已被过滤掉的域名(BUG-M2)
+                        const hostSet = new Set(allDomains.map(d => d.host));
+                        Array.from(selectedHosts).forEach(h => { if (!hostSet.has(h)) selectedHosts.delete(h); });
+                        // ⑩ 深度扫描后自动勾选新出现的高分域名，与初始加载逻辑一致
+                        // 初始加载 selectedHosts 纳入 score>=35 || viceToken，深度扫描同口径补齐新增域名
+                        allDomains.forEach(d => {
+                            if ((d.score >= 35 || d.viceToken) && !selectedHosts.has(d.host)) {
+                                selectedHosts.add(d.host);
+                            }
+                        });
+                        renderDomains();
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        const deepNote = deepResult.deepExtras ? `（深度新增：SW ${deepResult.deepExtras.swHosts.length} · WS ${deepResult.deepExtras.wsHosts.length} · 伪元素 ${deepResult.deepExtras.pseudoUrls.length} · SVG ${deepResult.deepExtras.svgUrls.length}）` : '';
+                        this.showToast(`深度扫描完成，域名列表已刷新。${deepNote}`, 'success', 5000);
+                    } catch (err) {
+                        btn.disabled = false;
+                        btn.textContent = origText;
+                        this.showToast('深度扫描失败：' + err.message, 'error');
+                    }
+                };
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(() => runDeep(), { timeout: 500 });
+                } else {
+                    setTimeout(runDeep, TIMING.DEEP_SCAN_DELAY_MS);
+                }
+            });
+
+            // 预览状态使用实例属性 this._globalPreview，clearPanel 可跨面板清理，避免预览元素残留
+            // 实时联动模式：预览激活时选择变化自动更新预览（Bug2&5），预览口径与 applyCSSRules 完全一致
+            // 注意：previewBtn 必须先于 resetGlobalPreview 声明，避免 TDZ 风险(BUG-M1)
+            const previewBtn = panel.querySelector('#btn-preview-global');
+            const resetGlobalPreview = () => {
+                if (!this._globalPreview.active) return;
+                this._globalPreview.elements.forEach(el => BlockEngine.showElement(el));
+                this._globalPreview = { active: false, elements: [] };
+                this._hidePreviewBanner();
+                previewBtn.textContent = '🔍 预览效果';
+            };
+            // 实时更新预览：根据当前 selectedHosts 重新隐藏元素（Bug2&5）
+            const updateGlobalPreview = () => {
+                if (!this._globalPreview.active) return;
+                // 先还原所有预览元素
+                this._globalPreview.elements.forEach(el => BlockEngine.showElement(el));
+                this._globalPreview.elements = [];
+                // 预览口径与 applyCSSRules 完全一致：
+                // 1) CSS [src*=domain] 隐藏资源元素本身
+                // 2) CSS *:has(> :is(...)) 隐藏直接父级
+                // 3) scanAndBlockDynamic 隐藏 findSingleChildWrapper 单子链容器
+                this._previewHideDomainResources(selectedHosts, this._globalPreview.elements);
+            };
+            previewBtn.addEventListener('click', () => {
+                if (this._globalPreview.active) {
+                    resetGlobalPreview();
+                    return;
+                }
+                if (selectedHosts.size === 0) return;
+                this._globalPreview = { active: true, elements: [] };
+                updateGlobalPreview();
+                this._showPreviewBanner(() => resetGlobalPreview());
+                previewBtn.textContent = '👁 恢复显示';
+            });
+
+            panel.querySelector('#btn-block-global').addEventListener('click', () => {
+                if (selectedHosts.size === 0) return;
+                const list = Array.from(selectedHosts);
+                const confirmMsg = `将封杀以下 ${list.length} 个域名（全局生效，所有页面都将拦截）：\n\n${list.join('\n')}\n\n确认继续？`;
+                this.showConfirm('封杀域名确认', confirmMsg, () => {
+                    if (!panel.isConnected) return; // 防御：confirm 期间面板可能已被 clearPanel 移除(BUG-S4)
+                    resetGlobalPreview();
+                    // 封杀选中域名：添加 domainBlock 规则 + 即时隐藏匹配资源（wrapper 口径）
+                    DomainBlockExecutor.execute(list, { hideMode: 'wrapper' });
+                    this._globalPreview = { active: false, elements: [] };
+                    this.clearPanel();
+                    this.showToast(`已封杀 ${list.length} 个域名，后续刷新与所有页面都将自动拦截。`, 'success');
+                });
+            });
+
+            panel.querySelector('#btn-cancel-global').addEventListener('click', () => {
+                resetGlobalPreview();
+                this.clearPanel();
+            });
+        }
+
+    function RegexPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">添加拦截规则</h3>
+                <p>通过组合条件、正则表达式或路径模式，实现对复杂动态广告的精准拦截。</p>
+
+                <label for="regex-mode">匹配模式</label>
+                <select id="regex-mode">
+                    <option value="contains">基础文本模式 (包含指定字符即隐藏)</option>
+                    <option value="builder" selected>积木组合模式 (免代码，支持多条件逻辑运算) ✨</option>
+                    <option value="regex">正则表达式模式 (适合高级用户)</option>
+                    <option value="attribute">属性选择器模式 (如 [src*="ad"] 或 [id^="banner"])</option>
+                    <option value="path">路径模式 (拦截广告跳转链接，如 /flink/url.php)</option>
+                    <option value="iframeBlock">iframe 子文档拦截 (封杀指定域名的 iframe 帧)</option>
+                </select>
+
+                <div id="standard-ui" style="display: none;">
+                    <label for="regex-input">拦截内容</label>
+                    <input type="text" id="regex-input" placeholder="输入要屏蔽的关键词或正则表达式片段..." />
+                </div>
+
+                <div id="path-ui" style="display: none;">
+                    <label for="path-input">广告跳转路径片段</label>
+                    <input type="text" id="path-input" placeholder="例如：/flink/url.php 或 /000/flink" />
+                    <p style="color:#bbb; font-size:11px;">提示：从广告链接 href 中提取有辨识度的路径片段，无需完整 URL。匹配该片段的所有链接与资源都将被拦截。</p>
+                </div>
+
+                <div id="iframe-block-ui" style="display: none;">
+                    <label for="iframe-domain-input">iframe 子文档域名</label>
+                    <input type="text" id="iframe-domain-input" placeholder="例如：ads.example.com 或 doubleclick.net" />
+                    <p style="color:#bbb; font-size:11px;">提示：输入广告 iframe 的 src 域名，系统将生成 iframeBlock 规则，拦截所有 src 包含该域名的 iframe 帧（即 $subdocument 拦截）。可封杀整个广告 iframe，而不影响同域名下的正常页面内容。</p>
+                </div>
+
+                <div id="attr-ui" style="display: none;">
+                    <label for="attr-input">CSS 属性选择器</label>
+                    <input type="text" id="attr-input" placeholder='例如：[src*="ad"] 或 [id^="banner"]' />
+                    <p style="color:#bbb; font-size:11px;">提示：输入标准 CSS 属性选择器，匹配元素将被隐藏。可组合多属性如 [src*="ad"][class*="banner"]。</p>
+                </div>
+
+                <div id="builder-ui" style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 15px;">
+                    <label style="margin-bottom: 8px;">总体逻辑网关</label>
+                    <select id="builder-logic" style="margin-bottom: 12px;">
+                        <option value="AND">满足以下【全部】条件才拦截 (AND)</option>
+                        <option value="OR">满足以下【任意】条件即拦截 (OR)</option>
+                    </select>
+
+                    <label>详细拦截条件</label>
+                    <div id="builder-conditions"></div>
+                    <button id="btn-add-condition" class="btn-outline" style="width: 100%; margin-top: 8px; border-style: dashed; padding: 6px;">+ 添加新条件块</button>
+                </div>
+
+                <div id="level-row">
+                    <label for="regex-level">向上隐藏层级 (0为仅隐藏自身，1为隐藏直接父级节点)</label>
+                    <input type="number" id="regex-level" value="0" min="0" max="10" />
+                </div>
+
+                <div class="btn-group" style="margin-top: 15px;">
+                    <button class="btn-warning" id="btn-preview-regex">🔍 预览效果</button>
+                    <button class="btn-primary" id="btn-save-regex">保存并应用</button>
+                    <button class="btn-outline" id="btn-close-regex">取消</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            const modeSelect = panel.querySelector('#regex-mode');
+            const standardUI = panel.querySelector('#standard-ui');
+            const builderUI = panel.querySelector('#builder-ui');
+            const pathUI = panel.querySelector('#path-ui');
+            const attrUI = panel.querySelector('#attr-ui');
+            const levelRow = panel.querySelector('#level-row');
+            const conditionsContainer = panel.querySelector('#builder-conditions');
+
+            const iframeBlockUI = panel.querySelector('#iframe-block-ui');
+
+            modeSelect.addEventListener('change', (e) => {
+                const v = e.target.value;
+                standardUI.style.display = (v === 'contains' || v === 'regex') ? 'block' : 'none';
+                builderUI.style.display = (v === 'builder') ? 'block' : 'none';
+                pathUI.style.display = (v === 'path') ? 'block' : 'none';
+                attrUI.style.display = (v === 'attribute') ? 'block' : 'none';
+                iframeBlockUI.style.display = (v === 'iframeBlock') ? 'block' : 'none';
+                levelRow.style.display = (v === 'path' || v === 'attribute' || v === 'iframeBlock') ? 'none' : 'block';
+                if (v === 'builder' && conditionsContainer.children.length === 0) addConditionRow();
+            });
+
+            const addConditionRow = () => {
+                const row = document.createElement('div');
+                row.className = 'condition-row';
+                row.style.cssText = 'display: flex; gap: 6px; margin-bottom: 8px; align-items: center;';
+                row.innerHTML = `
+                    <select class="cond-type" style="width: 32%; margin: 0; padding: 8px;">
+                        <option value="text">元素文本</option>
+                        <option value="class">类名(Class)</option>
+                        <option value="id">标识符(ID)</option>
+                    </select>
+                    <select class="cond-op" style="width: 24%; margin: 0; padding: 8px;">
+                        <option value="contains">包含</option>
+                        <option value="equals">等于</option>
+                        <option value="not_contains">不包含</option>
+                    </select>
+                    <input type="text" class="cond-val" style="flex: 1; margin: 0; padding: 8px;" placeholder="设定值..." />
+                    <button class="btn-danger btn-remove-cond" style="flex: none; width: 32px; padding: 0; min-width: 32px; height: 35px;">✕</button>
+                `;
+                row.querySelector('.btn-remove-cond').addEventListener('click', () => {
+                    row.remove();
+                    if (conditionsContainer.children.length === 0) addConditionRow();
+                });
+                conditionsContainer.appendChild(row);
+            };
+
+            addConditionRow();
+            panel.querySelector('#btn-add-condition').addEventListener('click', addConditionRow);
+
+            let isPreviewing = false;
+
+            const resetPreview = () => {
+                if (isPreviewing) {
+                    // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(BUG-2)
+                    // 否则 path 预览(用 hideElement)隐藏的 visibility/pointer-events 会永久残留
+                    this._previewAffectedElements.forEach(item => BlockEngine.showElement(item.el));
+                    this._previewAffectedElements = [];
+                    this._hidePreviewBanner();
+                    isPreviewing = false;
+                    const previewBtn = panel.querySelector('#btn-preview-regex');
+                    if (previewBtn) previewBtn.textContent = '🔍 预览效果';
+                }
+            };
+
+            panel.addEventListener('input', resetPreview);
+            panel.addEventListener('change', resetPreview);
+
+            panel.querySelector('#btn-preview-regex').addEventListener('click', (e) => {
+                const btn = e.currentTarget; // 用 currentTarget 而非 e.target(BUG-L2)
+                if (isPreviewing) { resetPreview(); return; }
+
+                const mode = modeSelect.value;
+                // NaN 兜底：输入框被清空时 parseInt 返回 NaN，_hideRegexAncestor 的 for(i=0;i<NaN;i++) 不执行 → 静默退化为 level 0
+                const level = parseInt(panel.querySelector('#regex-level').value, 10) || 0;
+                this._previewAffectedElements = [];
+
+                if (mode === 'path') {
+                    // 路径模式预览：与正式 pathPattern 拦截同口径
+                    // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
+                    const text = panel.querySelector('#path-input').value.trim();
+                    if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
+                    // 与 applyCSSRules 中 pathPattern 一致：3 通道(href/src/data-src)(BUG-6)
+                    // 旧版误用 9 通道扩展选择器导致预览比实际拦截多匹配 6 个属性通道
+                    const sel = ResourceSelectorBuilder.buildPathAttr(text);
+                    let hit = 0;
+                    const hideNode = (node) => {
+                        if (!node || node === document.body || node === document.documentElement) return false;
+                        if (ProtectedCheck.isProtected(node)) return false;
+                        if (node.style.display === 'none') return false;
+                        BlockEngine.hideElement(node);
+                        this._previewAffectedElements.push({ el: node });
+                        return true;
+                    };
+                    document.querySelectorAll(sel).forEach(el => {
+                        let counted = false;
+                        if (hideNode(el)) counted = true;
+                        if (el.parentElement && hideNode(el.parentElement)) counted = true;
+                        const wrapper = BlockEngine.findSingleChildWrapper(el, 4);
+                        if (hideNode(wrapper)) counted = true;
+                        if (counted) hit++;
+                    });
+                    if (hit === 0) { this.showToast('当前页面未匹配到含该路径片段的资源，预览为空。', 'info'); return; }
+                    isPreviewing = true;
+                    this._showPreviewBanner(() => resetPreview());
+                    btn.textContent = '👁 恢复显示';
+                    return;
+                }
+
+                if (mode === 'attribute') {
+                    const text = panel.querySelector('#attr-input').value.trim();
+                    if (!text) { this.showToast('校验失败：请输入属性选择器。', 'warning'); return; }
+                    // 预览口径与 applyCSSRules 完全一致：attribute 规则保存后直接注入 CSS 选择器，
+                    // 无 level 向上遍历逻辑。预览也仅隐藏选择器命中的元素本身，确保预览=刷新后效果。
+                    // 必须校验 isProtectedElement，否则 [id="pro-blocker-ui-host"] 会隐藏整个脚本 UI(BUG-5)
+                    try {
+                        document.querySelectorAll(text).forEach(el => {
+                            if (!el || el.style.display === 'none') return;
+                            if (ProtectedCheck.isProtected(el)) return;
+                            this._previewAffectedElements.push({ el });
+                            BlockEngine.hideElement(el); // 统一 4 属性口径(冗余-5)
+                        });
+                    } catch (err) {
+                        this.showToast('校验失败：属性选择器语法错误。', 'error');
+                        return;
+                    }
+                    isPreviewing = true;
+                    this._showPreviewBanner(() => resetPreview());
+                    btn.textContent = '👁 恢复显示';
+                    return;
+                }
+
+                if (mode === 'builder') {
+                    const logic = panel.querySelector('#builder-logic').value;
+                    const rows = conditionsContainer.querySelectorAll('.condition-row');
+                    const conditions = [];
+                    let isValueMissing = false;
+
+                    rows.forEach(row => {
+                        const type = row.querySelector('.cond-type').value;
+                        const op = row.querySelector('.cond-op').value;
+                        const val = row.querySelector('.cond-val').value.trim();
+                        if (!val) isValueMissing = true;
+                        conditions.push({ type, operator: op, value: val });
+                    });
+
+                    if (isValueMissing || conditions.length === 0) {
+                        this.showToast('规则校验失败：请完整填写所有积木条件的值再进行预览。', 'warning');
+                        return;
+                    }
+
+                    const baseSelector = BlockEngine._buildComplexBaseSelector(conditions, logic);
+
+                    const root = document.body;
+                    const elements = baseSelector === '*'
+                        ? root.querySelectorAll('div, span, a, p, img, li, ul, iframe, section, article, aside')
+                        : root.querySelectorAll(baseSelector);
+
+                    elements.forEach(el => {
+                        if (baseSelector === '*' && (el.textContent || '').length > 3000) return;
+
+                        if (BlockEngine.evaluateConditions(conditions, logic, el)) {
+                            const target = BlockEngine.findLevelAncestor(el, level);
+                            if (target.style.display !== 'none') {
+                                this._previewAffectedElements.push({ el: target });
+                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
+                            }
+                        }
+                    });
+
+                } else {
+                    const text = panel.querySelector('#regex-input').value.trim();
+                    if (!text) {
+                        this.showToast('规则校验失败：请输入有效的匹配内容再进行预览。', 'warning');
+                        return;
+                    }
+
+                    // contains 模式用 String.includes() 匹配，不走正则引擎(BUG-M7)
+                    // regex 模式校验语法后用 RegExp.test()
+                    const isContains = mode === 'contains';
+                    let regex = null;
+                    if (!isContains) {
+                        try { regex = new RegExp(text, 'i'); }
+                        catch (err) { this.showToast('规则校验失败：正则表达式存在语法错误。', 'error'); return; }
+                        // 预览 ReDoS 预检(问题4)：applyRegexRules 会用 isRegexSafe 过滤嵌套量词，
+                        // 预览时不检查会导致 regex.test 在每个文本节点上执行，可能触发灾难性回溯卡死页面
+                        if (!BlockEngine.isRegexSafe(text)) {
+                            this.showToast('规则校验失败：正则含嵌套量词（ReDoS 风险），已拒绝预览。', 'error');
+                            return;
+                        }
+                    }
+
+                    // 与 applyRegexRules 保持一致：跳过 SCRIPT/STYLE/NOSCRIPT 内的文本，
+                    // 否则预览会误隐藏 <script> 父级导致页面功能损坏，且与实际执行结果不一致
+                    const lowerText = isContains ? text.toLowerCase() : null;
+                    BlockEngine.walkTextNodes(document.body, (node) => {
+                        const content = node.textContent || '';
+                        const hit = isContains ? content.toLowerCase().includes(lowerText) : regex.test(content);
+                        if (hit) {
+                            const target = BlockEngine.findLevelAncestor(node.parentElement, level);
+                            if (target && target.style.display !== 'none') {
+                                this._previewAffectedElements.push({ el: target });
+                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
+                            }
+                        }
+                    });
+                }
+
+                isPreviewing = true;
+                this._showPreviewBanner(() => resetPreview());
+                btn.textContent = '👁 恢复显示';
+            });
+
+            panel.querySelector('#btn-save-regex').addEventListener('click', () => {
+                const mode = modeSelect.value;
+
+                if (mode === 'iframeBlock') {
+                    const domain = panel.querySelector('#iframe-domain-input').value.trim().toLowerCase();
+                    if (!domain) { this.showToast('校验失败：请输入要拦截的 iframe 域名。', 'warning'); return; }
+                    if (!/^[a-z0-9.\-]+$/.test(domain)) { this.showToast('校验失败：域名格式无效（仅允许字母、数字、点和横线）。', 'error'); return; }
+                    const added = this.storage.addIframeRule({ matchType: 'srcDomain', value: domain });
+                    if (!added) { this.showToast('该域名已存在 iframeBlock 规则，已跳过重复添加。', 'info'); return; }
+                    IframeGuard.invalidateBlockRules();
+                    EventBus.emit('rule:changed', { type: 'iframeBlock' });
+                    this.showToast(`已添加 iframe 拦截规则：${domain}`, 'success');
+                    this.clearPanel();
+                    return;
+                }
+
+                if (mode === 'path') {
+                    const text = panel.querySelector('#path-input').value.trim();
+                    if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
+                    // addRule 内部已通过 saveData 调用 applyCSSRules，此处无需重复(不一致-2)
+                    this.storage.addRule('pathPattern', { pattern: text, type: 'pathPattern' });
+                    BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
+                    this.clearPanel();
+                    return;
+                }
+
+                if (mode === 'attribute') {
+                    const text = panel.querySelector('#attr-input').value.trim();
+                    if (!text) { this.showToast('校验失败：请输入属性选择器。', 'warning'); return; }
+                    try { document.querySelector(text); } catch (err) {
+                        this.showToast('校验失败：属性选择器语法错误，请检查括号、引号是否匹配。', 'error');
+                        return;
+                    }
+                    // addRule 内部已通过 saveData 调用 applyCSSRules，此处无需重复(不一致-2)
+                    this.storage.addRule('attribute', { attrSelector: text, type: 'attribute' });
+                    this.clearPanel();
+                    return;
+                }
+
+                // NaN 兜底：输入框被清空时 parseInt 返回 NaN，需兜底为 0
+                const level = parseInt(panel.querySelector('#regex-level').value, 10) || 0;
+
+                if (mode === 'builder') {
+                    const logic = panel.querySelector('#builder-logic').value;
+                    const rows = conditionsContainer.querySelectorAll('.condition-row');
+                    const conditions = [];
+                    let isValueMissing = false;
+
+                    rows.forEach(row => {
+                        const type = row.querySelector('.cond-type').value;
+                        const op = row.querySelector('.cond-op').value;
+                        const val = row.querySelector('.cond-val').value.trim();
+                        if (!val) isValueMissing = true;
+                        conditions.push({ type, operator: op, value: val });
+                    });
+
+                    if (isValueMissing || conditions.length === 0) {
+                        this.showToast('校验失败：请完整填写所有积木条件的值。', 'warning');
+                        return;
+                    }
+
+                    this.storage.addRule('complex', { logic, conditions, level, type: 'complex' });
+                    BlockEngine.applyComplexRules();
+
+                } else {
+                    const text = panel.querySelector('#regex-input').value.trim();
+                    if (!text) { this.showToast('校验失败：请输入有效的匹配内容。', 'warning'); return; }
+
+                    if (mode === 'contains') {
+                        // contains 模式存储原始文本 + mode 标记，applyRegexRules 用 String.includes() 匹配(BUG-M7)
+                        // 避免 .*text.* 合并到批量正则后引发贪婪回溯，影响性能
+                        this.storage.addRule('regex', { regex: text, level: level, mode: 'contains', type: 'regex' });
+                    } else {
+                        // 正则模式保存前校验语法，与预览路径一致；非法正则会被 applyRegexRules 静默丢弃
+                        try { new RegExp(text); }
+                        catch (e) { this.showToast('校验失败：正则表达式语法错误。' + e.message, 'error'); return; }
+                        // ReDoS 预检(BUG-8)：applyRegexRules 用 isRegexSafe 过滤嵌套量词，
+                        // 保存前不检查会导致规则保存了但永不生效，用户无任何提示
+                        if (!BlockEngine.isRegexSafe(text)) {
+                            this.showToast('校验失败：正则含嵌套量词（ReDoS 风险），已拒绝保存。', 'error');
+                            return;
+                        }
+                        this.storage.addRule('regex', { regex: text, level: level, type: 'regex' });
+                    }
+                    BlockEngine.applyRegexRules();
+                }
+
+                this.clearPanel();
+            });
+
+            panel.querySelector('#btn-close-regex').addEventListener('click', () => this.clearPanel());
+        }
+
+    function IframePanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            const stats = IframeGuard.getStats();
+            const config = this.storage.getIframeConfig();
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">🖼️ iframe 防线管理</h3>
+                <p>动态 iframe 广告拦截完整防线：创建拦截 + 递归分类扫描 + 正文保护铁律 + 跨域帧间通信。下方可查看每个 iframe 的分类详情、管理白名单。</p>
+
+                <div class="status-bar">
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px;">
+                        <div>🖼️ <strong>已拦截：</strong><span style="color:#ff6f00;" id="ifs-blocked">0</span> 个</div>
+                        <div>🛡️ <strong>已保护：</strong><span style="color:#34c759;" id="ifs-protected">0</span> 个</div>
+                        <div>🔍 <strong>已扫描：</strong><span style="color:#4aa3ff;" id="ifs-scanned">0</span> 个</div>
+                        <div>🧹 <strong>内部清理：</strong><span style="color:#9c27b0;" id="ifs-cleaned">0</span> 个</div>
+                    </div>
+                    <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
+                </div>
+
+                <div class="section-divider"></div>
+
+                <div style="font-size:13px; color:#4aa3ff; font-weight:bold; margin-bottom:8px;">🔍 iframe 深扫（帧内元素级）</div>
+                <div class="gd-toolbar">
+                    <button class="btn-info" id="btn-iframe-scan" style="flex:none; padding:6px 12px; font-size:12px;">🔄 立即扫描</button>
+                    <button class="btn-warning" id="btn-iframe-rescan" style="flex:none; padding:6px 12px; font-size:12px;">⚡ 重扫全部</button>
+                    <button class="btn-outline" id="btn-iframe-preview" style="flex:none; padding:6px 12px; font-size:12px;" title="预览：勾选后点击预览">🔍 预览效果</button>
+                    <button class="btn-danger" id="btn-iframe-batch-info" style="flex:none; padding:6px 12px; font-size:12px; display:none;">🛡 拦截选中(0)</button>
+                    <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:#ddd; margin:0;">
+                        <span>嵌套深度：</span>
+                        <input type="number" id="iframe-max-depth" min="1" max="5" value="${config.maxDepth || 3}"
+                               style="width:50px; padding:4px 6px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
+                        <span style="font-size:10px; color:#888;">1-5</span>
+                    </label>
+                </div>
+                <div class="gd-stats" id="iframe-scan-stats"></div>
+                <div class="gd-scroll-area" id="iframe-scan-list" style="max-height:280px;"></div>
+
+                <div class="section-divider"></div>
+
+                <div style="font-size:13px; color:#4aa3ff; font-weight:bold; margin-bottom:8px;">🛡️ 白名单管理（永不拦截的内容帧）</div>
+                <div class="gd-scroll-area" id="iframe-wl-list" style="max-height:100px;"></div>
+
+                <div class="btn-group" style="margin-top:10px;">
+                    <button class="btn-primary" id="btn-close-iframe">完成</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            // ─── 分类标签与颜色 ───
+            const verdictLabel = (v) => ({
+                'ad': '纯广告', 'content': '内容帧', 'whitelist': '白名单', 'unknown': '未知'
+            }[v] || '未知');
+            const verdictColor = (v) => ({
+                'ad': 'rgba(255,59,48,0.7)', 'content': 'rgba(52,199,89,0.6)',
+                'whitelist': 'rgba(0,122,255,0.6)', 'unknown': 'rgba(120,144,156,0.5)'
+            }[v] || 'rgba(120,144,156,0.5)');
+
+            // ─── B7: iframe:stats 事件订阅 ───
+            if (!this._iframeUnsubs) this._iframeUnsubs = [];
+            this._iframeUnsubs.push(EventBus.on('iframe:stats', (s) => {
+                const set = (id, v) => { const el = panel.querySelector('#' + id); if (el) el.textContent = v; };
+                set('ifs-blocked', s.blocked || 0);
+                set('ifs-protected', s.protected || 0);
+                set('ifs-scanned', s.scanned || 0);
+                set('ifs-cleaned', s.cleaned || 0);
+            }));
+
+            // ─── B8: 已拦截指纹（跨扫描保留） ───
+            const blockedFingerprints = new WeakSet();
+            // WeakMap 不可枚举，以 DOM 存活帧为真实来源反查记录
+            IframeGuard._liveFrames().forEach((iframe) => {
+                const rec = IframeGuard._frameRecords.get(iframe);
+                if (rec && (rec.blocked || rec.manual)) blockedFingerprints.add(iframe);
+            });
+            const isBlocked = (iframe) => blockedFingerprints.has(iframe);
+
+            // ─── B6: 行内零输入生成按钮 ───
+            const mkBlockBtn = (idx) =>
+                `<button class="btn-danger" style="flex:none; padding:3px 8px; font-size:11px; margin-left:6px;" data-action="block" data-idx="${idx}">🛡拦截</button>`;
+            const mkProtectBtn = (idx) =>
+                `<button class="btn-success" style="flex:none; padding:3px 8px; font-size:11px; margin-left:4px;" data-action="protect" data-idx="${idx}">✅保护</button>`;
+
+            // ─── B6/B9/H8/H9/H12: 扫描列表渲染（异步 + 勾选 + 预览 + 批量）───
+            // state 在闭包中保留，跨渲染周期共享
+            let _deepResults = [];
+            let _iframeRecs = [];
+            let _selectedSet = new Set();
+            let _scanning = false;
+            // 扫描缓存：5s 内复用结果，避免每次打开面板都全量深扫
+            let _scanCache = null;
+            let _scanCacheTime = 0;
+            const SCAN_CACHE_TTL = 5000;
+
+            // 首绘 stats（H9）
+            (() => {
+                const s = IframeGuard.getStats();
+                const set = (id, v) => { const el = panel.querySelector('#' + id); if (el) el.textContent = v; };
+                set('ifs-blocked', s.blocked || 0);
+                set('ifs-protected', s.protected || 0);
+                set('ifs-scanned', s.scanned || 0);
+                set('ifs-cleaned', s.cleaned || 0);
+            })();
+
+            const paintScanStats = (deepResults, iframeRecs) => {
+                const statsBox = panel.querySelector('#iframe-scan-stats');
+                if (!statsBox) return;
+                const deepAd = deepResults.filter(r => r.category && r.category.endsWith('-ad')).length;
+                const deepOk = deepResults.filter(r => r.category && !r.category.endsWith('-ad')).length;
+                statsBox.textContent = `共 ${iframeRecs.length} 个帧 · 帧内 ${deepResults.length} 个可疑元素（广告 ${deepAd} · 内容 ${deepOk}）`;
+            };
+
+            const renderScanList = async () => {
+                const list = panel.querySelector('#iframe-scan-list');
+                const statsBox = panel.querySelector('#iframe-scan-stats');
+                if (!list) return;
+
+                // H12: 加载态
+                if (!_scanning) {
+                    _scanning = true;
+                    list.innerHTML = '<div class="empty-tip" style="text-align:center; padding:16px;">⏳ 扫描中...</div>';
+                    if (statsBox) statsBox.textContent = '扫描中...';
+                }
+
+                // 异步深扫，避免同步阻塞 UI
+                await new Promise(r => setTimeout(r, TIMING.MICRO_DELAY_MS));
+
+                // 缓存命中：5s 内复用结果，避免每次打开面板都全量深扫
+                const now = Date.now();
+                let deepResults;
+                if (_scanCache && (now - _scanCacheTime) < SCAN_CACHE_TTL) {
+                    deepResults = _scanCache.results;
+                } else {
+                    deepResults = IframeDeepScanner.scanAll();
+                    _scanCache = { results: deepResults, time: now };
+                }
+                const iframeRecs = [];
+                document.querySelectorAll('iframe').forEach(iframe => {
+                    if (ProtectedCheck.isProtected(iframe)) return;
+                    const rec = IframeGuard._ensureRecord(iframe);
+                    iframeRecs.push({ iframe, rec, _idx: iframeRecs.length });
+                });
+
+                _deepResults = deepResults;
+                _iframeRecs = iframeRecs;
+                _scanning = false;
+
+                paintScanStats(deepResults, iframeRecs);
+
+                if (deepResults.length === 0 && iframeRecs.length === 0) {
+                    list.innerHTML = '<div class="empty-tip">当前页面未发现 iframe 元素。</div>';
+                    return;
+                }
+
+                const batchInfoBtn = panel.querySelector('#btn-iframe-batch-info');
+                if (batchInfoBtn) batchInfoBtn.textContent = `🛡 拦截选中(${_selectedSet.size})`;
+
+                const rows = [];
+                // 帧级行：带 checkbox（H8：行 click = 勾选，动作走按钮）
+                iframeRecs.forEach(({ iframe, rec, _idx }) => {
+                    const vBadge = `<span class="tag" style="background:${verdictColor(rec.verdict)};">${verdictLabel(rec.verdict)}</span>`;
+                    const crossBadge = (rec.frozen && rec.frozen.w > 0) ? '' : '<span class="tag" style="background:rgba(255,149,0,0.5);">跨域</span>';
+                    const locked = rec.blocked || rec.manual;
+                    const lockBadge = locked
+                        ? `<span class="tag" style="background:${rec.blocked ? 'rgba(255,59,48,0.7)' : 'rgba(0,122,255,0.7)'};">${rec.blocked ? '🔒已拦截' : '🛡已保护'}</span>`
+                        : '';
+                    const srcDisplay = (iframe.src || '').length > 50
+                        ? escapeHTML(iframe.src.slice(0, 50)) + '...'
+                        : escapeHTML(iframe.src || '(空)');
+                    const frozenInfo = rec.frozen && rec.frozen.w > 0
+                        ? `<div class="gd-meta">尺寸: ${rec.frozen.w}×${rec.frozen.h}px · op=${rec.frozen.opacity} · z=${rec.frozen.zi}</div>` : '';
+                    const btns = locked
+                        ? `<span style="font-size:11px; color:#888; margin-left:4px;">锁定</span>`
+                        : mkBlockBtn(_idx) + mkProtectBtn(_idx);
+                    const checked = _selectedSet.has(_idx);
+                    rows.push(`<div class="gd-domain-row" data-idx="${_idx}" data-type="frame" ${locked ? 'style="opacity:0.7;"' : ''}>
+                        <div class="gd-left">
+                            <input type="checkbox" class="iframe-row-cb" data-idx="${_idx}" ${checked ? 'checked' : ''} style="flex:none; margin-right:6px; cursor:pointer; accent-color:#007AFF;" />
+                            <div>
+                                <div class="gd-host">${vBadge}${crossBadge}${lockBadge} ${iframe.id ? '#' + escapeHTML(iframe.id) : ''} ${iframe.className ? '· ' + escapeHTML(String(iframe.className).slice(0, 40)) : ''}</div>
+                                <div class="gd-meta" title="${escapeHTML(iframe.src || '')}">src: ${srcDisplay}</div>
+                                ${frozenInfo}
+                            </div>
+                        </div>
+                        <div style="display:flex; align-items:center;">${btns}</div>
+                    </div>`);
+                });
+
+                // 帧内元素级行：带 checkbox（H8）
+                deepResults.forEach((elRec, i) => {
+                    const cat = elRec.category || 'unknown';
+                    const suspicion = elRec.suspicion || 0;
+                    const reasonLabel = { 'domain-ad': '域名封杀', 'path-ad': '路径匹配', 'overlay': '透明覆盖', 'vice': '赌博域名', 'skin': '肤色特征' }[cat] || cat;
+                    const color = cat.endsWith('ad') ? 'rgba(255,59,48,0.7)' : 'rgba(255,159,10,0.6)';
+                    const lockClass = isBlocked(elRec.el) ? 'style="opacity:0.5;"' : '';
+                    const tagName = elRec.el?.tagName ? escapeHTML(elRec.el.tagName.toLowerCase()) : '(unknown)';
+                    const elId = elRec.el?.id ? '#' + escapeHTML(elRec.el.id) : '';
+                    const elClass = elRec.el?.className ? '.' + escapeHTML(String(elRec.el.className).split(' ')[0]) : '';
+                    const blocked = elRec.blocked;
+                    const checked = _selectedSet.has('_e_' + i);
+                    const actionBtns = blocked
+                        ? `<span style="font-size:11px; color:#888;">已拦截</span>`
+                        : `<button class="btn-danger" style="flex:none; padding:2px 8px; font-size:11px;" data-el-idx="${i}">🛡拦截</button>`;
+                    rows.push(`<div class="gd-domain-row" data-el-idx="${i}" data-type="element" ${lockClass}>
+                        <div class="gd-left">
+                            <input type="checkbox" class="iframe-row-cb" data-el-idx="${i}" ${checked ? 'checked' : ''} style="flex:none; margin-right:6px; cursor:pointer; accent-color:#007AFF;" />
+                            <div>
+                                <div class="gd-host"><span class="tag" style="background:${color};">⚠${reasonLabel}</span> 嫌疑分 ${suspicion} · <code>${tagName}${elId}${elClass}</code></div>
+                                ${elRec.selector ? `<div class="gd-meta">selector: <code>${escapeHTML(elRec.selector.slice(0, 80))}</code></div>` : ''}
+                                ${elRec.frameHost ? `<div class="gd-meta">帧域名: ${escapeHTML(elRec.frameHost)}</div>` : ''}
+                            </div>
+                        </div>
+                        <div style="display:flex; align-items:center;">${actionBtns}</div>
+                    </div>`);
+                });
+
+                list.innerHTML = rows.join('');
+
+                // 行 click = 切换勾选（H8），仅按钮触发动作
+                list.addEventListener('click', (e) => {
+                    const row = e.target.closest('.gd-domain-row');
+                    if (!row) return;
+                    // 忽略 checkbox 自身和按钮
+                    if (e.target.classList.contains('iframe-row-cb') || e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
+                    const idx = row.dataset.idx;
+                    const elIdx = row.dataset.elIdx;
+                    if (idx !== undefined) {
+                        if (_selectedSet.has(Number(idx))) _selectedSet.delete(Number(idx));
+                        else _selectedSet.add(Number(idx));
+                    } else if (elIdx !== undefined) {
+                        const key = '_e_' + Number(elIdx);
+                        if (_selectedSet.has(key)) _selectedSet.delete(key);
+                        else _selectedSet.add(key);
+                    }
+                    renderScanList();
+                });
+
+                // 绑定帧级 block/protect 按钮
+                list.querySelectorAll('[data-action="block"]').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const idx = parseInt(btn.dataset.idx, 10);
+                        const iframe = iframeRecs[idx]?.iframe;
+                        if (!iframe) return;
+                        const rec = IframeGuard._ensureRecord(iframe);
+                        if (rec.blocked || rec.manual) return;
+                        BlockEngine.hideElement(iframe);
+                        rec.blocked = true; rec.verdict = 'ad';
+                        blockedFingerprints.add(iframe);
+                        IframeGuard._incStat('blocked');
+                        EventBus.emit('iframe:blocked', { iframe, reason: 'panel-click' });
+                        this.showToast('已拦截该 iframe', 'success');
+                        renderScanList();
+                    });
+                });
+                list.querySelectorAll('[data-action="protect"]').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const idx = parseInt(btn.dataset.idx, 10);
+                        const iframe = iframeRecs[idx]?.iframe;
+                        if (!iframe) return;
+                        IframeGuard.protectInFrame({ iframe, el: iframe });
+                        blockedFingerprints.add(iframe);
+                        this.showToast('已保护该帧（零输入白名单）', 'success');
+                        renderScanList();
+                    });
+                });
+                // 绑定帧内元素级拦截（H8：仅按钮触发，不走行 click）
+                list.querySelectorAll('[data-el-idx]').forEach(btn => {
+                    if (btn.dataset.action) return;
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const elIdx = parseInt(btn.dataset.elIdx, 10);
+                        const elRec = deepResults[elIdx];
+                        if (!elRec || elRec.blocked) return;
+                        IframeGuard.blockInFrameNode(elRec);
+                        const targetIframe = elRec.el?.closest('iframe');
+                        if (targetIframe) blockedFingerprints.add(targetIframe);
+                        this.showToast('已拦截帧内元素', 'success');
+                        renderScanList();
+                    });
+                });
+            };
+
+            // ─── 白名单列表渲染 ───
+            const renderWlList = () => {
+                const box = panel.querySelector('#iframe-wl-list');
+                if (!box) return;
+                const list = WhitelistStore.getAll();
+                if (list.length === 0) {
+                    box.innerHTML = '<div class="empty-tip">暂无白名单条目（扫描时点击 ✅保护 按钮可零输入添加）</div>';
+                    return;
+                }
+                box.innerHTML = list.map((e, i) => {
+                    const parts = [];
+                    if (e.selector) parts.push(`选择器: <code>${escapeHTML(e.selector)}</code>`);
+                    if (e.domain) parts.push(`域名: <code>${escapeHTML(e.domain)}</code>`);
+                    return `<div class="gd-domain-row">
+                        <div class="gd-left">
+                            <div class="gd-check" style="cursor:pointer; color:#ff6f00;" data-wl-del="${i}" title="删除">✕</div>
+                            <div><div class="gd-host">${parts.join(' · ') || '(空)'}</div></div>
+                        </div>
+                    </div>`;
+                }).join('');
+                box.querySelectorAll('[data-wl-del]').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const idx = parseInt(btn.getAttribute('data-wl-del'), 10);
+                        WhitelistStore.remove(idx);
+                        this.showToast('已从白名单移除', 'success');
+                        try { IframeGuard.rescanAll(); } catch (err) { Log.warn(err.message || err); }
+                        renderWlList();
+                    });
+                });
+            };
+
+            // ─── 初始渲染 ───
+            renderScanList();
+            renderWlList();
+
+            // ─── 事件绑定 ───
+            panel.querySelector('#btn-iframe-scan').addEventListener('click', () => {
+                _selectedSet.clear();
+                _scanCache = null; // 清除缓存，强制重新扫描
+                renderScanList();
+            });
+            panel.querySelector('#btn-iframe-rescan').addEventListener('click', () => {
+                _selectedSet.clear();
+                try {
+                    IframeGuard.forceRescan();
+                    renderScanList();
+                    this.showToast('已重新扫描全部 iframe', 'success');
+                } catch (e) { this.showToast('重扫失败: ' + e.message, 'error'); }
+            });
+
+            // 预览横幅
+            let _previewBanner = null;
+            const showPreviewBanner = (fnReset) => {
+                this._hidePreviewBanner();
+                const banner = document.createElement('div');
+                banner.className = 'preview-banner';
+                banner.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483646;background:rgba(0,122,255,0.85);color:#fff;padding:8px 20px;border-radius:0 0 10px 10px;font-size:13px;font-weight:600;box-shadow:0 2px 12px rgba(0,0,0,0.3);';
+                banner.textContent = '🔍 预览模式：勾选元素后预览效果，完成后点"完成"退出预览';
+                banner.addEventListener('click', () => { fnReset(); this._hidePreviewBanner(); });
+                document.documentElement.appendChild(banner);
+                _previewBanner = banner;
+            };
+            // 预览按钮
+            panel.querySelector('#btn-iframe-preview').addEventListener('click', () => {
+                if (!this._iframePreview.active) {
+                    this._iframePreview = { active: true, elements: [] };
+                    showPreviewBanner(() => {
+                        this._iframePreview = { active: false, elements: [] };
+                    });
+                } else {
+                    this._iframePreview.active = false;
+                    this._iframePreview.elements.forEach(el => BlockEngine.showElement(el));
+                    this._iframePreview.elements = [];
+                    this._hidePreviewBanner();
+                }
+                this.showToast(this._iframePreview.active ? '预览已激活' : '预览已退出', 'info');
+            });
+            // 批量拦截选中
+            panel.querySelector('#btn-iframe-batch-info').addEventListener('click', () => {
+                if (_selectedSet.size === 0) { this.showToast('未选中任何元素', 'warning'); return; }
+                let count = 0;
+                _selectedSet.forEach(key => {
+                    if (key.startsWith('_e_')) {
+                        const i = parseInt(key.slice(3), 10);
+                        const elRec = _deepResults[i];
+                        if (elRec && !elRec.blocked) {
+                            IframeGuard.blockInFrameNode(elRec);
+                            count++;
+                        }
+                    } else {
+                        const idx = parseInt(key, 10);
+                        const iframe = _iframeRecs[idx]?.iframe;
+                        if (iframe) {
+                            const rec = IframeGuard._ensureRecord(iframe);
+                            if (!rec.blocked && !rec.manual) {
+                                BlockEngine.hideElement(iframe);
+                                rec.blocked = true; rec.verdict = 'ad';
+                                count++;
+                            }
+                        }
+                    }
+                });
+                _selectedSet.clear();
+                renderScanList();
+                this.showToast(`已批量拦截 ${count} 个元素`, 'success');
+            });
+            panel.querySelector('#iframe-max-depth').addEventListener('change', (e) => {
+                const d = parseInt(e.target.value, 10);
+                if (d >= IframeGuard.MIN_DEPTH && d <= IframeGuard.MAX_DEPTH) {
+                    IframeGuard.setMaxDepth(d);
+                    IframeDeepScanner.maxDepth = d;
+                    this.showToast(`扫描深度已设为 ${d} 层`, 'success');
+                } else {
+                    this.showToast('深度须在 1-5 之间', 'warning');
+                    e.target.value = this.storage.getIframeConfig().maxDepth || 3;
+                }
+            });
+            panel.querySelector('#btn-close-iframe').addEventListener('click', () => this.clearPanel());
+        }
+
+    function ManagerPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+            const data = this.storage.getData();
+
+            // 防御策略状态
+            const isManualPreemptive = data.config.mode === 'preemptive';
+            const isFlashMarked = !!this.storage.flashList[this.storage.domain];
+            const cleanCount = this.storage.getCleanLoadCount();
+            let modeText, modeHint;
+            if (isManualPreemptive) {
+                modeText = '<span style="color:#ffb74d; font-weight:bold;">极速预判（手动开启）</span>';
+                modeHint = '在 0/100/300/700/1500ms 多时序重扫，专治首屏闪现；观察无闪现后可切回智能自动。';
+            } else if (isFlashMarked) {
+                modeText = `<span style="color:#ff6f00; font-weight:bold;">极速预判（闪现自动启用）</span> · 自愈进度 ${cleanCount}/3`;
+                modeHint = '检测到广告闪现已自动升级。连续 3 次干净加载后自动恢复智能自动，或手动重置。';
+            } else {
+                modeText = '<span style="color:#34c759; font-weight:bold;">智能自动</span>';
+                modeHint = '由 MutationObserver 实时拦截动态广告，常规站点推荐。遇首屏闪现可手动切到极速预判。';
+            }
+            const flashStatus = isFlashMarked
+                ? `<span style="color:red; font-weight:bold;">已记录闪现特征</span>（本次加载如无闪现，将计入自愈 ${cleanCount}/3）`
+                : '<span style="color:#34c759; font-weight:bold;">运行良好</span>';
+            const highlightColor = GM_getValue('config_highlight_color', '#FF3B30');
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">规则与防御管理 (${this.storage.domain})</h3>
+
+                <div class="status-bar">
+                    <div><strong>防御策略：</strong> ${modeText}</div>
+                    <div style="font-size:11px; color:#999; margin:2px 0 6px;">${modeHint}</div>
+                    <div><strong>系统评估：</strong> ${flashStatus}</div>
+                    <div><strong>全局域名黑名单：</strong> 共 <span id="mgr-domain-count">${data.domainBlock.length}</span> 个域名（跨站点生效）</div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1);">
+                        <div>🌐 <strong>网络拦截：</strong><span style="color:#4aa3ff;"> ${BlockEngine.stats.networkBlocks}</span> 次</div>
+                        <div>🧩 <strong>DOM 屏蔽：</strong><span style="color:#34c759;"> ${BlockEngine.stats.domBlocks}</span> 个</div>
+                        <div>⚡ <strong>匹配耗时：</strong><span style="color:#ffb74d;"> ${BlockEngine.stats.matchTimeMs.toFixed(2)}</span> ms</div>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px; margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.05);">
+                        <div>🖼️ <strong>iframe 拦截：</strong><span style="color:#ff6f00;"> ${IframeGuard.getStats().blocked}</span> 个</div>
+                        <div>🛡️ <strong>iframe 保护：</strong><span style="color:#34c759;"> ${IframeGuard.getStats().protected}</span> 个</div>
+                        <div>🔍 <strong>iframe 扫描：</strong><span style="color:#4aa3ff;"> ${IframeGuard.getStats().scanned}</span> 个</div>
+                        <div>🧹 <strong>内部清理：</strong><span style="color:#9c27b0;"> ${IframeGuard.getStats().cleaned}</span> 个</div>
+                    </div>
+                    <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
+                </div>
+
+                <div class="status-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <label style="margin:0; font-size:12px; color:#ddd; white-space:nowrap;">🎨 高亮选框颜色：</label>
+                    <input type="text" id="ui-highlight-color" value="${escapeHTML(highlightColor)}"
+                           pattern="^#[0-9A-Fa-f]{6}$" maxlength="7" placeholder="#FF3B30"
+                           style="width:90px; padding:4px 8px; font-family:monospace; text-transform:uppercase; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
+                    <span id="color-preview" style="display:inline-block; width:20px; height:20px; border-radius:4px; border:1px solid rgba(255,255,255,0.3); background:${escapeHTML(highlightColor)}; vertical-align:middle;"></span>
+                    <span style="font-size:10px; color:#888;">输入 Hex 色值（如 #FF3B30）实时预览</span>
+                </div>
+
+                <div class="gd-toolbar">
+                    <select id="mgr-scope-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
+                        <option value="all">全部范围</option>
+                        <option value="global">域名黑名单</option>
+                        <option value="current">本站规则</option>
+                        <option value="other">其他站点</option>
+                    </select>
+                    <select id="mgr-type-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
+                        <option value="">全部类型</option>
+                        <option value="domainBlock">域名</option>
+                        <option value="iframeBlock">iframe</option>
+                        <option value="static">静态</option>
+                        <option value="dynamic">动态</option>
+                        <option value="regex">正则</option>
+                        <option value="attribute">属性</option>
+                        <option value="structural">位置</option>
+                        <option value="complex">积木</option>
+                        <option value="pathPattern">路径</option>
+                    </select>
+                    <input type="text" id="mgr-filter" placeholder="输入域名或规则内容关键字过滤..." />
+                    <button class="btn-warning" id="btn-impact-sort" style="flex:none; padding:6px 10px; font-size:12px;">📊 按影响度排序</button>
+                    <button class="btn-outline" id="btn-batch" style="flex:none; padding:6px 10px; font-size:12px;">☑ 批量选择</button>
+                    <button class="btn-danger" id="btn-batch-delete" style="flex:none; padding:6px 10px; font-size:12px; display:none;">🗑 删除选中(0)</button>
+                </div>
+                <div class="gd-stats" id="mgr-stats"></div>
+                <div class="selection-info" style="max-height: 320px; overflow-y: auto; margin-bottom: 12px;">
+                    <ul class="rule-list" id="mgr-list"></ul>
+                </div>
+
+                <div class="btn-group">
+                    <button class="btn-info" id="btn-toggle-mode">🚀 切换防御策略</button>
+                    <button class="btn-warning" id="btn-reset-flash" style="${isFlashMarked ? '' : 'display:none;'}">♻️ 重置闪现标记</button>
+                    <button class="btn-success" id="btn-export">📤 导出规则</button>
+                    <button class="btn-warning" id="btn-import">📥 导入规则</button>
+                </div>
+                <div class="btn-group" style="margin-top: 10px;">
+                    <button class="btn-info" id="btn-iframe-panel">🖼️ iframe 防线管理</button>
+                    <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
+                    <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
+                    <button class="btn-primary" id="btn-close-manager">完成</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            // —— 统一记录构建：全局域名黑名单 + 本站 7 类 + 其他站点规则，按 _ts 倒序（最近置顶）——
+            const formatRuleContent = (type, r) => {
+                switch (type) {
+                    case 'static': return escapeHTML(r.selector || '');
+                    case 'dynamic': return `类名: ${escapeHTML(r.className || '')}`;
+                    case 'regex': return `${r.mode === 'contains' ? '包含' : '匹配'}: ${escapeHTML(r.regex || '')} (层级: ${r.level})`;
+                    case 'attribute': return `选择器: ${escapeHTML(r.attrSelector || '')}`;
+                    case 'structural': return escapeHTML(r.structSelector || '');
+                    case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
+                    case 'iframeBlock': {
+                        const mt = r.matchType === 'srcDomain' ? 'src域名' : (r.matchType === 'srcdocKeyword' ? 'srcdoc关键词' : (r.matchType === 'geometry' ? '几何条件' : r.matchType));
+                        return `iframe[${mt}]: ${escapeHTML(r.value || '')}`;
+                    }
+                    case 'complex': {
+                        const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
+                        const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
+                        const condText = (r.conditions || []).map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic || 'AND')}</span> `);
+                        return `${condText} (层级: ${r.level})`;
+                    }
+                    default: return '';
+                }
+            };
+            const TYPE_META = {
+                domainBlock: { label: '域名', tag: 'domain' },
+                iframeBlock: { label: 'iframe', tag: 'iframe' },
+                static: { label: '静态', tag: '' },
+                dynamic: { label: '动态', tag: '' },
+                regex: { label: '正则', tag: '' },
+                attribute: { label: '属性', tag: 'attr' },
+                structural: { label: '位置', tag: 'struct' },
+                complex: { label: '积木', tag: 'complex' },
+                pathPattern: { label: '路径', tag: 'path' }
+            };
+            const buildRecords = () => {
+                const recs = [];
+                const d = this.storage.getData();
+                // 1. 全局域名黑名单（{domain,_ts}[]）
+                d.domainBlock.forEach((r, i) => recs.push({
+                    scope: 'global', domain: '(全局)', index: i, type: 'domainBlock',
+                    content: escapeHTML(r.domain), ts: r._ts || 0, value: r.domain,
+                    disabled: !!r._disabled,
+                    rule: r
+                }));
+                // 1.1 iframe 规则（全局生效，{matchType,value,_ts,_disabled}[]）
+                this.storage.getIframeBlocks().forEach((r, i) => recs.push({
+                    scope: 'global', domain: '(全局)', index: i, type: 'iframeBlock',
+                    content: formatRuleContent('iframeBlock', r), ts: r._ts || 0, value: r.value || '',
+                    disabled: !!r._disabled,
+                    rule: r
+                }));
+                // 2. 本站 7 类规则
+                ['static', 'dynamic', 'regex', 'attribute', 'structural', 'complex', 'pathPattern'].forEach(type => {
+                    (d[type] || []).forEach((r, i) => recs.push({
+                        scope: 'current', domain: this.storage.domain, index: i, type,
+                        content: formatRuleContent(type, r), ts: r._ts || 0,
+                        value: (type === 'pathPattern') ? (r.pattern || '') : '',
+                        disabled: !!r._disabled,
+                        rule: r
+                    }));
+                });
+                // 3. 其他站点规则（跨站，排除本站以免重复）
+                this.storage.getAllSiteRules().forEach(rec => {
+                    if (rec.domain === this.storage.domain) return;
+                    recs.push({
+                        scope: 'other', domain: rec.domain, index: rec.index, type: rec.type,
+                        content: formatRuleContent(rec.type, rec.rule), ts: rec.rule._ts || 0,
+                        value: (rec.type === 'pathPattern') ? (rec.rule.pattern || '') : '',
+                        disabled: !!rec.rule._disabled,
+                        rule: rec.rule
+                    });
+                });
+                // 按 _ts 倒序：最近过滤的规则置顶（问题3&7）
+                recs.sort((a, b) => b.ts - a.ts);
+                return recs;
+            };
+
+            let filterScope = 'all';
+            let filterType = '';
+            let filterText = '';
+            // 影响度排序模式：true 时按 impactScore 降序展示，高分规则红色标记便于排查误杀
+            let impactMode = false;
+            // 批量选择模式：true 时每条规则前显示复选框，支持一次性删除多条
+            let batchMode = false;
+            const batchSelected = new Set(); // key: `${scope}|${domain}|${type}|${index}`
+            // 构建记录并按需注入 impactScore：删除/撤销/切换后调用，避免影响度模式下排序退化(BUG-S3)
+            const rebuildRecords = () => {
+                const recs = buildRecords();
+                if (impactMode) {
+                    const impacts = this.evaluateRuleImpact();
+                    const impactMap = new Map();
+                    impacts.forEach(imp => impactMap.set(`${imp.type}-${imp.index}`, imp.score));
+                    recs.forEach(rec => { rec.impactScore = impactMap.get(`${rec.type}-${rec.index}`) || 0; });
+                }
+                return recs;
+            };
+            let records = rebuildRecords();
+
+            const renderList = () => {
+                const list = panel.querySelector('#mgr-list');
+                const stats = panel.querySelector('#mgr-stats');
+                const countEl = panel.querySelector('#mgr-domain-count');
+                if (countEl) countEl.textContent = records.filter(r => r.scope === 'global').length;
+                if (!list) return;
+                // 影响度模式下按 impactScore 降序，让高风险（疑似误杀）规则置顶
+                const displayRecords = impactMode
+                    ? records.slice().sort((a, b) => (b.impactScore || 0) - (a.impactScore || 0))
+                    : records;
+                const filtered = displayRecords.filter(rec => {
+                    if (filterScope !== 'all' && rec.scope !== filterScope) return false;
+                    if (filterType && rec.type !== filterType) return false;
+                    if (filterText) {
+                        const hay = (rec.domain + ' ' + (TYPE_META[rec.type] ? TYPE_META[rec.type].label : '') + ' ' + rec.content + (rec.rule?._meta || '')).toLowerCase();
+                        if (!hay.includes(filterText)) return false;
+                    }
+                    return true;
+                });
+                if (stats) stats.textContent = impactMode
+                    ? `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（按影响度排序，⚠️ 标记为疑似误杀）`
+                    : `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（最近过滤置顶，点击删除即时生效）`;
+                if (filtered.length === 0) {
+                    list.innerHTML = '<li class="empty-tip">暂无规则。手动屏蔽元素或封杀域名后将显示在此处。</li>';
+                    return;
+                }
+                list.innerHTML = filtered.map(rec => {
+                    const meta = TYPE_META[rec.type] || { label: rec.type, tag: '' };
+                    const siteBadge = rec.scope === 'current'
+                        ? `<span class="as-site" style="background:rgba(52,199,89,0.3);">本站</span>`
+                        : rec.scope === 'global'
+                            ? `<span class="as-site" style="background:rgba(255,111,0,0.35);">全局</span>`
+                            : `<span class="as-site" title="${escapeHTML(rec.domain)}">${escapeHTML(rec.domain)}</span>`;
+                    // 影响度模式：score≥60 红色警告（高度疑似误杀），30-59 黄色提示
+                    const impactBadge = impactMode && rec.impactScore >= 60
+                        ? `<span class="tag" style="background:rgba(255,0,0,0.7);">⚠️影响${rec.impactScore}</span>`
+                        : impactMode && rec.impactScore >= 30
+                            ? `<span class="tag" style="background:rgba(255,159,10,0.7);">影响${rec.impactScore}</span>`
+                            : '';
+                    // 禁用规则：文字置灰 + 删除线 + "已禁用"标记 + 切换按钮显示"启用"
+                    const disabledStyle = rec.disabled ? 'opacity:0.45; text-decoration:line-through;' : '';
+                    const disabledBadge = rec.disabled ? '<span class="tag" style="background:rgba(142,142,147,0.6);">已禁用</span>' : '';
+                    const toggleLabel = rec.disabled ? '启用' : '禁用';
+                    const toggleClass = rec.disabled ? 'btn-success' : 'btn-outline';
+                    // 批量选择模式：每条规则前显示复选框，key 唯一标识一条规则用于批量删除
+                    const recKey = `${rec.scope}|${rec.domain}|${rec.type}|${rec.index}`;
+                    const batchBox = batchMode
+                        ? `<input type="checkbox" class="batch-check" data-key="${escapeHTML(recKey)}" ${batchSelected.has(recKey) ? 'checked' : ''} style="flex:none; width:16px; height:16px; margin-right:8px; cursor:pointer; accent-color:#ff3b30;" />`
+                        : '';
+                    // 帧内深扫规则徽章（B4）
+                    const iframeBadge = (rec.rule?._meta === 'iframe-scan')
+                        ? '<span class="tag" style="background:rgba(156,39,176,.5);">🖼帧内</span>' : '';
+                    return `<li class="rule-item">
+                        ${batchBox}
+                        <div class="rule-content" style="${disabledStyle}">
+                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content} ${impactBadge} ${disabledBadge} ${iframeBadge}
+                        </div>
+                        <button class="${toggleClass} btn-toggle" style="flex:none; width:54px; padding: 6px; margin-right:6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}">${toggleLabel}</button>
+                        <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}" data-value="${escapeHTML(rec.value || '')}">删除</button>
+                    </li>`;
+                }).join('');
+            };
+            renderList();
+
+            // 过滤器事件
+            panel.querySelector('#mgr-scope-filter').addEventListener('change', (e) => { filterScope = e.target.value; renderList(); });
+            panel.querySelector('#mgr-type-filter').addEventListener('change', (e) => { filterType = e.target.value; renderList(); });
+            panel.querySelector('#mgr-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderList(); });
+
+            // 影响度排序：评估每条规则当前页面命中元素数，命中越多越疑似误杀
+            // 切换为 toggle：首次点击进入影响度模式，再次点击恢复 _ts 倒序
+            panel.querySelector('#btn-impact-sort').addEventListener('click', (e) => {
+                // 用 currentTarget 取按钮本身，避免点击子元素时 e.target 指向子元素(BUG-3)
+                const btn = e.currentTarget;
+                if (!impactMode) {
+                    impactMode = true;
+                    btn.textContent = '↩ 恢复原排序';
+                    btn.classList.remove('btn-warning');
+                    btn.classList.add('btn-success');
+                    records = rebuildRecords(); // 进入影响度模式时注入 impactScore
+                } else {
+                    impactMode = false;
+                    btn.textContent = '📊 按影响度排序';
+                    btn.classList.remove('btn-success');
+                    btn.classList.add('btn-warning');
+                    records = buildRecords(); // 恢复 _ts 倒序
+                }
+                renderList();
+            });
+
+            // 删除：事件委托，按归属调用对应删除 API，并还原内联隐藏 + 强制重扫确保即时生效（问题2&5）
+            // 删除后仅重渲染列表（不重建面板），保留过滤态与滚动位置，连续删除无需重开面板（问题3）
+            panel.querySelector('#mgr-list').addEventListener('click', (e) => {
+                // 启用/禁用切换：调用 toggleRuleDisabled，引擎层会自动重新应用规则
+                const toggleBtn = e.target.closest('.btn-toggle');
+                if (toggleBtn) {
+                    const scope = toggleBtn.getAttribute('data-scope');
+                    const domain = toggleBtn.getAttribute('data-domain');
+                    const type = toggleBtn.getAttribute('data-type');
+                    const index = parseInt(toggleBtn.getAttribute('data-index'), 10);
+                    // iframe 规则走独立 API
+                    if (type === 'iframeBlock') {
+                        const nowDisabled = this.storage.toggleIframeRuleDisabled(index);
+                        this.showToast(nowDisabled ? '规则已禁用' : '规则已启用', nowDisabled ? 'warning' : 'success');
+                        try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
+                        records = rebuildRecords();
+                        renderList();
+                        return;
+                    }
+                    // 跨站规则需传 domain，本站/全局用默认
+                    const targetDomain = scope === 'other' ? domain : null;
+                    const nowDisabled = this.storage.toggleRuleDisabled(type, index, targetDomain);
+                    this.showToast(nowDisabled ? '规则已禁用' : '规则已启用', nowDisabled ? 'warning' : 'success');
+                    // B4: iframe-scan 规则启用/禁用时同步重应用到帧内
+                    if (type === 'attribute') {
+                        try {
+                            const allRules = this.storage.getAllSiteRules();
+                            const targetRule = allRules.find(r => r.domain === domain && r.type === type && r.index === index);
+                            if (targetRule && targetRule.rule?._meta === 'iframe-scan') {
+                                IframeGuard.reapplyInFrames();
+                            }
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                    records = rebuildRecords();
+                    renderList();
+                    return;
+                }
+                const btn = e.target.closest('.btn-delete');
+                if (!btn) return;
+                const scope = btn.getAttribute('data-scope');
+                const domain = btn.getAttribute('data-domain');
+                const type = btn.getAttribute('data-type');
+                const index = parseInt(btn.getAttribute('data-index'), 10);
+                const value = btn.getAttribute('data-value') || '';
+                const scrollBox = panel.querySelector('#mgr-list').parentElement;
+                const savedScroll = scrollBox ? scrollBox.scrollTop : 0;
+
+                // 删除前捕获完整规则对象，供撤销恢复使用
+                let capturedRule = null;
+                if (type === 'iframeBlock') {
+                    capturedRule = this.storage.getIframeBlocks()[index];
+                } else if (scope === 'global') {
+                    capturedRule = this.storage.getDomainBlocks()[index];
+                } else if (scope === 'current') {
+                    capturedRule = this.storage.getData()[type][index];
+                } else {
+                    const siteRec = this.storage.getAllSiteRules().find(r => r.domain === domain && r.type === type && r.index === index);
+                    capturedRule = siteRec ? siteRec.rule : null;
+                }
+
+                if (type === 'iframeBlock') {
+                    this.storage.removeIframeRule(index);
+                    IframeGuard.rescanAll(); // 重新评估所有 iframe（含已处理的）让规则变更即时生效
+                } else if (scope === 'global') {
+                    // 域名黑名单：removeRule 已不再内部 apply(不一致-1)，统一由 reapplyAll 接管
+                    // reapplyAll = restoreAllInlineStyles + applyCSSRules + applyRegexRules + applyComplexRules + scanAndBlockDynamic
+                    // restoreAllInlineStyles 清除该域名命中的内联隐藏，applyCSSRules 重建表（不含已删域名）
+                    this.storage.removeRule('domainBlock', index);
+                    BlockEngine.reapplyAll();
+                } else if (scope === 'current') {
+                    this.storage.removeRule(type, index);
+                    BlockEngine.reapplyAll();
+                } else {
+                    // 跨站规则：同上，需重新应用所有内联拦截
+                    this.storage.removeRuleForDomain(domain, type, index);
+                    BlockEngine.reapplyAll();
+                    // B4: 若是 iframe-scan 规则，同步重应用到各帧
+                    if (capturedRule && capturedRule._meta === 'iframe-scan') {
+                        try { IframeGuard.reapplyInFrames(); } catch (e) { Log.warn(e.message || e); }
+                    }
+                }
+                // 推入撤销栈并显示带撤销按钮的 Toast（5s 内可恢复）
+                if (capturedRule) {
+                    this._pushUndo({ type, domain, scope, rule: { ...capturedRule } });
+                    this.showToast('已删除规则', 'warning', 5000, () => {
+                        this._performUndo();
+                        records = rebuildRecords();
+                        renderList();
+                    });
+                }
+                records = rebuildRecords();
+                renderList();
+                requestAnimationFrame(() => { if (scrollBox) scrollBox.scrollTop = savedScroll; });
+            });
+
+            // ===== 批量删除功能 =====
+            // 批量选择 toggle：切换批量模式，退出时清空已选集合
+            panel.querySelector('#btn-batch').addEventListener('click', (e) => {
+                batchMode = !batchMode;
+                if (!batchMode) batchSelected.clear();
+                // 用 currentTarget 取按钮本身，避免点击子元素时 e.target 指向子元素(BUG-3)
+                const btn = e.currentTarget;
+                btn.textContent = batchMode ? '↩ 退出批量' : '☑ 批量选择';
+                btn.classList.toggle('btn-success', batchMode);
+                btn.classList.toggle('btn-outline', !batchMode);
+                const delBtn = panel.querySelector('#btn-batch-delete');
+                if (delBtn) {
+                    delBtn.style.display = batchMode ? '' : 'none';
+                    delBtn.textContent = `🗑 删除选中(${batchSelected.size})`;
+                }
+                renderList();
+            });
+
+            // 复选框变化：同步 batchSelected 集合并更新删除按钮计数
+            panel.querySelector('#mgr-list').addEventListener('change', (e) => {
+                if (!e.target.classList.contains('batch-check')) return;
+                const key = e.target.getAttribute('data-key');
+                if (e.target.checked) batchSelected.add(key);
+                else batchSelected.delete(key);
+                const delBtn = panel.querySelector('#btn-batch-delete');
+                if (delBtn) delBtn.textContent = `🗑 删除选中(${batchSelected.size})`;
+            });
+
+            // 批量删除：按 (scope|domain|type) 分组，索引降序逐条删除避免错位；
+            // 删除前捕获完整规则对象，整体推入撤销栈（一次撤销恢复全部）
+            panel.querySelector('#btn-batch-delete').addEventListener('click', () => {
+                if (batchSelected.size === 0) { this.showToast('未选中任何规则', 'info'); return; }
+                const count = batchSelected.size;
+                this.showConfirm('批量删除确认', `确认删除选中的 ${count} 条规则？\n\n此操作可通过 Toast 撤销按钮一次性恢复（5 次操作内）。`, () => {
+                    // 解析选中 key → 删除任务列表
+                    const tasks = [];
+                    batchSelected.forEach(key => {
+                        const parts = key.split('|');
+                        // key 格式：scope|domain|type|index，domain 可能含 | 已用 escapeHTML 转义，此处 domain 为存储域名为安全字符
+                        if (parts.length < 4) return;
+                        const scope = parts[0];
+                        const domain = parts[1];
+                        const type = parts[2];
+                        const index = parseInt(parts[3], 10);
+                        if (isNaN(index)) return;
+                        tasks.push({ scope, domain, type, index });
+                    });
+                    // 捕获待删规则快照（用于撤销恢复）
+                    const captured = [];
+                    tasks.forEach(t => {
+                        let rule = null;
+                        let value = '';
+                        if (t.type === 'iframeBlock') {
+                            // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
+                            rule = this.storage.getIframeBlocks()[t.index];
+                            value = rule ? (rule.value || '') : '';
+                        } else if (t.scope === 'global') {
+                            rule = this.storage.getDomainBlocks()[t.index];
+                            value = rule ? rule.domain : '';
+                        } else if (t.scope === 'current') {
+                            rule = this.storage.getData()[t.type] && this.storage.getData()[t.type][t.index];
+                        } else {
+                            const siteRec = this.storage.getAllSiteRules().find(r => r.domain === t.domain && r.type === t.type && r.index === t.index);
+                            rule = siteRec ? siteRec.rule : null;
+                        }
+                        if (rule) captured.push({ scope: t.scope, domain: t.domain, type: t.type, rule: { ...rule }, value });
+                    });
+                    // 冗余-1：已移除 restoreInlineForDomain 循环——reapplyAll 内部 restoreAllInlineStyles
+                    // 会清除全部内联隐藏样式（不依赖规则存在），此处的逐域名还原完全被覆盖，属冗余操作
+                    // 按 (scope|domain|type) 分组，组内索引降序删除，保证低索引不受高索引删除影响
+                    const groups = new Map();
+                    tasks.forEach(t => {
+                        const gk = `${t.scope}|${t.domain}|${t.type}`;
+                        if (!groups.has(gk)) groups.set(gk, []);
+                        groups.get(gk).push(t);
+                    });
+                    groups.forEach(groupTasks => {
+                        groupTasks.sort((a, b) => b.index - a.index);
+                        groupTasks.forEach(t => {
+                            if (t.type === 'iframeBlock') this.storage.removeIframeRule(t.index);
+                            else if (t.scope === 'global') this.storage.removeRule('domainBlock', t.index);
+                            else if (t.scope === 'current') this.storage.removeRule(t.type, t.index);
+                            else this.storage.removeRuleForDomain(t.domain, t.type, t.index);
+                        });
+                    });
+                    // 删除后统一重新应用所有拦截规则
+                    BlockEngine.reapplyAll();
+                    // iframeBlock 规则变更需重新扫描（reapplyAll 不覆盖 iframe 扫描）
+                    if (tasks.some(t => t.type === 'iframeBlock')) {
+                        try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
+                    }
+                    // 推入批量撤销条目（一次撤销恢复全部）
+                    if (captured.length > 0) {
+                        this._pushUndo({ batch: true, rules: captured });
+                        this.showToast(`已批量删除 ${captured.length} 条规则`, 'warning', 5000, () => {
+                            this._performUndo();
+                            records = rebuildRecords();
+                            renderList();
+                        });
+                    }
+                    batchSelected.clear();
+                    batchMode = false;
+                    const batchBtn = panel.querySelector('#btn-batch');
+                    if (batchBtn) {
+                        batchBtn.textContent = '☑ 批量选择';
+                        batchBtn.classList.toggle('btn-success', false);
+                        batchBtn.classList.toggle('btn-outline', true);
+                    }
+                    const delBtn = panel.querySelector('#btn-batch-delete');
+                    if (delBtn) delBtn.style.display = 'none';
+                    records = rebuildRecords();
+                    renderList();
+                });
+            });
+
+            // 高亮颜色 Hex 输入：实时校验、预览并持久化
+            const colorInput = panel.querySelector('#ui-highlight-color');
+            const colorPreview = panel.querySelector('#color-preview');
+            if (colorInput) {
+                colorInput.addEventListener('input', (e) => {
+                    const val = e.target.value.trim();
+                    // 非法 Hex 值给视觉反馈(BUG-11)：红框提示用户格式错误，合法时还原边框并实时预览
+                    if (/^#[0-9A-Fa-f]{6}$/.test(val)) {
+                        colorInput.style.borderColor = '';
+                        document.documentElement.style.setProperty('--pro-blocker-highlight-color', val);
+                        if (colorPreview) colorPreview.style.background = val;
+                        GM_setValue('config_highlight_color', val);
+                    } else {
+                        colorInput.style.borderColor = '#FF3B30';
+                    }
+                });
+            }
+
+            panel.querySelector('#btn-toggle-mode').addEventListener('click', () => {
+                const newMode = this.storage.toggleMode();
+                this.showToast(`策略已调整为：${newMode === 'preemptive' ? '极速预判模式' : '智能自动模式'}，页面即将刷新。`, 'info', 2000);
+                setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
+            });
+
+            const resetBtn = panel.querySelector('#btn-reset-flash');
+            if (resetBtn) {
+                resetBtn.addEventListener('click', () => {
+                    this.showConfirm('清除闪现标记', '确认清除本站的闪现标记？清除后将恢复"智能自动"模式（除非你手动开启极速预判）。', () => {
+                        this.storage.resetFlash();
+                        this.showToast('闪现标记已清除，页面即将刷新。', 'success', 2000);
+                        setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
+                    });
+                });
+            }
+
+            panel.querySelector('#btn-export').addEventListener('click', () => this.showExportPanel());
+            panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
+            panel.querySelector('#btn-ag-export').addEventListener('click', () => this.showAdGuardExportPanel());
+
+            panel.querySelector('#btn-clear-all').addEventListener('click', () => {
+                this.showConfirm('清除本站规则', '警告：此操作将清空【当前域名】下的所有拦截规则和配置（不影响全局域名黑名单）。确认继续？', () => {
+                    this.storage.clearDomain();
+                    window.location.reload();
+                });
+            });
+
+            panel.querySelector('#btn-close-manager').addEventListener('click', () => this.clearPanel());
+            panel.querySelector('#btn-iframe-panel').addEventListener('click', () => this.showIframePanel());
+        }
+
+    function ExportPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+            const json = this.storage.exportAll();
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">📤 导出规则</h3>
+                <p>下方文本框包含全部拦截规则、全局域名黑名单、iframe 拦截规则与白名单。复制后保存到任意位置，或在新设备的脚本中通过"导入规则"粘贴即可。</p>
+                <textarea id="export-text" readonly></textarea>
+                <div class="btn-group" style="margin-top: 10px;">
+                    <button class="btn-primary" id="btn-copy">📋 复制到剪贴板</button>
+                    <button class="btn-success" id="btn-download">💾 下载为文件</button>
+                    <button class="btn-outline" id="btn-back">返回</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            const ta = panel.querySelector('#export-text');
+            ta.value = json;
+
+            panel.querySelector('#btn-copy').addEventListener('click', async () => {
+                const text = ta.value;
+                try {
+                    await navigator.clipboard.writeText(text);
+                    this.showToast('已复制到剪贴板！', 'success');
+                } catch (e) {
+                    ta.select();
+                    try { document.execCommand('copy'); this.showToast('已复制到剪贴板！', 'success'); }
+                    catch (e2) { this.showToast('复制失败，请手动选中文本复制。', 'error'); }
+                }
+            });
+
+            panel.querySelector('#btn-download').addEventListener('click', () => {
+                const blob = new Blob([json], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `pro-blocker-rules-${new Date().toISOString().slice(0, 10)}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+            });
+
+            panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
+        }
+
+    function AdGuardExportPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            let rulesText = this.generateAdGuardRules();
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
+                <p class="hint-text">已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
+                <textarea class="export-box" id="ag-export-box" readonly></textarea>
+                <div class="btn-group">
+                    <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
+                    <button class="btn-success" id="btn-ag-download">💾 下载 txt</button>
+                    <button class="btn-outline" id="btn-ag-back">返回</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            const box = panel.querySelector('#ag-export-box');
+            box.value = rulesText;
+
+            panel.querySelector('#btn-ag-copy').addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(rulesText);
+                    this.showToast('AdGuard 规则已复制到剪贴板！', 'success');
+                } catch (e) {
+                    box.select();
+                    try { document.execCommand('copy'); this.showToast('AdGuard 规则已复制到剪贴板！', 'success'); }
+                    catch (e2) { this.showToast('复制失败，请手动选中文本复制。', 'error'); }
+                }
+            });
+
+            panel.querySelector('#btn-ag-download').addEventListener('click', () => {
+                const blob = new Blob([rulesText], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `adguard-rules-${new Date().toISOString().slice(0, 10)}.txt`;
+                a.click();
+                URL.revokeObjectURL(url);
+            });
+
+            panel.querySelector('#btn-ag-back').addEventListener('click', () => this.showManager());
+        }
+
+    function OverlayScanPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            // 双引擎采集：BlockEngine.scanInvisibleOverlays（透明跳转覆盖层）+ OverlayAdScanner（不可见/覆盖层/博彩色情图片/追踪像素）
+            // 合并策略：按元素引用合并，BlockEngine 提供触发URL/跨域/尺寸，OverlayAdScanner 提供嫌疑分/分类/特征/原因
+            // 过滤策略：已封杀域名 / 已被脚本隐藏 / 已匹配现有规则的元素不再重复展示
+            const collectAll = async (opts = {}) => {
+                const deep = !!opts.deep;
+                const blockedDomains = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+                // 异步时间分片扫描：避免大型页面 5000+ 候选导致主线程卡顿
+                const beRecords = await BlockEngine.scanInvisibleOverlaysAsync({ autoBlock: false });
+                let oasResult = { results: [], elapsed: '0', total: 0, deepExtras: null };
+                try {
+                    // 不一致-3 修复：deep=true 调用 deepScan（肤色/伪元素/沙箱解码高阶探测），
+                    //              deep=false 调用 scan（快速基线），两者维度/耗时显著区分
+                    oasResult = deep ? OverlayService.deepScan({ deep: true }) : OverlayService.scan();
+                } catch (e) { Log.warn(e.message || e); }
+                // 以元素引用为 key 建立 OverlayAdScanner 特征索引
+                const oasMap = new Map();
+                for (const r of (oasResult.results || [])) {
+                    if (r.el) oasMap.set(r.el, r);
+                }
+
+                // 判定元素是否已被封杀（域名已在黑名单 / 元素已被脚本隐藏 / 元素匹配现有规则）
+                const isAlreadyBlocked = (rec) => {
+                    if (!rec.el) return true;
+                    // 脚本自身 UI 永远视为已处理（不展示在扫描结果中）
+                    if (ProtectedCheck.isProtected(rec.el)) return true;
+                    // 元素已从 DOM 移除（被脚本 remove() 或被父级移除）
+                    if (!document.contains(rec.el)) return true;
+                    if (rec.triggerUrl) {
+                        try {
+                            const h = new URL(rec.triggerUrl, location.href).hostname;
+                            if (blockedDomains.has(h)) return true;
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                    // 内联隐藏（脚本封杀后打的内联样式）：扩展 visibility/opacity/pointer-events 的 important 检查
+                    if (rec.el.style) {
+                        const s = rec.el.style;
+                        if (s.display === 'none') return true;
+                        if (s.visibility === 'hidden' && s.getPropertyPriority('visibility') === 'important') return true;
+                        if (s.opacity === '0' && s.getPropertyPriority('opacity') === 'important') return true;
+                        if (s.pointerEvents === 'none' && s.getPropertyPriority('pointer-events') === 'important') return true;
+                    }
+                    // CSS 规则隐藏：OAS 独有结果未经过 BlockEngine 的 getComputedStyle 过滤
+                    // 通过计算样式检查，避免已封杀的元素再次出现在扫描列表
+                    // 新增：父级隐藏检查——自身可见但被父级 display:none / visibility:hidden 隐藏
+                    if (document.contains(rec.el)) {
+                        try {
+                            const cs = window.getComputedStyle(rec.el);
+                            if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return true;
+                            let parent = rec.el.parentElement;
+                            while (parent && parent !== document.body) {
+                                const pcs = window.getComputedStyle(parent);
+                                if (pcs.display === 'none' || pcs.visibility === 'hidden') return true;
+                                parent = parent.parentElement;
+                            }
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                    // 检查元素是否匹配现有的静态/属性规则（确保持久化拦截的元素不再展示）
+                    if (rec.el) {
+                        try {
+                            const data = this.storage.getData();
+                            // 静态选择器规则
+                            for (const r of (data.static || [])) {
+                                if (r.selector && rec.el.matches && rec.el.matches(r.selector)) return true;
+                            }
+                            // 属性选择器规则
+                            for (const r of (data.attribute || [])) {
+                                if (r.attrSelector && rec.el.matches && rec.el.matches(r.attrSelector)) return true;
+                            }
+                            // 动态类名规则
+                            if (typeof rec.el.className === 'string') {
+                                for (const r of (data.dynamic || [])) {
+                                    if (r.className && rec.el.classList.contains(r.className)) return true;
+                                }
+                            }
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                    return false;
+                };
+
+                // ① BlockEngine 记录为基线，叠加 OAS 的嫌疑分/分类/特征
+                const merged = beRecords.map(rec => {
+                    const oas = rec.el ? oasMap.get(rec.el) : null;
+                    if (!oas) return rec;
+                    return {
+                        ...rec,
+                        suspicion: oas.suspicion || 0,
+                        category: oas.category || 'unknown',
+                        oasReasons: oas.reasons || [],
+                        features: oas.features || {},
+                        selector: oas.selector || '',
+                        // 高嫌疑分也算高风险（补充 BlockEngine 仅按面积判定 highRisk 的不足）
+                        highRisk: rec.highRisk || (oas.suspicion >= 50)
+                    };
+                }).filter(r => !isAlreadyBlocked(r));
+                // ② 补充 OAS 独有结果（BlockEngine 未覆盖的不可见元素/博彩色情图片/追踪像素）
+                // 用 Set O(1) 去重替代 beRecords.find O(n)，避免 O(n×m) 嵌套查找(冗余-4)
+                const beElSet = new Set(beRecords.map(r => r.el).filter(Boolean));
+                for (const oas of (oasResult.results || [])) {
+                    if (!oas.el || beElSet.has(oas.el)) continue;
+                    const rect = oas.el.getBoundingClientRect ? oas.el.getBoundingClientRect() : { width: 0, height: 0, top: 0, left: 0 };
+                    // getComputedStyle 缓存一次，避免重复 3 次调用(冗余-3)
+                    const cs = window.getComputedStyle(oas.el);
+                    const rec = {
+                        el: oas.el,
+                        tagName: oas.el.tagName,
+                        id: oas.el.id || '',
+                        className: typeof oas.el.className === 'string' ? oas.el.className.slice(0, 80) : '',
+                        opacity: parseFloat(cs.opacity) || 1,
+                        visibility: cs.visibility,
+                        position: cs.position,
+                        rect: { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top), left: Math.round(rect.left) },
+                        triggerUrl: oas.features?.externalLink || '',
+                        hasOnClick: !!oas.features?.clickable,
+                        hasIframeChild: !!oas.features?.hasEmbed,
+                        crossDomain: !!oas.features?.externalLink,
+                        highRisk: oas.suspicion >= 50,
+                        suspicion: oas.suspicion || 0,
+                        category: oas.category || 'unknown',
+                        oasReasons: oas.reasons || [],
+                        features: oas.features || {},
+                        selector: oas.selector || ''
+                    };
+                    if (!isAlreadyBlocked(rec)) merged.push(rec);
+                }
+                // 按嫌疑分降序，高分置顶
+                merged.sort((a, b) => (b.suspicion || 0) - (a.suspicion || 0));
+                return { records: merged, oasElapsed: oasResult.elapsed, deepExtras: oasResult.deepExtras || null };
+            };
+
+            // 异步初始加载：扫描在空闲帧分片执行，先显示加载态再渲染结果
+            let records = [];
+            let oasElapsed = '0';
+            let selectedSet = new Set();
+            let onlyHigh = false;
+            // 已拦截元素指纹集合：跨重新扫描保留 blocked 状态(BUG-D8)
+            // 用 tagName+id+className+rect 组合作为元素指纹，避免元素引用失效后状态丢失
+            let blockedFingerprints = new Set();
+            const fingerprintOf = (r) => `${r.tagName}|${r.id || ''}|${typeof r.el?.className === 'string' ? r.el.className.slice(0, 80) : ''}|${r.rect?.w || 0}x${r.rect?.h || 0}`;
+            // 扫描进行中标志：render() 据此显示加载占位，避免空 records 误导用户以为扫描无结果(BUG-S2)
+            let scanning = true;
+
+            const categoryLabel = (cat) => ({
+                'invisible': '不可见',
+                'overlay': '覆盖层',
+                'tracking': '追踪像素',
+                'vice-image': '🚫博彩色情图'
+            }[cat] || '可疑');
+            const categoryColor = (cat) => ({
+                'invisible': 'rgba(120,144,156,0.65)',
+                'overlay': 'rgba(255,59,48,0.65)',
+                'tracking': 'rgba(255,149,0,0.65)',
+                'vice-image': 'rgba(255,0,80,0.75)'
+            }[cat] || 'rgba(255,149,0,0.5)');
+            const getScoreClass = (s) => s >= 50 ? 'high' : s >= 25 ? 'mid' : 'low';
+
+            const render = () => {
+                const box = panel.querySelector('#overlay-list');
+                const stats = panel.querySelector('#overlay-stats');
+                if (!box) return;
+
+                // 扫描进行中：显示加载占位，不展示"未发现"误导用户(BUG-S2)
+                if (scanning) {
+                    box.innerHTML = '<li class="empty-tip">⏳ 正在扫描覆盖层...</li>';
+                    if (stats) stats.textContent = '正在扫描...';
+                    const btnBlock = panel.querySelector('#btn-block-overlay');
+                    if (btnBlock) btnBlock.disabled = true;
+                    return;
+                }
+
+                const filtered = onlyHigh ? records.map((r, i) => ({ r, i })).filter(({ r }) => r.highRisk) : records.map((r, i) => ({ r, i }));
+
+                if (stats) {
+                    const blockedCount = records.filter(r => r.blocked).length;
+                    const viceCount = records.filter(r => r.category === 'vice-image').length;
+                    const invisibleCount = records.filter(r => r.category === 'invisible').length;
+                    const overlayCount = records.filter(r => r.category === 'overlay').length;
+                    stats.textContent = `共 ${records.length} 项 · 🚫博彩色情 ${viceCount} · 覆盖层 ${overlayCount} · 不可见 ${invisibleCount} · 已拦截 ${blockedCount} · 选中 ${selectedSet.size}`;
+                }
+
+                if (filtered.length === 0) {
+                    box.innerHTML = '<div class="empty-tip">未发现不可见覆盖层广告。可尝试取消"只看高风险"或使用"深度扫描"。</div>';
+                    const btnBlock = panel.querySelector('#btn-block-overlay');
+                    if (btnBlock) btnBlock.disabled = true;
+                    return;
+                }
+
+                box.innerHTML = filtered.map(({ r, i }) => {
+                    const checked = selectedSet.has(i);
+                    const catLabel = categoryLabel(r.category);
+                    const catColor = categoryColor(r.category);
+                    const catBadge = `<span class="tag" style="background:${catColor};">${catLabel}</span>`;
+                    const riskBadge = r.highRisk ? '<span class="tag" style="background:rgba(255,59,48,0.7);">高风险</span>' : '';
+                    const willChangeBadge = r.hasWillChange ? '<span class="tag" style="background:rgba(255,149,0,0.6);">合成层</span>' : '';
+                    const blockedBadge = r.blocked ? '<span class="tag" style="background:rgba(52,199,89,0.6);">已拦截</span>' : '';
+                    const viceBadge = r.features?.viceTarget ? `<span class="tag" style="background:rgba(255,0,80,0.75);">🚫${escapeHTML(r.features.viceTarget)}</span>` : '';
+                    const reasons = (r.oasReasons && r.oasReasons.length) ? r.oasReasons.slice(0, 3).join(' · ') : '';
+                    // 截断 triggerUrl 时添加 title 属性展示完整 URL(BUG-L4)
+                    const triggerRaw = r.triggerUrl || (r.hasOnClick ? 'onclick' : '—');
+                    const triggerDisplay = r.triggerUrl && r.triggerUrl.length > 80
+                        ? escapeHTML(r.triggerUrl.slice(0, 80)) + '...'
+                        : escapeHTML(triggerRaw);
+                    const trigger = r.triggerUrl
+                        ? `<span title="${escapeHTML(r.triggerUrl)}">${triggerDisplay}</span>`
+                        : triggerDisplay;
+                    const selector = r.selector ? `<div class="gd-meta">选择器：${escapeHTML(r.selector)}</div>` : '';
+                    const cls = r.className ? `<div class="gd-meta">class: ${escapeHTML(r.className)}</div>` : '';
+                    const suspicion = r.suspicion || 0;
+                    return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-idx="${i}">
+                        <div class="gd-left">
+                            <div class="gd-check">${checked ? '✓' : ''}</div>
+                            <div>
+                                <div class="gd-host">${catBadge}${riskBadge}${willChangeBadge}${blockedBadge}${viceBadge} ${escapeHTML(r.tagName)} ${r.id ? '#' + escapeHTML(r.id) : ''} · ${r.rect.w}×${r.rect.h}px</div>
+                                <div class="gd-meta">${reasons ? escapeHTML(reasons) : ''}${reasons ? ' · ' : ''}触发：${trigger}${r.crossDomain ? ' · 跨域' : ''}</div>
+                                ${selector}${cls}
+                            </div>
+                        </div>
+                        <div class="gd-score ${getScoreClass(suspicion)}">${suspicion}</div>
+                    </div>`;
+                }).join('');
+
+                const btnBlock = panel.querySelector('#btn-block-overlay');
+                if (btnBlock) {
+                    btnBlock.disabled = selectedSet.size === 0;
+                    btnBlock.textContent = selectedSet.size > 0
+                        ? `🛡️ 拦截选中的 ${selectedSet.size} 个覆盖层`
+                        : '🛡️ 未选择覆盖层';
+                }
+            };
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">👁 不可见覆盖层扫描</h3>
+                <p>双引擎检测：透明跳转覆盖层 + 不可见元素 + 高z-index覆盖层 + 1×1追踪像素 + 博彩/色情可点击图片。红色🚫为博彩/色情图片，建议优先拦截。</p>
+                <div class="gd-toolbar">
+                    <label><input type="checkbox" id="ov-only-high" /> 只看高风险</label>
+                    <button class="btn-outline" id="ov-select-high">选中高风险</button>
+                    <button class="btn-outline" id="ov-select-none">清空</button>
+                </div>
+                <div class="gd-stats" id="overlay-stats"></div>
+                <div class="gd-scroll-area" id="overlay-list"></div>
+                <label style="display:flex; align-items:center; gap:6px; margin:8px 0; font-size:12px; color:#ddd; cursor:pointer;">
+                    <input type="checkbox" id="ov-block-domain" checked style="cursor:pointer;" />
+                    <span>同时封杀跳转域名（加入全局黑名单，并预览/拦截全页该域资源）</span>
+                </label>
+                <div class="btn-group">
+                    <button class="btn-danger" id="btn-block-overlay" style="flex:100%; font-weight:bold;">🛡️ 拦截选中的覆盖层</button>
+                </div>
+                <div class="section-divider"></div>
+                <div class="btn-group">
+                    <button class="btn-info" id="btn-deep-scan" title="运行双引擎联合扫描">🤖 深度扫描</button>
+                    <button class="btn-warning" id="btn-preview-overlay">🔍 预览效果</button>
+                    <button class="btn-warning" id="btn-rescan">🔄 重新扫描</button>
+                    <button class="btn-outline" id="btn-close-overlay">关闭</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+            // 先渲染加载占位(BUG-S2)，再启动异步扫描；扫描完成后用真实结果重绘
+            render();
+            // 记录最近一次深度扫描的额外发现，供 Toast 统计展示（必须先于 runScan 声明，避免 TDZ）
+            let lastDeepExtras = null;
+            // 共享扫描执行器：初始加载 / 重新扫描 / 深度扫描统一调用，避免重复代码
+            // skipInitialRender=true 时跳过内部 scanning=true+render()，供首次加载复用外部已渲染的占位(问题5)
+            // opts.deep=true 开启真·深度扫描（肤色/伪元素/沙箱解码），false 仅基线扫描（不一致-3）
+            const runScan = async (skipInitialRender = false, opts = {}) => {
+                const deep = !!opts.deep;
+                if (!skipInitialRender) {
+                    scanning = true;
+                    render();
+                }
+                try {
+                    // collectAll 内部按 deep 调用 OverlayAdScanner.deepScan/scan，此处不再冗余预调用(BUG-M6)
+                    const collected = await collectAll({ deep });
+                    records = collected.records;
+                    oasElapsed = collected.oasElapsed;
+                    lastDeepExtras = collected.deepExtras || null;
+                    // 跨扫描保留已拦截状态(BUG-D8)：用指纹匹配回填 r.blocked
+                    records.forEach(r => { if (blockedFingerprints.has(fingerprintOf(r))) r.blocked = true; });
+                    // 默认选中所有未拦截的高风险记录(BUG-3)：必须基于原始 records 索引遍历，
+                    // 旧版 filter().map((r,i)=>i) 的 i 是过滤后数组索引，导致 selectedSet 指向错误元素
+                    selectedSet = new Set();
+                    records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+                    scanning = false;
+                    render();
+                    return true; // 扫描成功(BUG-9)：供深度扫描回调判断是否显示完成 Toast
+                } catch (e) {
+                    scanning = false;
+                    Log.error('覆盖层扫描失败:', e);
+                    this.showToast('扫描失败：' + e.message, 'error');
+                    render();
+                    return false; // 扫描失败：避免回调再显示矛盾的"深度扫描完成"Toast
+                }
+            };
+            // 首次加载：外部已渲染加载占位，跳过 runScan 内部重复渲染(问题5)；初始为基线扫描
+            runScan(true, { deep: false });
+
+            // 预览状态：实例属性，clearPanel 切换/关闭面板时兜底还原，避免预览隐藏的元素永久残留
+            // 实时联动模式：预览激活时，选择变化自动更新预览（隐藏新增选中 / 还原取消选中），无需手动重置
+            this._overlayPreview = { active: false, elements: [], hiddenDomains: new Set() };
+            // previewBtn 必须先于 resetOverlayPreview 声明，否则闭包内引用触发 TDZ ReferenceError(BUG-4)
+            const previewBtn = panel.querySelector('#btn-preview-overlay');
+            const resetOverlayPreview = () => {
+                if (!this._overlayPreview.active) return;
+                this._overlayPreview.elements.forEach(el => BlockEngine.showElement(el));
+                this._overlayPreview = { active: false, elements: [], hiddenDomains: new Set() };
+                this._hidePreviewBanner();
+                previewBtn.textContent = '🔍 预览效果';
+            };
+
+            // 实时更新预览：根据当前 selectedSet 和域名勾选状态，增量隐藏/还原元素
+            const updatePreview = () => {
+                if (!this._overlayPreview.active) return;
+                // ① 先还原所有预览元素
+                this._overlayPreview.elements.forEach(el => BlockEngine.showElement(el));
+                this._overlayPreview.elements = [];
+                this._overlayPreview.hiddenDomains = new Set();
+                const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
+                // ② 重新隐藏当前选中的覆盖层
+                Array.from(selectedSet).forEach(idx => {
+                    const r = records[idx];
+                    if (!r || !r.el || !document.contains(r.el)) return;
+                    // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过
+                    if (ProtectedCheck.isProtected(r.el)) return;
+                    if (r.el.style.display !== 'none') {
+                        // 统一隐藏口径(5.2 节)
+                        BlockEngine.hideElement(r.el);
+                        this._overlayPreview.elements.push(r.el);
+                    }
+                    if (blockDomainToo && r.triggerUrl) {
+                        try {
+                            const u = new URL(r.triggerUrl, location.href);
+                            if (u.hostname !== window.location.hostname) this._overlayPreview.hiddenDomains.add(u.hostname);
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                });
+                // ③ 勾选域名时，同步预览全页该域名资源的隐藏效果（与正式拦截同口径）
+                // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
+                this._previewHideDomainResources(this._overlayPreview.hiddenDomains, this._overlayPreview.elements);
+            };
+
+            panel.querySelector('#overlay-list').addEventListener('click', (e) => {
+                const row = e.target.closest('.gd-domain-row');
+                if (!row) return;
+                const idx = parseInt(row.dataset.idx, 10);
+                if (selectedSet.has(idx)) selectedSet.delete(idx);
+                else selectedSet.add(idx);
+                // 预览激活时实时更新，无需手动重置再预览（Bug2）
+                updatePreview();
+                render();
+            });
+
+            panel.querySelector('#ov-only-high').addEventListener('change', (e) => { onlyHigh = e.target.checked; render(); });
+            panel.querySelector('#ov-select-high').addEventListener('click', () => {
+                // 与 runScan 初始化逻辑一致(问题1)：排除已拦截项，避免重复生成持久化规则
+                records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+                updatePreview();
+                render();
+            });
+            panel.querySelector('#ov-select-none').addEventListener('click', () => {
+                selectedSet.clear();
+                updatePreview();
+                render();
+            });
+
+
+            // 预览效果：预览「隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏」，与正式拦截效果一致
+            // 激活后选择变化自动实时更新预览（Bug1&2），再次点击关闭预览
+            previewBtn.addEventListener('click', (e) => {
+                e.stopPropagation(); // 防止事件冒泡触发其他监听器
+                if (this._overlayPreview.active) {
+                    resetOverlayPreview();
+                    return;
+                }
+                if (selectedSet.size === 0) {
+                    this.showToast('请先选择需要预览的覆盖层。', 'warning');
+                    return;
+                }
+                this._overlayPreview = { active: true, elements: [], hiddenDomains: new Set() };
+                try {
+                    updatePreview();
+                } catch (err) {
+                    Log.error('覆盖层预览失败:', err);
+                    this._overlayPreview.active = false;
+                    this.showToast('预览失败：' + err.message, 'error');
+                    return;
+                }
+                this._showPreviewBanner(() => resetOverlayPreview());
+                previewBtn.textContent = '👁 恢复显示';
+            });
+
+            // 域名勾选变化时实时更新预览
+            panel.querySelector('#ov-block-domain').addEventListener('change', () => updatePreview());
+
+            panel.querySelector('#btn-block-overlay').addEventListener('click', () => {
+                if (selectedSet.size === 0) return;
+                const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
+                // 正式拦截前先还原预览，避免预览态与正式拦截叠加造成状态混乱
+                resetOverlayPreview();
+                let ruleCount = 0;
+                let skippedSelfUI = 0;
+                // 收集选中记录的去重跨域域名，循环结束后批量封杀（避免重复添加规则）
+                const domainsToBlock = new Set();
+                // 仅修改 record 属性不删除数组元素，无需降序遍历；直接 forEach
+                Array.from(selectedSet).forEach(idx => {
+                    const r = records[idx];
+                    if (!r || !r.el || !document.contains(r.el)) return;
+                    // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）绝不拦截，否则所有面板都会消失
+                    if (ProtectedCheck.isProtected(r.el)) {
+                        skippedSelfUI++;
+                        return;
+                    }
+                    // 统一隐藏口径：补齐 opacity:0，与 applyCSSRules/scanAndBlockDynamic 一致(BUG-D4)
+                    BlockEngine.hideElement(r.el);
+                    r.blocked = true;
+                    // 记录指纹：重新扫描后据此回填 blocked 状态(BUG-D8)
+                    blockedFingerprints.add(fingerprintOf(r));
+                    // 自动生成持久化规则：基于元素特征生成属性选择器，确保刷新后仍能拦截
+                    // 无 id/class 时回退到物理结构选择器(BUG-D5)，避免刷新后拦截失效
+                    try {
+                        const el = r.el;
+                        const tag = el.tagName.toLowerCase();
+                        let attrSelector = null;
+                        // 优先用 id 生成属性规则（唯一性最强）
+                        if (el.id) {
+                            attrSelector = `${tag}[id="${CSS.escape(el.id)}"]`;
+                        } else if (typeof el.className === 'string' && el.className.trim()) {
+                            // 用第一个有辨识度的 class 生成属性规则
+                            const classes = el.className.trim().split(/\s+/).filter(c => c.length >= 3);
+                            if (classes.length > 0) {
+                                attrSelector = `${tag}[class*="${CSS.escape(classes[0])}"]`;
+                            }
+                        }
+                        // skipApply=true：跳过 addRule 内部 applyCSSRules，循环结束后统一调用一次(冗余-2)
+                        if (attrSelector) {
+                            this.storage.addRule('attribute', { attrSelector, type: 'attribute' }, true);
+                            ruleCount++;
+                        } else {
+                            // 兜底：无 id/class 时用物理结构选择器(nth-of-type 路径)，刷新后仍可定位(BUG-D5)
+                            const structSelector = BlockEngine.generateStructuralSelector(el);
+                            if (structSelector) {
+                                this.storage.addRule('structural', { structSelector, type: 'structural' }, true);
+                                ruleCount++;
+                            }
+                        }
+                    } catch (e) { Log.warn(e.message || e); }
+                    // 仅在勾选「封杀域名」时收集跨域跳转域名（去重）
+                    if (blockDomainToo && r.triggerUrl) {
+                        try {
+                            const u = new URL(r.triggerUrl, location.href);
+                            if (u.hostname !== window.location.hostname) {
+                                domainsToBlock.add(u.hostname);
+                            }
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                });
+                // 循环内 addRule 均用 skipApply=true 跳过，此处统一重建一次样式表(冗余-2)
+                if (ruleCount > 0) BlockEngine.applyCSSRules();
+                // 批量封杀收集到的域名：添加 domainBlock 规则（元素已单独隐藏，hideMode='none'）
+                const domainCount = domainsToBlock.size;
+                if (domainCount > 0) {
+                    DomainBlockExecutor.execute(Array.from(domainsToBlock), { hideMode: 'none' });
+                }
+                selectedSet.clear();
+                render();
+                const domainNote = blockDomainToo ? `，${domainCount} 个跨域跳转域名已加入全局黑名单` : '（未封杀域名）';
+                const ruleNote = ruleCount > 0 ? `，已生成 ${ruleCount} 条持久化规则` : '';
+                const skipNote = skippedSelfUI > 0 ? `（跳过 ${skippedSelfUI} 个脚本自身元素）` : '';
+                this.showToast(`已拦截选中的覆盖层${domainNote}${ruleNote}${skipNote}`, 'success');
+            });
+
+            // 深度扫描：真·深度覆盖层挖掘（v0.7.0 重构）
+            // 开启高开销探测：Canvas 肤色采样 / CSS 伪元素穿透 / 混淆跳转沙箱解码 / Icon Font 映射
+            // 耗时 200ms~2s，runScan 内部已通过 scanInvisibleOverlaysAsync 时间分片，避免主线程卡顿(不一致-3)
+            panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
+                const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
+                btn.disabled = true;
+                btn.textContent = '⏳ 深度挖掘中...';
+                resetOverlayPreview();
+                // runScan 返回成功/失败标志(BUG-9)：失败时 catch 已显示"扫描失败"Toast，
+                // 此处仅成功时显示"深度扫描完成"，避免两个矛盾 Toast 同时出现
+                runScan(false, { deep: true }).then(ok => {
+                    btn.disabled = false;
+                    btn.textContent = '🤖 深度扫描';
+                    if (ok) {
+                        const ex = lastDeepExtras;
+                        const note = ex ? `（深度新增：🎨肤色图 ${ex.viceImages.length} · 🔐混淆跳转 ${ex.obfuscatedUrls.length} · ::伪元素 ${ex.pseudoInjects.length} · 🔤自定义字体 ${ex.customFontEls.length}）` : '';
+                        this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。${note}`, 'success', 6000);
+                    }
+                });
+            });
+
+            // 重新扫描：快速基线扫描（耗时 < 50ms），仅双引擎基线，不开启高开销探测(不一致-3)
+            panel.querySelector('#btn-rescan').addEventListener('click', () => {
+                resetOverlayPreview();
+                runScan(false, { deep: false });
+            });
+
+            panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
+        }
+
+    function ImportPanel() {
+            this.clearPanel();
+            const panel = document.createElement('div');
+            panel.className = 'panel';
+
+            panel.innerHTML = `
+                <h3 title="按住可拖动窗口">📥 导入规则</h3>
+                <p>将之前导出的规则 JSON 文本粘贴到下方文本框，选择导入模式后点击"开始导入"。</p>
+                <label for="import-mode">导入模式</label>
+                <select id="import-mode">
+                    <option value="merge" selected>合并导入（推荐，自动去重）</option>
+                    <option value="replace">覆盖导入（清空现有规则后导入）</option>
+                </select>
+                <label for="import-text">规则 JSON 文本</label>
+                <textarea id="import-text" placeholder='在此粘贴导出的 JSON 文本...'></textarea>
+                <div class="btn-group" style="margin-top: 10px;">
+                    <button class="btn-primary" id="btn-do-import">开始导入</button>
+                    <button class="btn-outline" id="btn-back">返回</button>
+                </div>
+            `;
+
+            this.makeDraggable(panel);
+            this.shadowRoot.appendChild(panel);
+
+            panel.querySelector('#btn-do-import').addEventListener('click', () => {
+                const text = panel.querySelector('#import-text').value.trim();
+                if (!text) { this.showToast('请粘贴规则 JSON 文本。', 'warning'); return; }
+                const mode = panel.querySelector('#import-mode').value;
+                const doImport = () => {
+                    try {
+                        this.storage.importAll(text, mode === 'merge');
+                        this.showToast('导入成功！页面即将刷新以应用规则。', 'success', 2000);
+                        setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
+                    } catch (e) {
+                        this.showToast('导入失败：' + e.message, 'error');
+                    }
+                };
+                // 覆盖模式需用户确认（confirm 已从 importAll 移出）
+                if (mode === 'replace') {
+                    this.showConfirm('覆盖导入确认', '覆盖导入将清除现有所有规则，确定继续？', doImport);
+                } else {
+                    doImport();
+                }
+            });
+
+            panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
+        }
+
+class UIManager {
         // 全局不可侵犯保护判定：所有扫描/隐藏入口必须调用此函数，
         // 统一排除脚本自身 UI 宿主（含其子元素、Shadow DOM 内部节点），
         // 防止任何规则或扫描误伤面板导致整个脚本 UI 全毁
@@ -4678,6 +7064,7 @@
         }
 
         constructor() {
+            this.storage = StorageService;
             const existingHost = document.getElementById('pro-blocker-ui-host');
             if (existingHost) existingHost.remove();
 
@@ -5121,13 +7508,13 @@
                 items.forEach(it => {
                     if (it.type === 'iframeBlock') {
                         // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
-                        storage.addIframeRule(it.rule, true);
+                        this.storage.addIframeRule(it.rule, true);
                     } else if (it.scope === 'global' || it.type === 'domainBlock') {
-                        storage.addRule('domainBlock', { domain: it.rule.domain, type: 'domainBlock' });
+                        this.storage.addRule('domainBlock', { domain: it.rule.domain, type: 'domainBlock' });
                     } else if (it.scope === 'other') {
-                        storage.addRuleForDomain(it.domain, it.type, it.rule);
+                        this.storage.addRuleForDomain(it.domain, it.type, it.rule);
                     } else {
-                        storage.addRule(it.type, it.rule);
+                        this.storage.addRule(it.type, it.rule);
                     }
                 });
                 // iframe 规则变更后重新扫描（reapplyAll 不覆盖 iframe 扫描）
@@ -5257,38 +7644,8 @@
             };
         }
 
-        startSelection() {
-            this.stopSelection();
-            this.injectHighlightStyle();
-            this._showSelectionBanner();
-            // 选择模式下完全冻结页面导航：广告常通过 window.open / location.href / form.submit
-            // 在 touchstart/click 触发瞬间跳转，仅靠事件 capture 无法兜底，必须从 API 层拦截
-            this._freezeNavigation();
-            this._contextmenuHandler = (e) => {
-                e.preventDefault();
-                this.stopSelection();
-            };
-            this._keydownHandler = (e) => {
-                if (e.key === 'Escape') this.stopSelection();
-            };
-            this._trackDoc('keydown', this._keydownHandler);
-            // 拦截事件必须尽可能早地阻止广告跳转：
-            // ① pointerdown：在 mousedown/touchstart 之前触发，是最早可拦截的人机交互事件
-            // ② document 级 capture：确保在所有目标阶段处理之前拦截（无论 body 是否被广告脚本清空）
-            // ③ 同时拦截 mouseover/click/touch*/auxclick：覆盖鼠标 + 触屏 + pointer + 中键四种交互模型
-            const registerOnDoc = () => {
-                this._trackDoc('pointerdown', this._handlePointerDown, { capture: true, passive: false });
-                this._trackDoc('mousedown', this._handleMouseDown, { capture: true, passive: false });
-                this._trackDoc('mouseover', this._handleMouseOver, { capture: true });
-                this._trackDoc('click', this._handleClick, { capture: true, passive: false });
-                this._trackDoc('contextmenu', this._contextmenuHandler, { capture: true });
-                this._trackDoc('touchstart', this._handleTouchStart, { capture: true, passive: false });
-                this._trackDoc('touchmove', this._handleTouchMove, { capture: true, passive: false });
-                this._trackDoc('touchend', this._handleTouchEnd, { capture: true, passive: false });
-                // 拦截 auxclick（中键点击打开新标签、右键点击）：防止绕过 click 拦截触发跳转
-                this._trackDoc('auxclick', this._handleAuxClick, { capture: true });
-            };
-            registerOnDoc();
+                startSelection() {
+            return SelectionPanel.call(this);
         }
 
         stopSelection() {
@@ -5794,7 +8151,7 @@
             // 静态路径拦截
             panel.querySelector('#btn-static').addEventListener('click', () => {
                 const sel = BlockEngine.generateOptimalSelector(this.currentSelectedEl);
-                storage.addRule('static', { selector: sel, type: 'static' });
+                this.storage.addRule('static', { selector: sel, type: 'static' });
                 this.clearPanel();
             });
 
@@ -5803,7 +8160,7 @@
                 const el = this.currentSelectedEl;
                 const primaryClass = (el.className || '').split(/\s+/)[0];
                 if (!primaryClass) { this.showToast('当前元素无有效类名，请选择其他拦截方式。', 'warning'); return; }
-                storage.addRule('dynamic', { className: primaryClass, type: 'dynamic' });
+                this.storage.addRule('dynamic', { className: primaryClass, type: 'dynamic' });
                 this.clearPanel();
             });
 
@@ -5811,7 +8168,7 @@
             panel.querySelector('#btn-struct').addEventListener('click', () => {
                 const el = this.currentSelectedEl;
                 const sel = BlockEngine.generateStructuralSelector(el);
-                storage.addRule('structural', { structSelector: sel, type: 'structural' });
+                this.storage.addRule('structural', { structSelector: sel, type: 'structural' });
                 this.clearPanel();
             });
 
@@ -5857,7 +8214,7 @@
                     //         内部的 applyCSSRules 统一重建（会同时应用 pathPattern + domainBlock），无需此处再调一次
                     const pathCandidates = BlockEngine.extractPathCandidates(result);
                     pathCandidates.forEach(p => {
-                        storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' }, true);
+                        this.storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' }, true);
                     });
 
                     // 立即隐藏当前框选的整个广告容器（向上找单子链容器）
@@ -5908,709 +8265,19 @@
             this._refreshSelectionInfo(panel);
         }
 
-        showGlobalDomainPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            // 双引擎采集：BlockEngine.extractResourceDomains（DOM 资源来源）+ GlobalDomainScanner（6通道+12维+博彩色情）
-            // 合并策略：按 hostname 合并，分数取较高者，附加 viceToken/adToken/level 标记
-            // 过滤策略：已在域名黑名单中的域名不再展示（Bug3）
-            const blockedDomainSet = new Set(storage.getDomainBlocks().map(r => r.domain));
-            const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
-            let gdsResult = { results: [], elapsed: '0', total: 0 };
-            try { gdsResult = GlobalDomainScanner.scan(); } catch (e) { Log.warn(e.message || e); }
-            const gdsMap = new Map();
-            for (const r of (gdsResult.results || [])) gdsMap.set(r.hostname, r);
-
-            // 合并：existing scoredDomains 为基线，叠加 GDS 的 12 维评分与博彩色情标记，过滤已封杀域名
-            let allDomains = scoredDomains.filter(d => !blockedDomainSet.has(d.host)).map(d => {
-                const g = gdsMap.get(d.host);
-                if (!g) return d;
-                // 取较高分（GDS 12维更精细，但保留原有 sources/reasons）
-                const mergedScore = Math.max(d.score, g.score);
-                return {
-                    ...d,
-                    score: mergedScore,
-                    viceToken: g.viceToken || null,
-                    adToken: g.adToken || null,
-                    level: g.level || null,
-                    gdsReasons: g.reasons || [],
-                    signals: g.signals || 0
-                };
-            });
-            // 补充 GDS 独有域名（extractResourceDomains 未覆盖的 Performance API / 链接跳转目标），过滤已封杀
-            // 冗余-3：用 Set O(1) 查找替代 allDomains.find O(n) 线性查找
-            const existingHosts = new Set(allDomains.map(d => d.host));
-            for (const [host, g] of gdsMap) {
-                if (blockedDomainSet.has(host)) continue;
-                if (!existingHosts.has(host)) {
-                    allDomains.push({
-                        host, score: g.score, count: g.freq || 1,
-                        sources: ['performance-api'], reasons: g.reasons || [],
-                        viceToken: g.viceToken || null, adToken: g.adToken || null,
-                        level: g.level || null, gdsReasons: g.reasons || [], signals: g.signals || 0
-                    });
-                    existingHosts.add(host);
-                }
-            }
-            // 按分数降序，确保高分广告域置顶
-            allDomains.sort((a, b) => b.score - a.score);
-
-            let selectedHosts = new Set(allDomains.filter(d => d.score >= 35 || d.viceToken).map(d => d.host));
-            let filterText = '';
-            let onlyAds = true;
-
-            const isAdLike = (d) => isAdKeywordHost(d.host) || d.score >= 40 || !!d.viceToken || !!d.adToken || d.level === 'ad' || d.level === 'suspect';
-
-            const getScoreClass = (score) => score >= 50 ? 'high' : score >= 25 ? 'mid' : 'low';
-            const sourceLabel = (src) => ({ 'attr': '属性', 'srcset': '响应图', 'inline-style': '内联样式', 'stylesheet': '样式表', 'data-attr': '数据属性', 'script-text': '脚本文本', 'script-var': '脚本变量', 'performance-api': '性能API', 'image-link': '图片链接', 'link': '跳转链接' }[src] || src);
-
-            const renderDomains = () => {
-                const box = panel.querySelector('#global-domains');
-                const stats = panel.querySelector('#gd-stats');
-                if (!box) return;
-
-                const filtered = allDomains.filter(d => {
-                    if (filterText && !d.host.includes(filterText)) return false;
-                    if (onlyAds && !isAdLike(d)) return false;
-                    return true;
-                });
-
-                if (stats) {
-                    const viceCount = allDomains.filter(d => d.viceToken).length;
-                    const adCount = allDomains.filter(d => d.level === 'ad').length;
-                    stats.textContent = `共 ${allDomains.length} 个第三方域名 · 🚫博彩/色情 ${viceCount} · 广告级 ${adCount} · 已选 ${selectedHosts.size} · 显示 ${filtered.length}`;
-                }
-
-                if (filtered.length === 0) {
-                    box.innerHTML = '<div class="empty-tip">未匹配到域名，请尝试取消“只看广告相关”或手动添加。</div>';
-                } else {
-                    box.innerHTML = filtered.map(d => {
-                        const checked = selectedHosts.has(d.host);
-                        // 博彩/色情标记（最高优先级）
-                        const viceBadge = d.viceToken ? `<span class="tag" style="background:rgba(255,0,80,0.7);" title="博彩/色情词元：${escapeHTML(d.viceToken)}">🚫${escapeHTML(d.viceToken)}</span>` : '';
-                        const adBadge = d.adToken ? `<span class="tag" style="background:rgba(255,149,0,0.55);">广告</span>` : '';
-                        const levelBadge = d.level === 'ad' ? '<span class="tag" style="background:rgba(255,59,48,0.7);">广告级</span>'
-                            : d.level === 'suspect' ? '<span class="tag" style="background:rgba(255,149,0,0.55);">可疑</span>'
-                                : d.level === 'watch' ? '<span class="tag" style="background:rgba(120,144,156,0.5);">关注</span>' : '';
-                        const reasons = (d.gdsReasons && d.gdsReasons.length) ? d.gdsReasons.slice(0, 3).join(', ')
-                            : (d.reasons.length ? d.reasons.slice(0, 3).join(', ') : '');
-                        const sources = d.sources.map(sourceLabel).join('、');
-                        return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-host="${escapeHTML(d.host)}">
-                            <div class="gd-left">
-                                <div class="gd-check">${checked ? '✓' : ''}</div>
-                                <div>
-                                    <div class="gd-host">${escapeHTML(d.host)} ${viceBadge}${adBadge}${levelBadge}</div>
-                                    <div class="gd-meta">来源：${sources}${reasons ? ' · ' + escapeHTML(reasons) : ''}</div>
-                                </div>
-                            </div>
-                            <div class="gd-score ${getScoreClass(d.score)}">${d.score}</div>
-                        </div>`;
-                    }).join('');
-                }
-
-                const btnBlock = panel.querySelector('#btn-block-global');
-                if (btnBlock) {
-                    btnBlock.disabled = selectedHosts.size === 0;
-                    btnBlock.textContent = selectedHosts.size > 0
-                        ? `🔥 彻底封杀 ${selectedHosts.size} 个域名（推荐）`
-                        : '🔥 未选择可封杀域名';
-                }
-            };
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">🌐 全局域名深度检索</h3>
-                <p>双引擎采集：DOM 资源来源 + 6通道性能API + 12维特征评分 + 博彩/色情词库。红色🚫为博彩/色情域，建议优先封杀。</p>
-                <div class="gd-toolbar">
-                    <input type="text" id="gd-filter" placeholder="输入域名关键字过滤..." />
-                    <label><input type="checkbox" id="gd-only-ads" checked /> 只看广告相关</label>
-                    <button class="btn-outline" id="gd-select-all">全选</button>
-                    <button class="btn-outline" id="gd-select-none">清空</button>
-                </div>
-                <div class="gd-stats" id="gd-stats"></div>
-                <div class="gd-scroll-area" id="global-domains"></div>
-                <div class="gd-manual">
-                    <input type="text" id="gd-manual-input" placeholder="手动输入域名，例如：ads.example.com" />
-                    <button class="btn-outline" id="gd-manual-add">+ 添加</button>
-                </div>
-                <div class="btn-group">
-                    <button class="btn-danger" id="btn-block-global" style="flex:100%; font-weight:bold;">🔥 彻底封杀广告域名（推荐）</button>
-                </div>
-                <div class="section-divider"></div>
-                <div class="btn-group">
-                    <button class="btn-info" id="btn-deep-scan" title="运行双引擎联合扫描">🤖 深度扫描</button>
-                    <button class="btn-warning" id="btn-preview-global">🔍 预览效果</button>
-                    <button class="btn-outline" id="btn-cancel-global">取消</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-            renderDomains();
-
-            panel.querySelector('#global-domains').addEventListener('click', (e) => {
-                const row = e.target.closest('.gd-domain-row');
-                if (!row) return;
-                const host = row.dataset.host.toLowerCase();
-                if (selectedHosts.has(host)) selectedHosts.delete(host);
-                else selectedHosts.add(host);
-                updateGlobalPreview();
-                renderDomains();
-            });
-
-            panel.querySelector('#gd-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderDomains(); });
-            panel.querySelector('#gd-only-ads').addEventListener('change', (e) => { onlyAds = e.target.checked; renderDomains(); });
-            panel.querySelector('#gd-select-all').addEventListener('click', () => {
-                allDomains.forEach(d => selectedHosts.add(d.host));
-                updateGlobalPreview();
-                renderDomains();
-            });
-            panel.querySelector('#gd-select-none').addEventListener('click', () => {
-                selectedHosts.clear();
-                updateGlobalPreview();
-                renderDomains();
-            });
-            panel.querySelector('#gd-manual-add').addEventListener('click', () => {
-                const input = panel.querySelector('#gd-manual-input');
-                const host = input.value.trim().toLowerCase();
-                if (!host) return;
-                // 域名格式校验：拒绝带协议、路径、空格等非法输入(BUG-M5)
-                if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(host)) {
-                    this.showToast(`域名格式无效："${host}"，请输入纯域名（如 ad.example.com，不含 http://）。`, 'warning');
-                    return;
-                }
-                // 拒绝添加已封杀域名：避免UI误导用户以为该域名未封杀（Bug1）
-                const currentBlocked = new Set(storage.getDomainBlocks().map(r => r.domain));
-                if (currentBlocked.has(host)) {
-                    this.showToast(`域名 ${host} 已在黑名单中，无需重复添加。`, 'info');
-                    input.value = '';
-                    return;
-                }
-                // 冗余-3：用 some 替代 find（仅需判断存在性，无需返回元素），语义更清晰
-                if (!allDomains.some(d => d.host === host)) {
-                    allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1, viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 });
-                }
-                selectedHosts.add(host);
-                input.value = '';
-                updateGlobalPreview();
-                renderDomains();
-            });
-
-            // 深度扫描：真·深度域名挖掘（v0.7.0 重构）
-            // 双引擎：BlockEngine.extractResourceDomains（DOM 资源）+ GlobalDomainScanner.deepScan（GDS 6通道+12维+真·深度）
-            // 真·深度：CSS 伪元素穿透 / Service Worker / WebSocket / Blob URL 溯源 / SVG 引用
-            // 时间分片：requestIdleCallback 包裹高开销探测，避免主线程卡顿(BUG-4)
-            panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
-                const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
-                const origText = btn.textContent;
-                btn.disabled = true;
-                btn.textContent = '⏳ 深度挖掘中...';
-                // 高开销探测包裹 requestIdleCallback，避免主线程卡死（方案六.2 性能保护）
-                const runDeep = () => {
-                    try {
-                        const currentBlocked = new Set(storage.getDomainBlocks().map(r => r.domain));
-                        allDomains = allDomains.filter(d => !currentBlocked.has(d.host));
-                        // BUG-4 修复：补齐双引擎——extractResourceDomains DOM 资源 + GDS.deepScan 真·深度
-                        const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
-                        const deepResult = GlobalDomainScanner.deepScan({ deep: true });
-                        // 冗余-3 修复：用 Map O(1) 查找合并，替代 allDomains.find O(n) 线性查找
-                        const existingMap = new Map();
-                        for (const d of allDomains) existingMap.set(d.host, d);
-                        // 合并 extractResourceDomains 结果
-                        for (const sd of scoredDomains) {
-                            if (currentBlocked.has(sd.host)) continue;
-                            const exist = existingMap.get(sd.host);
-                            if (exist) {
-                                exist.score = Math.max(exist.score, sd.score);
-                                if (!exist.sources.includes('dom-resource')) exist.sources.push('dom-resource');
-                            } else {
-                                const newD = { host: sd.host, score: sd.score, count: sd.count || 1, sources: sd.sources || ['dom-resource'], reasons: sd.reasons || [], viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 };
-                                existingMap.set(sd.host, newD);
-                                allDomains.push(newD);
-                            }
-                        }
-                        // 合并 GDS.deepScan 结果（含真·深度新增的隐藏域名）
-                        for (const g of deepResult.results) {
-                            if (currentBlocked.has(g.hostname)) continue;
-                            const exist = existingMap.get(g.hostname);
-                            if (exist) {
-                                exist.score = Math.max(exist.score, g.score);
-                                exist.viceToken = g.viceToken || exist.viceToken;
-                                exist.adToken = g.adToken || exist.adToken;
-                                exist.level = g.level || exist.level;
-                                exist.gdsReasons = g.reasons || exist.gdsReasons;
-                                exist.signals = Math.max(exist.signals, g.signals || 0);
-                            } else {
-                                const newD = { host: g.hostname, score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals };
-                                existingMap.set(g.hostname, newD);
-                                allDomains.push(newD);
-                            }
-                        }
-                        allDomains.sort((a, b) => b.score - a.score);
-                        // 同步 selectedHosts：移除已被过滤掉的域名(BUG-M2)
-                        const hostSet = new Set(allDomains.map(d => d.host));
-                        Array.from(selectedHosts).forEach(h => { if (!hostSet.has(h)) selectedHosts.delete(h); });
-                        // ⑩ 深度扫描后自动勾选新出现的高分域名，与初始加载逻辑一致
-                        // 初始加载 selectedHosts 纳入 score>=35 || viceToken，深度扫描同口径补齐新增域名
-                        allDomains.forEach(d => {
-                            if ((d.score >= 35 || d.viceToken) && !selectedHosts.has(d.host)) {
-                                selectedHosts.add(d.host);
-                            }
-                        });
-                        renderDomains();
-                        btn.disabled = false;
-                        btn.textContent = origText;
-                        const deepNote = deepResult.deepExtras ? `（深度新增：SW ${deepResult.deepExtras.swHosts.length} · WS ${deepResult.deepExtras.wsHosts.length} · 伪元素 ${deepResult.deepExtras.pseudoUrls.length} · SVG ${deepResult.deepExtras.svgUrls.length}）` : '';
-                        this.showToast(`深度扫描完成，域名列表已刷新。${deepNote}`, 'success', 5000);
-                    } catch (err) {
-                        btn.disabled = false;
-                        btn.textContent = origText;
-                        this.showToast('深度扫描失败：' + err.message, 'error');
-                    }
-                };
-                if (typeof requestIdleCallback === 'function') {
-                    requestIdleCallback(() => runDeep(), { timeout: 500 });
-                } else {
-                    setTimeout(runDeep, TIMING.DEEP_SCAN_DELAY_MS);
-                }
-            });
-
-            // 预览状态使用实例属性 this._globalPreview，clearPanel 可跨面板清理，避免预览元素残留
-            // 实时联动模式：预览激活时选择变化自动更新预览（Bug2&5），预览口径与 applyCSSRules 完全一致
-            // 注意：previewBtn 必须先于 resetGlobalPreview 声明，避免 TDZ 风险(BUG-M1)
-            const previewBtn = panel.querySelector('#btn-preview-global');
-            const resetGlobalPreview = () => {
-                if (!this._globalPreview.active) return;
-                this._globalPreview.elements.forEach(el => BlockEngine.showElement(el));
-                this._globalPreview = { active: false, elements: [] };
-                this._hidePreviewBanner();
-                previewBtn.textContent = '🔍 预览效果';
-            };
-            // 实时更新预览：根据当前 selectedHosts 重新隐藏元素（Bug2&5）
-            const updateGlobalPreview = () => {
-                if (!this._globalPreview.active) return;
-                // 先还原所有预览元素
-                this._globalPreview.elements.forEach(el => BlockEngine.showElement(el));
-                this._globalPreview.elements = [];
-                // 预览口径与 applyCSSRules 完全一致：
-                // 1) CSS [src*=domain] 隐藏资源元素本身
-                // 2) CSS *:has(> :is(...)) 隐藏直接父级
-                // 3) scanAndBlockDynamic 隐藏 findSingleChildWrapper 单子链容器
-                this._previewHideDomainResources(selectedHosts, this._globalPreview.elements);
-            };
-            previewBtn.addEventListener('click', () => {
-                if (this._globalPreview.active) {
-                    resetGlobalPreview();
-                    return;
-                }
-                if (selectedHosts.size === 0) return;
-                this._globalPreview = { active: true, elements: [] };
-                updateGlobalPreview();
-                this._showPreviewBanner(() => resetGlobalPreview());
-                previewBtn.textContent = '👁 恢复显示';
-            });
-
-            panel.querySelector('#btn-block-global').addEventListener('click', () => {
-                if (selectedHosts.size === 0) return;
-                const list = Array.from(selectedHosts);
-                const confirmMsg = `将封杀以下 ${list.length} 个域名（全局生效，所有页面都将拦截）：\n\n${list.join('\n')}\n\n确认继续？`;
-                this.showConfirm('封杀域名确认', confirmMsg, () => {
-                    if (!panel.isConnected) return; // 防御：confirm 期间面板可能已被 clearPanel 移除(BUG-S4)
-                    resetGlobalPreview();
-                    // 封杀选中域名：添加 domainBlock 规则 + 即时隐藏匹配资源（wrapper 口径）
-                    DomainBlockExecutor.execute(list, { hideMode: 'wrapper' });
-                    this._globalPreview = { active: false, elements: [] };
-                    this.clearPanel();
-                    this.showToast(`已封杀 ${list.length} 个域名，后续刷新与所有页面都将自动拦截。`, 'success');
-                });
-            });
-
-            panel.querySelector('#btn-cancel-global').addEventListener('click', () => {
-                resetGlobalPreview();
-                this.clearPanel();
-            });
+                showGlobalDomainPanel() {
+            return GlobalDomainPanel.call(this);
         }
 
-        showRegexPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">添加拦截规则</h3>
-                <p>通过组合条件、正则表达式或路径模式，实现对复杂动态广告的精准拦截。</p>
-
-                <label for="regex-mode">匹配模式</label>
-                <select id="regex-mode">
-                    <option value="contains">基础文本模式 (包含指定字符即隐藏)</option>
-                    <option value="builder" selected>积木组合模式 (免代码，支持多条件逻辑运算) ✨</option>
-                    <option value="regex">正则表达式模式 (适合高级用户)</option>
-                    <option value="attribute">属性选择器模式 (如 [src*="ad"] 或 [id^="banner"])</option>
-                    <option value="path">路径模式 (拦截广告跳转链接，如 /flink/url.php)</option>
-                    <option value="iframeBlock">iframe 子文档拦截 (封杀指定域名的 iframe 帧)</option>
-                </select>
-
-                <div id="standard-ui" style="display: none;">
-                    <label for="regex-input">拦截内容</label>
-                    <input type="text" id="regex-input" placeholder="输入要屏蔽的关键词或正则表达式片段..." />
-                </div>
-
-                <div id="path-ui" style="display: none;">
-                    <label for="path-input">广告跳转路径片段</label>
-                    <input type="text" id="path-input" placeholder="例如：/flink/url.php 或 /000/flink" />
-                    <p style="color:#bbb; font-size:11px;">提示：从广告链接 href 中提取有辨识度的路径片段，无需完整 URL。匹配该片段的所有链接与资源都将被拦截。</p>
-                </div>
-
-                <div id="iframe-block-ui" style="display: none;">
-                    <label for="iframe-domain-input">iframe 子文档域名</label>
-                    <input type="text" id="iframe-domain-input" placeholder="例如：ads.example.com 或 doubleclick.net" />
-                    <p style="color:#bbb; font-size:11px;">提示：输入广告 iframe 的 src 域名，系统将生成 iframeBlock 规则，拦截所有 src 包含该域名的 iframe 帧（即 $subdocument 拦截）。可封杀整个广告 iframe，而不影响同域名下的正常页面内容。</p>
-                </div>
-
-                <div id="attr-ui" style="display: none;">
-                    <label for="attr-input">CSS 属性选择器</label>
-                    <input type="text" id="attr-input" placeholder='例如：[src*="ad"] 或 [id^="banner"]' />
-                    <p style="color:#bbb; font-size:11px;">提示：输入标准 CSS 属性选择器，匹配元素将被隐藏。可组合多属性如 [src*="ad"][class*="banner"]。</p>
-                </div>
-
-                <div id="builder-ui" style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 15px;">
-                    <label style="margin-bottom: 8px;">总体逻辑网关</label>
-                    <select id="builder-logic" style="margin-bottom: 12px;">
-                        <option value="AND">满足以下【全部】条件才拦截 (AND)</option>
-                        <option value="OR">满足以下【任意】条件即拦截 (OR)</option>
-                    </select>
-
-                    <label>详细拦截条件</label>
-                    <div id="builder-conditions"></div>
-                    <button id="btn-add-condition" class="btn-outline" style="width: 100%; margin-top: 8px; border-style: dashed; padding: 6px;">+ 添加新条件块</button>
-                </div>
-
-                <div id="level-row">
-                    <label for="regex-level">向上隐藏层级 (0为仅隐藏自身，1为隐藏直接父级节点)</label>
-                    <input type="number" id="regex-level" value="0" min="0" max="10" />
-                </div>
-
-                <div class="btn-group" style="margin-top: 15px;">
-                    <button class="btn-warning" id="btn-preview-regex">🔍 预览效果</button>
-                    <button class="btn-primary" id="btn-save-regex">保存并应用</button>
-                    <button class="btn-outline" id="btn-close-regex">取消</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-
-            const modeSelect = panel.querySelector('#regex-mode');
-            const standardUI = panel.querySelector('#standard-ui');
-            const builderUI = panel.querySelector('#builder-ui');
-            const pathUI = panel.querySelector('#path-ui');
-            const attrUI = panel.querySelector('#attr-ui');
-            const levelRow = panel.querySelector('#level-row');
-            const conditionsContainer = panel.querySelector('#builder-conditions');
-
-            const iframeBlockUI = panel.querySelector('#iframe-block-ui');
-
-            modeSelect.addEventListener('change', (e) => {
-                const v = e.target.value;
-                standardUI.style.display = (v === 'contains' || v === 'regex') ? 'block' : 'none';
-                builderUI.style.display = (v === 'builder') ? 'block' : 'none';
-                pathUI.style.display = (v === 'path') ? 'block' : 'none';
-                attrUI.style.display = (v === 'attribute') ? 'block' : 'none';
-                iframeBlockUI.style.display = (v === 'iframeBlock') ? 'block' : 'none';
-                levelRow.style.display = (v === 'path' || v === 'attribute' || v === 'iframeBlock') ? 'none' : 'block';
-                if (v === 'builder' && conditionsContainer.children.length === 0) addConditionRow();
-            });
-
-            const addConditionRow = () => {
-                const row = document.createElement('div');
-                row.className = 'condition-row';
-                row.style.cssText = 'display: flex; gap: 6px; margin-bottom: 8px; align-items: center;';
-                row.innerHTML = `
-                    <select class="cond-type" style="width: 32%; margin: 0; padding: 8px;">
-                        <option value="text">元素文本</option>
-                        <option value="class">类名(Class)</option>
-                        <option value="id">标识符(ID)</option>
-                    </select>
-                    <select class="cond-op" style="width: 24%; margin: 0; padding: 8px;">
-                        <option value="contains">包含</option>
-                        <option value="equals">等于</option>
-                        <option value="not_contains">不包含</option>
-                    </select>
-                    <input type="text" class="cond-val" style="flex: 1; margin: 0; padding: 8px;" placeholder="设定值..." />
-                    <button class="btn-danger btn-remove-cond" style="flex: none; width: 32px; padding: 0; min-width: 32px; height: 35px;">✕</button>
-                `;
-                row.querySelector('.btn-remove-cond').addEventListener('click', () => {
-                    row.remove();
-                    if (conditionsContainer.children.length === 0) addConditionRow();
-                });
-                conditionsContainer.appendChild(row);
-            };
-
-            addConditionRow();
-            panel.querySelector('#btn-add-condition').addEventListener('click', addConditionRow);
-
-            let isPreviewing = false;
-
-            const resetPreview = () => {
-                if (isPreviewing) {
-                    // 统一使用 BlockEngine.showElement：还原 hideElement 设置的全部 4 个属性(BUG-2)
-                    // 否则 path 预览(用 hideElement)隐藏的 visibility/pointer-events 会永久残留
-                    this._previewAffectedElements.forEach(item => BlockEngine.showElement(item.el));
-                    this._previewAffectedElements = [];
-                    this._hidePreviewBanner();
-                    isPreviewing = false;
-                    const previewBtn = panel.querySelector('#btn-preview-regex');
-                    if (previewBtn) previewBtn.textContent = '🔍 预览效果';
-                }
-            };
-
-            panel.addEventListener('input', resetPreview);
-            panel.addEventListener('change', resetPreview);
-
-            panel.querySelector('#btn-preview-regex').addEventListener('click', (e) => {
-                const btn = e.currentTarget; // 用 currentTarget 而非 e.target(BUG-L2)
-                if (isPreviewing) { resetPreview(); return; }
-
-                const mode = modeSelect.value;
-                // NaN 兜底：输入框被清空时 parseInt 返回 NaN，_hideRegexAncestor 的 for(i=0;i<NaN;i++) 不执行 → 静默退化为 level 0
-                const level = parseInt(panel.querySelector('#regex-level').value, 10) || 0;
-                this._previewAffectedElements = [];
-
-                if (mode === 'path') {
-                    // 路径模式预览：与正式 pathPattern 拦截同口径
-                    // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
-                    const text = panel.querySelector('#path-input').value.trim();
-                    if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
-                    // 与 applyCSSRules 中 pathPattern 一致：3 通道(href/src/data-src)(BUG-6)
-                    // 旧版误用 9 通道扩展选择器导致预览比实际拦截多匹配 6 个属性通道
-                    const sel = ResourceSelectorBuilder.buildPathAttr(text);
-                    let hit = 0;
-                    const hideNode = (node) => {
-                        if (!node || node === document.body || node === document.documentElement) return false;
-                        if (ProtectedCheck.isProtected(node)) return false;
-                        if (node.style.display === 'none') return false;
-                        BlockEngine.hideElement(node);
-                        this._previewAffectedElements.push({ el: node });
-                        return true;
-                    };
-                    document.querySelectorAll(sel).forEach(el => {
-                        let counted = false;
-                        if (hideNode(el)) counted = true;
-                        if (el.parentElement && hideNode(el.parentElement)) counted = true;
-                        const wrapper = BlockEngine.findSingleChildWrapper(el, 4);
-                        if (hideNode(wrapper)) counted = true;
-                        if (counted) hit++;
-                    });
-                    if (hit === 0) { this.showToast('当前页面未匹配到含该路径片段的资源，预览为空。', 'info'); return; }
-                    isPreviewing = true;
-                    this._showPreviewBanner(() => resetPreview());
-                    btn.textContent = '👁 恢复显示';
-                    return;
-                }
-
-                if (mode === 'attribute') {
-                    const text = panel.querySelector('#attr-input').value.trim();
-                    if (!text) { this.showToast('校验失败：请输入属性选择器。', 'warning'); return; }
-                    // 预览口径与 applyCSSRules 完全一致：attribute 规则保存后直接注入 CSS 选择器，
-                    // 无 level 向上遍历逻辑。预览也仅隐藏选择器命中的元素本身，确保预览=刷新后效果。
-                    // 必须校验 isProtectedElement，否则 [id="pro-blocker-ui-host"] 会隐藏整个脚本 UI(BUG-5)
-                    try {
-                        document.querySelectorAll(text).forEach(el => {
-                            if (!el || el.style.display === 'none') return;
-                            if (ProtectedCheck.isProtected(el)) return;
-                            this._previewAffectedElements.push({ el });
-                            BlockEngine.hideElement(el); // 统一 4 属性口径(冗余-5)
-                        });
-                    } catch (err) {
-                        this.showToast('校验失败：属性选择器语法错误。', 'error');
-                        return;
-                    }
-                    isPreviewing = true;
-                    this._showPreviewBanner(() => resetPreview());
-                    btn.textContent = '👁 恢复显示';
-                    return;
-                }
-
-                if (mode === 'builder') {
-                    const logic = panel.querySelector('#builder-logic').value;
-                    const rows = conditionsContainer.querySelectorAll('.condition-row');
-                    const conditions = [];
-                    let isValueMissing = false;
-
-                    rows.forEach(row => {
-                        const type = row.querySelector('.cond-type').value;
-                        const op = row.querySelector('.cond-op').value;
-                        const val = row.querySelector('.cond-val').value.trim();
-                        if (!val) isValueMissing = true;
-                        conditions.push({ type, operator: op, value: val });
-                    });
-
-                    if (isValueMissing || conditions.length === 0) {
-                        this.showToast('规则校验失败：请完整填写所有积木条件的值再进行预览。', 'warning');
-                        return;
-                    }
-
-                    const baseSelector = BlockEngine._buildComplexBaseSelector(conditions, logic);
-
-                    const root = document.body;
-                    const elements = baseSelector === '*'
-                        ? root.querySelectorAll('div, span, a, p, img, li, ul, iframe, section, article, aside')
-                        : root.querySelectorAll(baseSelector);
-
-                    elements.forEach(el => {
-                        if (baseSelector === '*' && (el.textContent || '').length > 3000) return;
-
-                        if (BlockEngine.evaluateConditions(conditions, logic, el)) {
-                            const target = BlockEngine.findLevelAncestor(el, level);
-                            if (target.style.display !== 'none') {
-                                this._previewAffectedElements.push({ el: target });
-                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
-                            }
-                        }
-                    });
-
-                } else {
-                    const text = panel.querySelector('#regex-input').value.trim();
-                    if (!text) {
-                        this.showToast('规则校验失败：请输入有效的匹配内容再进行预览。', 'warning');
-                        return;
-                    }
-
-                    // contains 模式用 String.includes() 匹配，不走正则引擎(BUG-M7)
-                    // regex 模式校验语法后用 RegExp.test()
-                    const isContains = mode === 'contains';
-                    let regex = null;
-                    if (!isContains) {
-                        try { regex = new RegExp(text, 'i'); }
-                        catch (err) { this.showToast('规则校验失败：正则表达式存在语法错误。', 'error'); return; }
-                        // 预览 ReDoS 预检(问题4)：applyRegexRules 会用 isRegexSafe 过滤嵌套量词，
-                        // 预览时不检查会导致 regex.test 在每个文本节点上执行，可能触发灾难性回溯卡死页面
-                        if (!BlockEngine.isRegexSafe(text)) {
-                            this.showToast('规则校验失败：正则含嵌套量词（ReDoS 风险），已拒绝预览。', 'error');
-                            return;
-                        }
-                    }
-
-                    // 与 applyRegexRules 保持一致：跳过 SCRIPT/STYLE/NOSCRIPT 内的文本，
-                    // 否则预览会误隐藏 <script> 父级导致页面功能损坏，且与实际执行结果不一致
-                    const lowerText = isContains ? text.toLowerCase() : null;
-                    BlockEngine.walkTextNodes(document.body, (node) => {
-                        const content = node.textContent || '';
-                        const hit = isContains ? content.toLowerCase().includes(lowerText) : regex.test(content);
-                        if (hit) {
-                            const target = BlockEngine.findLevelAncestor(node.parentElement, level);
-                            if (target && target.style.display !== 'none') {
-                                this._previewAffectedElements.push({ el: target });
-                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
-                            }
-                        }
-                    });
-                }
-
-                isPreviewing = true;
-                this._showPreviewBanner(() => resetPreview());
-                btn.textContent = '👁 恢复显示';
-            });
-
-            panel.querySelector('#btn-save-regex').addEventListener('click', () => {
-                const mode = modeSelect.value;
-
-                if (mode === 'iframeBlock') {
-                    const domain = panel.querySelector('#iframe-domain-input').value.trim().toLowerCase();
-                    if (!domain) { this.showToast('校验失败：请输入要拦截的 iframe 域名。', 'warning'); return; }
-                    if (!/^[a-z0-9.\-]+$/.test(domain)) { this.showToast('校验失败：域名格式无效（仅允许字母、数字、点和横线）。', 'error'); return; }
-                    const added = storage.addIframeRule({ matchType: 'srcDomain', value: domain });
-                    if (!added) { this.showToast('该域名已存在 iframeBlock 规则，已跳过重复添加。', 'info'); return; }
-                    IframeGuard.invalidateBlockRules();
-                    EventBus.emit('rule:changed', { type: 'iframeBlock' });
-                    this.showToast(`已添加 iframe 拦截规则：${domain}`, 'success');
-                    this.clearPanel();
-                    return;
-                }
-
-                if (mode === 'path') {
-                    const text = panel.querySelector('#path-input').value.trim();
-                    if (!text) { this.showToast('校验失败：请输入路径片段。', 'warning'); return; }
-                    // addRule 内部已通过 saveData 调用 applyCSSRules，此处无需重复(不一致-2)
-                    storage.addRule('pathPattern', { pattern: text, type: 'pathPattern' });
-                    BlockEngine.scanAndBlockDynamic(document.body, undefined, undefined, { force: true });
-                    this.clearPanel();
-                    return;
-                }
-
-                if (mode === 'attribute') {
-                    const text = panel.querySelector('#attr-input').value.trim();
-                    if (!text) { this.showToast('校验失败：请输入属性选择器。', 'warning'); return; }
-                    try { document.querySelector(text); } catch (err) {
-                        this.showToast('校验失败：属性选择器语法错误，请检查括号、引号是否匹配。', 'error');
-                        return;
-                    }
-                    // addRule 内部已通过 saveData 调用 applyCSSRules，此处无需重复(不一致-2)
-                    storage.addRule('attribute', { attrSelector: text, type: 'attribute' });
-                    this.clearPanel();
-                    return;
-                }
-
-                // NaN 兜底：输入框被清空时 parseInt 返回 NaN，需兜底为 0
-                const level = parseInt(panel.querySelector('#regex-level').value, 10) || 0;
-
-                if (mode === 'builder') {
-                    const logic = panel.querySelector('#builder-logic').value;
-                    const rows = conditionsContainer.querySelectorAll('.condition-row');
-                    const conditions = [];
-                    let isValueMissing = false;
-
-                    rows.forEach(row => {
-                        const type = row.querySelector('.cond-type').value;
-                        const op = row.querySelector('.cond-op').value;
-                        const val = row.querySelector('.cond-val').value.trim();
-                        if (!val) isValueMissing = true;
-                        conditions.push({ type, operator: op, value: val });
-                    });
-
-                    if (isValueMissing || conditions.length === 0) {
-                        this.showToast('校验失败：请完整填写所有积木条件的值。', 'warning');
-                        return;
-                    }
-
-                    storage.addRule('complex', { logic, conditions, level, type: 'complex' });
-                    BlockEngine.applyComplexRules();
-
-                } else {
-                    const text = panel.querySelector('#regex-input').value.trim();
-                    if (!text) { this.showToast('校验失败：请输入有效的匹配内容。', 'warning'); return; }
-
-                    if (mode === 'contains') {
-                        // contains 模式存储原始文本 + mode 标记，applyRegexRules 用 String.includes() 匹配(BUG-M7)
-                        // 避免 .*text.* 合并到批量正则后引发贪婪回溯，影响性能
-                        storage.addRule('regex', { regex: text, level: level, mode: 'contains', type: 'regex' });
-                    } else {
-                        // 正则模式保存前校验语法，与预览路径一致；非法正则会被 applyRegexRules 静默丢弃
-                        try { new RegExp(text); }
-                        catch (e) { this.showToast('校验失败：正则表达式语法错误。' + e.message, 'error'); return; }
-                        // ReDoS 预检(BUG-8)：applyRegexRules 用 isRegexSafe 过滤嵌套量词，
-                        // 保存前不检查会导致规则保存了但永不生效，用户无任何提示
-                        if (!BlockEngine.isRegexSafe(text)) {
-                            this.showToast('校验失败：正则含嵌套量词（ReDoS 风险），已拒绝保存。', 'error');
-                            return;
-                        }
-                        storage.addRule('regex', { regex: text, level: level, type: 'regex' });
-                    }
-                    BlockEngine.applyRegexRules();
-                }
-
-                this.clearPanel();
-            });
-
-            panel.querySelector('#btn-close-regex').addEventListener('click', () => this.clearPanel());
+                showRegexPanel() {
+            return RegexPanel.call(this);
         }
 
         // 规则影响度评估：统计每条规则在当前页面命中的元素数，命中越多越疑似误杀
         // 仅评估本站规则 + 全局域名黑名单（其他站点规则不在当前页生效，评估无意义）
         // regex 规则用 TreeWalker 采样前 500 个文本节点，避免全页遍历开销过大
         evaluateRuleImpact() {
-            const data = storage.getData();
+            const data = this.storage.getData();
             const impacts = []; // {type, index, score, count}
 
             // 1. static 规则：直接 querySelectorAll 计数
@@ -6703,1019 +8370,24 @@
         // iframe 防线独立面板：统计看板 + 扫描检测 + 白名单管理 + 规则添加 + 扫描深度
         // 风格对齐 showOverlayScanPanel（毛玻璃 + 可拖动 + gd-* 样式）
         // ═══════════════════════════════════════════════════════════
-        showIframePanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            const stats = IframeGuard.getStats();
-            const config = storage.getIframeConfig();
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">🖼️ iframe 防线管理</h3>
-                <p>动态 iframe 广告拦截完整防线：创建拦截 + 递归分类扫描 + 正文保护铁律 + 跨域帧间通信。下方可查看每个 iframe 的分类详情、管理白名单。</p>
-
-                <div class="status-bar">
-                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px;">
-                        <div>🖼️ <strong>已拦截：</strong><span style="color:#ff6f00;" id="ifs-blocked">0</span> 个</div>
-                        <div>🛡️ <strong>已保护：</strong><span style="color:#34c759;" id="ifs-protected">0</span> 个</div>
-                        <div>🔍 <strong>已扫描：</strong><span style="color:#4aa3ff;" id="ifs-scanned">0</span> 个</div>
-                        <div>🧹 <strong>内部清理：</strong><span style="color:#9c27b0;" id="ifs-cleaned">0</span> 个</div>
-                    </div>
-                    <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
-                </div>
-
-                <div class="section-divider"></div>
-
-                <div style="font-size:13px; color:#4aa3ff; font-weight:bold; margin-bottom:8px;">🔍 iframe 深扫（帧内元素级）</div>
-                <div class="gd-toolbar">
-                    <button class="btn-info" id="btn-iframe-scan" style="flex:none; padding:6px 12px; font-size:12px;">🔄 立即扫描</button>
-                    <button class="btn-warning" id="btn-iframe-rescan" style="flex:none; padding:6px 12px; font-size:12px;">⚡ 重扫全部</button>
-                    <button class="btn-outline" id="btn-iframe-preview" style="flex:none; padding:6px 12px; font-size:12px;" title="预览：勾选后点击预览">🔍 预览效果</button>
-                    <button class="btn-danger" id="btn-iframe-batch-info" style="flex:none; padding:6px 12px; font-size:12px; display:none;">🛡 拦截选中(0)</button>
-                    <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:#ddd; margin:0;">
-                        <span>嵌套深度：</span>
-                        <input type="number" id="iframe-max-depth" min="1" max="5" value="${config.maxDepth || 3}"
-                               style="width:50px; padding:4px 6px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
-                        <span style="font-size:10px; color:#888;">1-5</span>
-                    </label>
-                </div>
-                <div class="gd-stats" id="iframe-scan-stats"></div>
-                <div class="gd-scroll-area" id="iframe-scan-list" style="max-height:280px;"></div>
-
-                <div class="section-divider"></div>
-
-                <div style="font-size:13px; color:#4aa3ff; font-weight:bold; margin-bottom:8px;">🛡️ 白名单管理（永不拦截的内容帧）</div>
-                <div class="gd-scroll-area" id="iframe-wl-list" style="max-height:100px;"></div>
-
-                <div class="btn-group" style="margin-top:10px;">
-                    <button class="btn-primary" id="btn-close-iframe">完成</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-
-            // ─── 分类标签与颜色 ───
-            const verdictLabel = (v) => ({
-                'ad': '纯广告', 'content': '内容帧', 'whitelist': '白名单', 'unknown': '未知'
-            }[v] || '未知');
-            const verdictColor = (v) => ({
-                'ad': 'rgba(255,59,48,0.7)', 'content': 'rgba(52,199,89,0.6)',
-                'whitelist': 'rgba(0,122,255,0.6)', 'unknown': 'rgba(120,144,156,0.5)'
-            }[v] || 'rgba(120,144,156,0.5)');
-
-            // ─── B7: iframe:stats 事件订阅 ───
-            if (!this._iframeUnsubs) this._iframeUnsubs = [];
-            this._iframeUnsubs.push(EventBus.on('iframe:stats', (s) => {
-                const set = (id, v) => { const el = panel.querySelector('#' + id); if (el) el.textContent = v; };
-                set('ifs-blocked', s.blocked || 0);
-                set('ifs-protected', s.protected || 0);
-                set('ifs-scanned', s.scanned || 0);
-                set('ifs-cleaned', s.cleaned || 0);
-            }));
-
-            // ─── B8: 已拦截指纹（跨扫描保留） ───
-            const blockedFingerprints = new WeakSet();
-            // WeakMap 不可枚举，以 DOM 存活帧为真实来源反查记录
-            IframeGuard._liveFrames().forEach((iframe) => {
-                const rec = IframeGuard._frameRecords.get(iframe);
-                if (rec && (rec.blocked || rec.manual)) blockedFingerprints.add(iframe);
-            });
-            const isBlocked = (iframe) => blockedFingerprints.has(iframe);
-
-            // ─── B6: 行内零输入生成按钮 ───
-            const mkBlockBtn = (idx) =>
-                `<button class="btn-danger" style="flex:none; padding:3px 8px; font-size:11px; margin-left:6px;" data-action="block" data-idx="${idx}">🛡拦截</button>`;
-            const mkProtectBtn = (idx) =>
-                `<button class="btn-success" style="flex:none; padding:3px 8px; font-size:11px; margin-left:4px;" data-action="protect" data-idx="${idx}">✅保护</button>`;
-
-            // ─── B6/B9/H8/H9/H12: 扫描列表渲染（异步 + 勾选 + 预览 + 批量）───
-            // state 在闭包中保留，跨渲染周期共享
-            let _deepResults = [];
-            let _iframeRecs = [];
-            let _selectedSet = new Set();
-            let _scanning = false;
-            // 扫描缓存：5s 内复用结果，避免每次打开面板都全量深扫
-            let _scanCache = null;
-            let _scanCacheTime = 0;
-            const SCAN_CACHE_TTL = 5000;
-
-            // 首绘 stats（H9）
-            (() => {
-                const s = IframeGuard.getStats();
-                const set = (id, v) => { const el = panel.querySelector('#' + id); if (el) el.textContent = v; };
-                set('ifs-blocked', s.blocked || 0);
-                set('ifs-protected', s.protected || 0);
-                set('ifs-scanned', s.scanned || 0);
-                set('ifs-cleaned', s.cleaned || 0);
-            })();
-
-            const paintScanStats = (deepResults, iframeRecs) => {
-                const statsBox = panel.querySelector('#iframe-scan-stats');
-                if (!statsBox) return;
-                const deepAd = deepResults.filter(r => r.category && r.category.endsWith('-ad')).length;
-                const deepOk = deepResults.filter(r => r.category && !r.category.endsWith('-ad')).length;
-                statsBox.textContent = `共 ${iframeRecs.length} 个帧 · 帧内 ${deepResults.length} 个可疑元素（广告 ${deepAd} · 内容 ${deepOk}）`;
-            };
-
-            const renderScanList = async () => {
-                const list = panel.querySelector('#iframe-scan-list');
-                const statsBox = panel.querySelector('#iframe-scan-stats');
-                if (!list) return;
-
-                // H12: 加载态
-                if (!_scanning) {
-                    _scanning = true;
-                    list.innerHTML = '<div class="empty-tip" style="text-align:center; padding:16px;">⏳ 扫描中...</div>';
-                    if (statsBox) statsBox.textContent = '扫描中...';
-                }
-
-                // 异步深扫，避免同步阻塞 UI
-                await new Promise(r => setTimeout(r, TIMING.MICRO_DELAY_MS));
-
-                // 缓存命中：5s 内复用结果，避免每次打开面板都全量深扫
-                const now = Date.now();
-                let deepResults;
-                if (_scanCache && (now - _scanCacheTime) < SCAN_CACHE_TTL) {
-                    deepResults = _scanCache.results;
-                } else {
-                    deepResults = IframeDeepScanner.scanAll();
-                    _scanCache = { results: deepResults, time: now };
-                }
-                const iframeRecs = [];
-                document.querySelectorAll('iframe').forEach(iframe => {
-                    if (ProtectedCheck.isProtected(iframe)) return;
-                    const rec = IframeGuard._ensureRecord(iframe);
-                    iframeRecs.push({ iframe, rec, _idx: iframeRecs.length });
-                });
-
-                _deepResults = deepResults;
-                _iframeRecs = iframeRecs;
-                _scanning = false;
-
-                paintScanStats(deepResults, iframeRecs);
-
-                if (deepResults.length === 0 && iframeRecs.length === 0) {
-                    list.innerHTML = '<div class="empty-tip">当前页面未发现 iframe 元素。</div>';
-                    return;
-                }
-
-                const batchInfoBtn = panel.querySelector('#btn-iframe-batch-info');
-                if (batchInfoBtn) batchInfoBtn.textContent = `🛡 拦截选中(${_selectedSet.size})`;
-
-                const rows = [];
-                // 帧级行：带 checkbox（H8：行 click = 勾选，动作走按钮）
-                iframeRecs.forEach(({ iframe, rec, _idx }) => {
-                    const vBadge = `<span class="tag" style="background:${verdictColor(rec.verdict)};">${verdictLabel(rec.verdict)}</span>`;
-                    const crossBadge = (rec.frozen && rec.frozen.w > 0) ? '' : '<span class="tag" style="background:rgba(255,149,0,0.5);">跨域</span>';
-                    const locked = rec.blocked || rec.manual;
-                    const lockBadge = locked
-                        ? `<span class="tag" style="background:${rec.blocked ? 'rgba(255,59,48,0.7)' : 'rgba(0,122,255,0.7)'};">${rec.blocked ? '🔒已拦截' : '🛡已保护'}</span>`
-                        : '';
-                    const srcDisplay = (iframe.src || '').length > 50
-                        ? escapeHTML(iframe.src.slice(0, 50)) + '...'
-                        : escapeHTML(iframe.src || '(空)');
-                    const frozenInfo = rec.frozen && rec.frozen.w > 0
-                        ? `<div class="gd-meta">尺寸: ${rec.frozen.w}×${rec.frozen.h}px · op=${rec.frozen.opacity} · z=${rec.frozen.zi}</div>` : '';
-                    const btns = locked
-                        ? `<span style="font-size:11px; color:#888; margin-left:4px;">锁定</span>`
-                        : mkBlockBtn(_idx) + mkProtectBtn(_idx);
-                    const checked = _selectedSet.has(_idx);
-                    rows.push(`<div class="gd-domain-row" data-idx="${_idx}" data-type="frame" ${locked ? 'style="opacity:0.7;"' : ''}>
-                        <div class="gd-left">
-                            <input type="checkbox" class="iframe-row-cb" data-idx="${_idx}" ${checked ? 'checked' : ''} style="flex:none; margin-right:6px; cursor:pointer; accent-color:#007AFF;" />
-                            <div>
-                                <div class="gd-host">${vBadge}${crossBadge}${lockBadge} ${iframe.id ? '#' + escapeHTML(iframe.id) : ''} ${iframe.className ? '· ' + escapeHTML(String(iframe.className).slice(0, 40)) : ''}</div>
-                                <div class="gd-meta" title="${escapeHTML(iframe.src || '')}">src: ${srcDisplay}</div>
-                                ${frozenInfo}
-                            </div>
-                        </div>
-                        <div style="display:flex; align-items:center;">${btns}</div>
-                    </div>`);
-                });
-
-                // 帧内元素级行：带 checkbox（H8）
-                deepResults.forEach((elRec, i) => {
-                    const cat = elRec.category || 'unknown';
-                    const suspicion = elRec.suspicion || 0;
-                    const reasonLabel = { 'domain-ad': '域名封杀', 'path-ad': '路径匹配', 'overlay': '透明覆盖', 'vice': '赌博域名', 'skin': '肤色特征' }[cat] || cat;
-                    const color = cat.endsWith('ad') ? 'rgba(255,59,48,0.7)' : 'rgba(255,159,10,0.6)';
-                    const lockClass = isBlocked(elRec.el) ? 'style="opacity:0.5;"' : '';
-                    const tagName = elRec.el?.tagName ? escapeHTML(elRec.el.tagName.toLowerCase()) : '(unknown)';
-                    const elId = elRec.el?.id ? '#' + escapeHTML(elRec.el.id) : '';
-                    const elClass = elRec.el?.className ? '.' + escapeHTML(String(elRec.el.className).split(' ')[0]) : '';
-                    const blocked = elRec.blocked;
-                    const checked = _selectedSet.has('_e_' + i);
-                    const actionBtns = blocked
-                        ? `<span style="font-size:11px; color:#888;">已拦截</span>`
-                        : `<button class="btn-danger" style="flex:none; padding:2px 8px; font-size:11px;" data-el-idx="${i}">🛡拦截</button>`;
-                    rows.push(`<div class="gd-domain-row" data-el-idx="${i}" data-type="element" ${lockClass}>
-                        <div class="gd-left">
-                            <input type="checkbox" class="iframe-row-cb" data-el-idx="${i}" ${checked ? 'checked' : ''} style="flex:none; margin-right:6px; cursor:pointer; accent-color:#007AFF;" />
-                            <div>
-                                <div class="gd-host"><span class="tag" style="background:${color};">⚠${reasonLabel}</span> 嫌疑分 ${suspicion} · <code>${tagName}${elId}${elClass}</code></div>
-                                ${elRec.selector ? `<div class="gd-meta">selector: <code>${escapeHTML(elRec.selector.slice(0, 80))}</code></div>` : ''}
-                                ${elRec.frameHost ? `<div class="gd-meta">帧域名: ${escapeHTML(elRec.frameHost)}</div>` : ''}
-                            </div>
-                        </div>
-                        <div style="display:flex; align-items:center;">${actionBtns}</div>
-                    </div>`);
-                });
-
-                list.innerHTML = rows.join('');
-
-                // 行 click = 切换勾选（H8），仅按钮触发动作
-                list.addEventListener('click', (e) => {
-                    const row = e.target.closest('.gd-domain-row');
-                    if (!row) return;
-                    // 忽略 checkbox 自身和按钮
-                    if (e.target.classList.contains('iframe-row-cb') || e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
-                    const idx = row.dataset.idx;
-                    const elIdx = row.dataset.elIdx;
-                    if (idx !== undefined) {
-                        if (_selectedSet.has(Number(idx))) _selectedSet.delete(Number(idx));
-                        else _selectedSet.add(Number(idx));
-                    } else if (elIdx !== undefined) {
-                        const key = '_e_' + Number(elIdx);
-                        if (_selectedSet.has(key)) _selectedSet.delete(key);
-                        else _selectedSet.add(key);
-                    }
-                    renderScanList();
-                });
-
-                // 绑定帧级 block/protect 按钮
-                list.querySelectorAll('[data-action="block"]').forEach(btn => {
-                    btn.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        const idx = parseInt(btn.dataset.idx, 10);
-                        const iframe = iframeRecs[idx]?.iframe;
-                        if (!iframe) return;
-                        const rec = IframeGuard._ensureRecord(iframe);
-                        if (rec.blocked || rec.manual) return;
-                        BlockEngine.hideElement(iframe);
-                        rec.blocked = true; rec.verdict = 'ad';
-                        blockedFingerprints.add(iframe);
-                        IframeGuard._incStat('blocked');
-                        EventBus.emit('iframe:blocked', { iframe, reason: 'panel-click' });
-                        this.showToast('已拦截该 iframe', 'success');
-                        renderScanList();
-                    });
-                });
-                list.querySelectorAll('[data-action="protect"]').forEach(btn => {
-                    btn.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        const idx = parseInt(btn.dataset.idx, 10);
-                        const iframe = iframeRecs[idx]?.iframe;
-                        if (!iframe) return;
-                        IframeGuard.protectInFrame({ iframe, el: iframe });
-                        blockedFingerprints.add(iframe);
-                        this.showToast('已保护该帧（零输入白名单）', 'success');
-                        renderScanList();
-                    });
-                });
-                // 绑定帧内元素级拦截（H8：仅按钮触发，不走行 click）
-                list.querySelectorAll('[data-el-idx]').forEach(btn => {
-                    if (btn.dataset.action) return;
-                    btn.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        const elIdx = parseInt(btn.dataset.elIdx, 10);
-                        const elRec = deepResults[elIdx];
-                        if (!elRec || elRec.blocked) return;
-                        IframeGuard.blockInFrameNode(elRec);
-                        const targetIframe = elRec.el?.closest('iframe');
-                        if (targetIframe) blockedFingerprints.add(targetIframe);
-                        this.showToast('已拦截帧内元素', 'success');
-                        renderScanList();
-                    });
-                });
-            };
-
-            // ─── 白名单列表渲染 ───
-            const renderWlList = () => {
-                const box = panel.querySelector('#iframe-wl-list');
-                if (!box) return;
-                const list = WhitelistStore.getAll();
-                if (list.length === 0) {
-                    box.innerHTML = '<div class="empty-tip">暂无白名单条目（扫描时点击 ✅保护 按钮可零输入添加）</div>';
-                    return;
-                }
-                box.innerHTML = list.map((e, i) => {
-                    const parts = [];
-                    if (e.selector) parts.push(`选择器: <code>${escapeHTML(e.selector)}</code>`);
-                    if (e.domain) parts.push(`域名: <code>${escapeHTML(e.domain)}</code>`);
-                    return `<div class="gd-domain-row">
-                        <div class="gd-left">
-                            <div class="gd-check" style="cursor:pointer; color:#ff6f00;" data-wl-del="${i}" title="删除">✕</div>
-                            <div><div class="gd-host">${parts.join(' · ') || '(空)'}</div></div>
-                        </div>
-                    </div>`;
-                }).join('');
-                box.querySelectorAll('[data-wl-del]').forEach(btn => {
-                    btn.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        const idx = parseInt(btn.getAttribute('data-wl-del'), 10);
-                        WhitelistStore.remove(idx);
-                        this.showToast('已从白名单移除', 'success');
-                        try { IframeGuard.rescanAll(); } catch (err) { Log.warn(err.message || err); }
-                        renderWlList();
-                    });
-                });
-            };
-
-            // ─── 初始渲染 ───
-            renderScanList();
-            renderWlList();
-
-            // ─── 事件绑定 ───
-            panel.querySelector('#btn-iframe-scan').addEventListener('click', () => {
-                _selectedSet.clear();
-                _scanCache = null; // 清除缓存，强制重新扫描
-                renderScanList();
-            });
-            panel.querySelector('#btn-iframe-rescan').addEventListener('click', () => {
-                _selectedSet.clear();
-                try {
-                    IframeGuard.forceRescan();
-                    renderScanList();
-                    this.showToast('已重新扫描全部 iframe', 'success');
-                } catch (e) { this.showToast('重扫失败: ' + e.message, 'error'); }
-            });
-
-            // 预览横幅
-            let _previewBanner = null;
-            const showPreviewBanner = (fnReset) => {
-                this._hidePreviewBanner();
-                const banner = document.createElement('div');
-                banner.className = 'preview-banner';
-                banner.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483646;background:rgba(0,122,255,0.85);color:#fff;padding:8px 20px;border-radius:0 0 10px 10px;font-size:13px;font-weight:600;box-shadow:0 2px 12px rgba(0,0,0,0.3);';
-                banner.textContent = '🔍 预览模式：勾选元素后预览效果，完成后点"完成"退出预览';
-                banner.addEventListener('click', () => { fnReset(); this._hidePreviewBanner(); });
-                document.documentElement.appendChild(banner);
-                _previewBanner = banner;
-            };
-            // 预览按钮
-            panel.querySelector('#btn-iframe-preview').addEventListener('click', () => {
-                if (!this._iframePreview.active) {
-                    this._iframePreview = { active: true, elements: [] };
-                    showPreviewBanner(() => {
-                        this._iframePreview = { active: false, elements: [] };
-                    });
-                } else {
-                    this._iframePreview.active = false;
-                    this._iframePreview.elements.forEach(el => BlockEngine.showElement(el));
-                    this._iframePreview.elements = [];
-                    this._hidePreviewBanner();
-                }
-                this.showToast(this._iframePreview.active ? '预览已激活' : '预览已退出', 'info');
-            });
-            // 批量拦截选中
-            panel.querySelector('#btn-iframe-batch-info').addEventListener('click', () => {
-                if (_selectedSet.size === 0) { this.showToast('未选中任何元素', 'warning'); return; }
-                let count = 0;
-                _selectedSet.forEach(key => {
-                    if (key.startsWith('_e_')) {
-                        const i = parseInt(key.slice(3), 10);
-                        const elRec = _deepResults[i];
-                        if (elRec && !elRec.blocked) {
-                            IframeGuard.blockInFrameNode(elRec);
-                            count++;
-                        }
-                    } else {
-                        const idx = parseInt(key, 10);
-                        const iframe = _iframeRecs[idx]?.iframe;
-                        if (iframe) {
-                            const rec = IframeGuard._ensureRecord(iframe);
-                            if (!rec.blocked && !rec.manual) {
-                                BlockEngine.hideElement(iframe);
-                                rec.blocked = true; rec.verdict = 'ad';
-                                count++;
-                            }
-                        }
-                    }
-                });
-                _selectedSet.clear();
-                renderScanList();
-                this.showToast(`已批量拦截 ${count} 个元素`, 'success');
-            });
-            panel.querySelector('#iframe-max-depth').addEventListener('change', (e) => {
-                const d = parseInt(e.target.value, 10);
-                if (d >= IframeGuard.MIN_DEPTH && d <= IframeGuard.MAX_DEPTH) {
-                    IframeGuard.setMaxDepth(d);
-                    IframeDeepScanner.maxDepth = d;
-                    this.showToast(`扫描深度已设为 ${d} 层`, 'success');
-                } else {
-                    this.showToast('深度须在 1-5 之间', 'warning');
-                    e.target.value = storage.getIframeConfig().maxDepth || 3;
-                }
-            });
-            panel.querySelector('#btn-close-iframe').addEventListener('click', () => this.clearPanel());
+                showIframePanel() {
+            return IframePanel.call(this);
         }
 
 
 
         // 统一规则管理面板：合并「规则与防御管理」与「按网站查看所有规则」为单一透明玻璃面板（问题3）
         // 全局域名黑名单 + 本站规则 + 其他站点规则统一汇总，按最近过滤时间 _ts 倒序置顶，便于快速删除
-        showManager() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-            const data = storage.getData();
-
-            // 防御策略状态
-            const isManualPreemptive = data.config.mode === 'preemptive';
-            const isFlashMarked = !!storage.flashList[storage.domain];
-            const cleanCount = storage.getCleanLoadCount();
-            let modeText, modeHint;
-            if (isManualPreemptive) {
-                modeText = '<span style="color:#ffb74d; font-weight:bold;">极速预判（手动开启）</span>';
-                modeHint = '在 0/100/300/700/1500ms 多时序重扫，专治首屏闪现；观察无闪现后可切回智能自动。';
-            } else if (isFlashMarked) {
-                modeText = `<span style="color:#ff6f00; font-weight:bold;">极速预判（闪现自动启用）</span> · 自愈进度 ${cleanCount}/3`;
-                modeHint = '检测到广告闪现已自动升级。连续 3 次干净加载后自动恢复智能自动，或手动重置。';
-            } else {
-                modeText = '<span style="color:#34c759; font-weight:bold;">智能自动</span>';
-                modeHint = '由 MutationObserver 实时拦截动态广告，常规站点推荐。遇首屏闪现可手动切到极速预判。';
-            }
-            const flashStatus = isFlashMarked
-                ? `<span style="color:red; font-weight:bold;">已记录闪现特征</span>（本次加载如无闪现，将计入自愈 ${cleanCount}/3）`
-                : '<span style="color:#34c759; font-weight:bold;">运行良好</span>';
-            const highlightColor = GM_getValue('config_highlight_color', '#FF3B30');
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">规则与防御管理 (${storage.domain})</h3>
-
-                <div class="status-bar">
-                    <div><strong>防御策略：</strong> ${modeText}</div>
-                    <div style="font-size:11px; color:#999; margin:2px 0 6px;">${modeHint}</div>
-                    <div><strong>系统评估：</strong> ${flashStatus}</div>
-                    <div><strong>全局域名黑名单：</strong> 共 <span id="mgr-domain-count">${data.domainBlock.length}</span> 个域名（跨站点生效）</div>
-                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1);">
-                        <div>🌐 <strong>网络拦截：</strong><span style="color:#4aa3ff;"> ${BlockEngine.stats.networkBlocks}</span> 次</div>
-                        <div>🧩 <strong>DOM 屏蔽：</strong><span style="color:#34c759;"> ${BlockEngine.stats.domBlocks}</span> 个</div>
-                        <div>⚡ <strong>匹配耗时：</strong><span style="color:#ffb74d;"> ${BlockEngine.stats.matchTimeMs.toFixed(2)}</span> ms</div>
-                    </div>
-                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px; margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.05);">
-                        <div>🖼️ <strong>iframe 拦截：</strong><span style="color:#ff6f00;"> ${IframeGuard.getStats().blocked}</span> 个</div>
-                        <div>🛡️ <strong>iframe 保护：</strong><span style="color:#34c759;"> ${IframeGuard.getStats().protected}</span> 个</div>
-                        <div>🔍 <strong>iframe 扫描：</strong><span style="color:#4aa3ff;"> ${IframeGuard.getStats().scanned}</span> 个</div>
-                        <div>🧹 <strong>内部清理：</strong><span style="color:#9c27b0;"> ${IframeGuard.getStats().cleaned}</span> 个</div>
-                    </div>
-                    <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
-                </div>
-
-                <div class="status-bar" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                    <label style="margin:0; font-size:12px; color:#ddd; white-space:nowrap;">🎨 高亮选框颜色：</label>
-                    <input type="text" id="ui-highlight-color" value="${escapeHTML(highlightColor)}"
-                           pattern="^#[0-9A-Fa-f]{6}$" maxlength="7" placeholder="#FF3B30"
-                           style="width:90px; padding:4px 8px; font-family:monospace; text-transform:uppercase; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
-                    <span id="color-preview" style="display:inline-block; width:20px; height:20px; border-radius:4px; border:1px solid rgba(255,255,255,0.3); background:${escapeHTML(highlightColor)}; vertical-align:middle;"></span>
-                    <span style="font-size:10px; color:#888;">输入 Hex 色值（如 #FF3B30）实时预览</span>
-                </div>
-
-                <div class="gd-toolbar">
-                    <select id="mgr-scope-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
-                        <option value="all">全部范围</option>
-                        <option value="global">域名黑名单</option>
-                        <option value="current">本站规则</option>
-                        <option value="other">其他站点</option>
-                    </select>
-                    <select id="mgr-type-filter" style="flex:none; padding:6px 8px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;">
-                        <option value="">全部类型</option>
-                        <option value="domainBlock">域名</option>
-                        <option value="iframeBlock">iframe</option>
-                        <option value="static">静态</option>
-                        <option value="dynamic">动态</option>
-                        <option value="regex">正则</option>
-                        <option value="attribute">属性</option>
-                        <option value="structural">位置</option>
-                        <option value="complex">积木</option>
-                        <option value="pathPattern">路径</option>
-                    </select>
-                    <input type="text" id="mgr-filter" placeholder="输入域名或规则内容关键字过滤..." />
-                    <button class="btn-warning" id="btn-impact-sort" style="flex:none; padding:6px 10px; font-size:12px;">📊 按影响度排序</button>
-                    <button class="btn-outline" id="btn-batch" style="flex:none; padding:6px 10px; font-size:12px;">☑ 批量选择</button>
-                    <button class="btn-danger" id="btn-batch-delete" style="flex:none; padding:6px 10px; font-size:12px; display:none;">🗑 删除选中(0)</button>
-                </div>
-                <div class="gd-stats" id="mgr-stats"></div>
-                <div class="selection-info" style="max-height: 320px; overflow-y: auto; margin-bottom: 12px;">
-                    <ul class="rule-list" id="mgr-list"></ul>
-                </div>
-
-                <div class="btn-group">
-                    <button class="btn-info" id="btn-toggle-mode">🚀 切换防御策略</button>
-                    <button class="btn-warning" id="btn-reset-flash" style="${isFlashMarked ? '' : 'display:none;'}">♻️ 重置闪现标记</button>
-                    <button class="btn-success" id="btn-export">📤 导出规则</button>
-                    <button class="btn-warning" id="btn-import">📥 导入规则</button>
-                </div>
-                <div class="btn-group" style="margin-top: 10px;">
-                    <button class="btn-info" id="btn-iframe-panel">🖼️ iframe 防线管理</button>
-                    <button class="btn-success" id="btn-ag-export">🛡️ 转 AdGuard 规则</button>
-                    <button class="btn-outline" id="btn-clear-all">清除本站规则</button>
-                    <button class="btn-primary" id="btn-close-manager">完成</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-
-            // —— 统一记录构建：全局域名黑名单 + 本站 7 类 + 其他站点规则，按 _ts 倒序（最近置顶）——
-            const formatRuleContent = (type, r) => {
-                switch (type) {
-                    case 'static': return escapeHTML(r.selector || '');
-                    case 'dynamic': return `类名: ${escapeHTML(r.className || '')}`;
-                    case 'regex': return `${r.mode === 'contains' ? '包含' : '匹配'}: ${escapeHTML(r.regex || '')} (层级: ${r.level})`;
-                    case 'attribute': return `选择器: ${escapeHTML(r.attrSelector || '')}`;
-                    case 'structural': return escapeHTML(r.structSelector || '');
-                    case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
-                    case 'iframeBlock': {
-                        const mt = r.matchType === 'srcDomain' ? 'src域名' : (r.matchType === 'srcdocKeyword' ? 'srcdoc关键词' : (r.matchType === 'geometry' ? '几何条件' : r.matchType));
-                        return `iframe[${mt}]: ${escapeHTML(r.value || '')}`;
-                    }
-                    case 'complex': {
-                        const formatOp = (op) => op === 'contains' ? '包含' : (op === 'equals' ? '等于' : '不包含');
-                        const formatType = (t) => t === 'text' ? '文本' : (t === 'class' ? '类名' : 'ID');
-                        const condText = (r.conditions || []).map(c => `[${formatType(c.type)} ${formatOp(c.operator)} "${escapeHTML(c.value)}"]`).join(` <span style="color:#007AFF; font-weight:bold;">${escapeHTML(r.logic || 'AND')}</span> `);
-                        return `${condText} (层级: ${r.level})`;
-                    }
-                    default: return '';
-                }
-            };
-            const TYPE_META = {
-                domainBlock: { label: '域名', tag: 'domain' },
-                iframeBlock: { label: 'iframe', tag: 'iframe' },
-                static: { label: '静态', tag: '' },
-                dynamic: { label: '动态', tag: '' },
-                regex: { label: '正则', tag: '' },
-                attribute: { label: '属性', tag: 'attr' },
-                structural: { label: '位置', tag: 'struct' },
-                complex: { label: '积木', tag: 'complex' },
-                pathPattern: { label: '路径', tag: 'path' }
-            };
-            const buildRecords = () => {
-                const recs = [];
-                const d = storage.getData();
-                // 1. 全局域名黑名单（{domain,_ts}[]）
-                d.domainBlock.forEach((r, i) => recs.push({
-                    scope: 'global', domain: '(全局)', index: i, type: 'domainBlock',
-                    content: escapeHTML(r.domain), ts: r._ts || 0, value: r.domain,
-                    disabled: !!r._disabled,
-                    rule: r
-                }));
-                // 1.1 iframe 规则（全局生效，{matchType,value,_ts,_disabled}[]）
-                storage.getIframeBlocks().forEach((r, i) => recs.push({
-                    scope: 'global', domain: '(全局)', index: i, type: 'iframeBlock',
-                    content: formatRuleContent('iframeBlock', r), ts: r._ts || 0, value: r.value || '',
-                    disabled: !!r._disabled,
-                    rule: r
-                }));
-                // 2. 本站 7 类规则
-                ['static', 'dynamic', 'regex', 'attribute', 'structural', 'complex', 'pathPattern'].forEach(type => {
-                    (d[type] || []).forEach((r, i) => recs.push({
-                        scope: 'current', domain: storage.domain, index: i, type,
-                        content: formatRuleContent(type, r), ts: r._ts || 0,
-                        value: (type === 'pathPattern') ? (r.pattern || '') : '',
-                        disabled: !!r._disabled,
-                        rule: r
-                    }));
-                });
-                // 3. 其他站点规则（跨站，排除本站以免重复）
-                storage.getAllSiteRules().forEach(rec => {
-                    if (rec.domain === storage.domain) return;
-                    recs.push({
-                        scope: 'other', domain: rec.domain, index: rec.index, type: rec.type,
-                        content: formatRuleContent(rec.type, rec.rule), ts: rec.rule._ts || 0,
-                        value: (rec.type === 'pathPattern') ? (rec.rule.pattern || '') : '',
-                        disabled: !!rec.rule._disabled,
-                        rule: rec.rule
-                    });
-                });
-                // 按 _ts 倒序：最近过滤的规则置顶（问题3&7）
-                recs.sort((a, b) => b.ts - a.ts);
-                return recs;
-            };
-
-            let filterScope = 'all';
-            let filterType = '';
-            let filterText = '';
-            // 影响度排序模式：true 时按 impactScore 降序展示，高分规则红色标记便于排查误杀
-            let impactMode = false;
-            // 批量选择模式：true 时每条规则前显示复选框，支持一次性删除多条
-            let batchMode = false;
-            const batchSelected = new Set(); // key: `${scope}|${domain}|${type}|${index}`
-            // 构建记录并按需注入 impactScore：删除/撤销/切换后调用，避免影响度模式下排序退化(BUG-S3)
-            const rebuildRecords = () => {
-                const recs = buildRecords();
-                if (impactMode) {
-                    const impacts = this.evaluateRuleImpact();
-                    const impactMap = new Map();
-                    impacts.forEach(imp => impactMap.set(`${imp.type}-${imp.index}`, imp.score));
-                    recs.forEach(rec => { rec.impactScore = impactMap.get(`${rec.type}-${rec.index}`) || 0; });
-                }
-                return recs;
-            };
-            let records = rebuildRecords();
-
-            const renderList = () => {
-                const list = panel.querySelector('#mgr-list');
-                const stats = panel.querySelector('#mgr-stats');
-                const countEl = panel.querySelector('#mgr-domain-count');
-                if (countEl) countEl.textContent = records.filter(r => r.scope === 'global').length;
-                if (!list) return;
-                // 影响度模式下按 impactScore 降序，让高风险（疑似误杀）规则置顶
-                const displayRecords = impactMode
-                    ? records.slice().sort((a, b) => (b.impactScore || 0) - (a.impactScore || 0))
-                    : records;
-                const filtered = displayRecords.filter(rec => {
-                    if (filterScope !== 'all' && rec.scope !== filterScope) return false;
-                    if (filterType && rec.type !== filterType) return false;
-                    if (filterText) {
-                        const hay = (rec.domain + ' ' + (TYPE_META[rec.type] ? TYPE_META[rec.type].label : '') + ' ' + rec.content + (rec.rule?._meta || '')).toLowerCase();
-                        if (!hay.includes(filterText)) return false;
-                    }
-                    return true;
-                });
-                if (stats) stats.textContent = impactMode
-                    ? `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（按影响度排序，⚠️ 标记为疑似误杀）`
-                    : `共 ${records.length} 条 · 当前显示 ${filtered.length} 条（最近过滤置顶，点击删除即时生效）`;
-                if (filtered.length === 0) {
-                    list.innerHTML = '<li class="empty-tip">暂无规则。手动屏蔽元素或封杀域名后将显示在此处。</li>';
-                    return;
-                }
-                list.innerHTML = filtered.map(rec => {
-                    const meta = TYPE_META[rec.type] || { label: rec.type, tag: '' };
-                    const siteBadge = rec.scope === 'current'
-                        ? `<span class="as-site" style="background:rgba(52,199,89,0.3);">本站</span>`
-                        : rec.scope === 'global'
-                            ? `<span class="as-site" style="background:rgba(255,111,0,0.35);">全局</span>`
-                            : `<span class="as-site" title="${escapeHTML(rec.domain)}">${escapeHTML(rec.domain)}</span>`;
-                    // 影响度模式：score≥60 红色警告（高度疑似误杀），30-59 黄色提示
-                    const impactBadge = impactMode && rec.impactScore >= 60
-                        ? `<span class="tag" style="background:rgba(255,0,0,0.7);">⚠️影响${rec.impactScore}</span>`
-                        : impactMode && rec.impactScore >= 30
-                            ? `<span class="tag" style="background:rgba(255,159,10,0.7);">影响${rec.impactScore}</span>`
-                            : '';
-                    // 禁用规则：文字置灰 + 删除线 + "已禁用"标记 + 切换按钮显示"启用"
-                    const disabledStyle = rec.disabled ? 'opacity:0.45; text-decoration:line-through;' : '';
-                    const disabledBadge = rec.disabled ? '<span class="tag" style="background:rgba(142,142,147,0.6);">已禁用</span>' : '';
-                    const toggleLabel = rec.disabled ? '启用' : '禁用';
-                    const toggleClass = rec.disabled ? 'btn-success' : 'btn-outline';
-                    // 批量选择模式：每条规则前显示复选框，key 唯一标识一条规则用于批量删除
-                    const recKey = `${rec.scope}|${rec.domain}|${rec.type}|${rec.index}`;
-                    const batchBox = batchMode
-                        ? `<input type="checkbox" class="batch-check" data-key="${escapeHTML(recKey)}" ${batchSelected.has(recKey) ? 'checked' : ''} style="flex:none; width:16px; height:16px; margin-right:8px; cursor:pointer; accent-color:#ff3b30;" />`
-                        : '';
-                    // 帧内深扫规则徽章（B4）
-                    const iframeBadge = (rec.rule?._meta === 'iframe-scan')
-                        ? '<span class="tag" style="background:rgba(156,39,176,.5);">🖼帧内</span>' : '';
-                    return `<li class="rule-item">
-                        ${batchBox}
-                        <div class="rule-content" style="${disabledStyle}">
-                            ${siteBadge}<span class="tag ${meta.tag}">${meta.label}</span> ${rec.content} ${impactBadge} ${disabledBadge} ${iframeBadge}
-                        </div>
-                        <button class="${toggleClass} btn-toggle" style="flex:none; width:54px; padding: 6px; margin-right:6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}">${toggleLabel}</button>
-                        <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}" data-value="${escapeHTML(rec.value || '')}">删除</button>
-                    </li>`;
-                }).join('');
-            };
-            renderList();
-
-            // 过滤器事件
-            panel.querySelector('#mgr-scope-filter').addEventListener('change', (e) => { filterScope = e.target.value; renderList(); });
-            panel.querySelector('#mgr-type-filter').addEventListener('change', (e) => { filterType = e.target.value; renderList(); });
-            panel.querySelector('#mgr-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderList(); });
-
-            // 影响度排序：评估每条规则当前页面命中元素数，命中越多越疑似误杀
-            // 切换为 toggle：首次点击进入影响度模式，再次点击恢复 _ts 倒序
-            panel.querySelector('#btn-impact-sort').addEventListener('click', (e) => {
-                // 用 currentTarget 取按钮本身，避免点击子元素时 e.target 指向子元素(BUG-3)
-                const btn = e.currentTarget;
-                if (!impactMode) {
-                    impactMode = true;
-                    btn.textContent = '↩ 恢复原排序';
-                    btn.classList.remove('btn-warning');
-                    btn.classList.add('btn-success');
-                    records = rebuildRecords(); // 进入影响度模式时注入 impactScore
-                } else {
-                    impactMode = false;
-                    btn.textContent = '📊 按影响度排序';
-                    btn.classList.remove('btn-success');
-                    btn.classList.add('btn-warning');
-                    records = buildRecords(); // 恢复 _ts 倒序
-                }
-                renderList();
-            });
-
-            // 删除：事件委托，按归属调用对应删除 API，并还原内联隐藏 + 强制重扫确保即时生效（问题2&5）
-            // 删除后仅重渲染列表（不重建面板），保留过滤态与滚动位置，连续删除无需重开面板（问题3）
-            panel.querySelector('#mgr-list').addEventListener('click', (e) => {
-                // 启用/禁用切换：调用 toggleRuleDisabled，引擎层会自动重新应用规则
-                const toggleBtn = e.target.closest('.btn-toggle');
-                if (toggleBtn) {
-                    const scope = toggleBtn.getAttribute('data-scope');
-                    const domain = toggleBtn.getAttribute('data-domain');
-                    const type = toggleBtn.getAttribute('data-type');
-                    const index = parseInt(toggleBtn.getAttribute('data-index'), 10);
-                    // iframe 规则走独立 API
-                    if (type === 'iframeBlock') {
-                        const nowDisabled = storage.toggleIframeRuleDisabled(index);
-                        this.showToast(nowDisabled ? '规则已禁用' : '规则已启用', nowDisabled ? 'warning' : 'success');
-                        try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
-                        records = rebuildRecords();
-                        renderList();
-                        return;
-                    }
-                    // 跨站规则需传 domain，本站/全局用默认
-                    const targetDomain = scope === 'other' ? domain : null;
-                    const nowDisabled = storage.toggleRuleDisabled(type, index, targetDomain);
-                    this.showToast(nowDisabled ? '规则已禁用' : '规则已启用', nowDisabled ? 'warning' : 'success');
-                    // B4: iframe-scan 规则启用/禁用时同步重应用到帧内
-                    if (type === 'attribute') {
-                        try {
-                            const allRules = storage.getAllSiteRules();
-                            const targetRule = allRules.find(r => r.domain === domain && r.type === type && r.index === index);
-                            if (targetRule && targetRule.rule?._meta === 'iframe-scan') {
-                                IframeGuard.reapplyInFrames();
-                            }
-                        } catch (e) { Log.warn(e.message || e); }
-                    }
-                    records = rebuildRecords();
-                    renderList();
-                    return;
-                }
-                const btn = e.target.closest('.btn-delete');
-                if (!btn) return;
-                const scope = btn.getAttribute('data-scope');
-                const domain = btn.getAttribute('data-domain');
-                const type = btn.getAttribute('data-type');
-                const index = parseInt(btn.getAttribute('data-index'), 10);
-                const value = btn.getAttribute('data-value') || '';
-                const scrollBox = panel.querySelector('#mgr-list').parentElement;
-                const savedScroll = scrollBox ? scrollBox.scrollTop : 0;
-
-                // 删除前捕获完整规则对象，供撤销恢复使用
-                let capturedRule = null;
-                if (type === 'iframeBlock') {
-                    capturedRule = storage.getIframeBlocks()[index];
-                } else if (scope === 'global') {
-                    capturedRule = storage.getDomainBlocks()[index];
-                } else if (scope === 'current') {
-                    capturedRule = storage.getData()[type][index];
-                } else {
-                    const siteRec = storage.getAllSiteRules().find(r => r.domain === domain && r.type === type && r.index === index);
-                    capturedRule = siteRec ? siteRec.rule : null;
-                }
-
-                if (type === 'iframeBlock') {
-                    storage.removeIframeRule(index);
-                    IframeGuard.rescanAll(); // 重新评估所有 iframe（含已处理的）让规则变更即时生效
-                } else if (scope === 'global') {
-                    // 域名黑名单：removeRule 已不再内部 apply(不一致-1)，统一由 reapplyAll 接管
-                    // reapplyAll = restoreAllInlineStyles + applyCSSRules + applyRegexRules + applyComplexRules + scanAndBlockDynamic
-                    // restoreAllInlineStyles 清除该域名命中的内联隐藏，applyCSSRules 重建表（不含已删域名）
-                    storage.removeRule('domainBlock', index);
-                    BlockEngine.reapplyAll();
-                } else if (scope === 'current') {
-                    storage.removeRule(type, index);
-                    BlockEngine.reapplyAll();
-                } else {
-                    // 跨站规则：同上，需重新应用所有内联拦截
-                    storage.removeRuleForDomain(domain, type, index);
-                    BlockEngine.reapplyAll();
-                    // B4: 若是 iframe-scan 规则，同步重应用到各帧
-                    if (capturedRule && capturedRule._meta === 'iframe-scan') {
-                        try { IframeGuard.reapplyInFrames(); } catch (e) { Log.warn(e.message || e); }
-                    }
-                }
-                // 推入撤销栈并显示带撤销按钮的 Toast（5s 内可恢复）
-                if (capturedRule) {
-                    this._pushUndo({ type, domain, scope, rule: { ...capturedRule } });
-                    this.showToast('已删除规则', 'warning', 5000, () => {
-                        this._performUndo();
-                        records = rebuildRecords();
-                        renderList();
-                    });
-                }
-                records = rebuildRecords();
-                renderList();
-                requestAnimationFrame(() => { if (scrollBox) scrollBox.scrollTop = savedScroll; });
-            });
-
-            // ===== 批量删除功能 =====
-            // 批量选择 toggle：切换批量模式，退出时清空已选集合
-            panel.querySelector('#btn-batch').addEventListener('click', (e) => {
-                batchMode = !batchMode;
-                if (!batchMode) batchSelected.clear();
-                // 用 currentTarget 取按钮本身，避免点击子元素时 e.target 指向子元素(BUG-3)
-                const btn = e.currentTarget;
-                btn.textContent = batchMode ? '↩ 退出批量' : '☑ 批量选择';
-                btn.classList.toggle('btn-success', batchMode);
-                btn.classList.toggle('btn-outline', !batchMode);
-                const delBtn = panel.querySelector('#btn-batch-delete');
-                if (delBtn) {
-                    delBtn.style.display = batchMode ? '' : 'none';
-                    delBtn.textContent = `🗑 删除选中(${batchSelected.size})`;
-                }
-                renderList();
-            });
-
-            // 复选框变化：同步 batchSelected 集合并更新删除按钮计数
-            panel.querySelector('#mgr-list').addEventListener('change', (e) => {
-                if (!e.target.classList.contains('batch-check')) return;
-                const key = e.target.getAttribute('data-key');
-                if (e.target.checked) batchSelected.add(key);
-                else batchSelected.delete(key);
-                const delBtn = panel.querySelector('#btn-batch-delete');
-                if (delBtn) delBtn.textContent = `🗑 删除选中(${batchSelected.size})`;
-            });
-
-            // 批量删除：按 (scope|domain|type) 分组，索引降序逐条删除避免错位；
-            // 删除前捕获完整规则对象，整体推入撤销栈（一次撤销恢复全部）
-            panel.querySelector('#btn-batch-delete').addEventListener('click', () => {
-                if (batchSelected.size === 0) { this.showToast('未选中任何规则', 'info'); return; }
-                const count = batchSelected.size;
-                this.showConfirm('批量删除确认', `确认删除选中的 ${count} 条规则？\n\n此操作可通过 Toast 撤销按钮一次性恢复（5 次操作内）。`, () => {
-                    // 解析选中 key → 删除任务列表
-                    const tasks = [];
-                    batchSelected.forEach(key => {
-                        const parts = key.split('|');
-                        // key 格式：scope|domain|type|index，domain 可能含 | 已用 escapeHTML 转义，此处 domain 为存储域名为安全字符
-                        if (parts.length < 4) return;
-                        const scope = parts[0];
-                        const domain = parts[1];
-                        const type = parts[2];
-                        const index = parseInt(parts[3], 10);
-                        if (isNaN(index)) return;
-                        tasks.push({ scope, domain, type, index });
-                    });
-                    // 捕获待删规则快照（用于撤销恢复）
-                    const captured = [];
-                    tasks.forEach(t => {
-                        let rule = null;
-                        let value = '';
-                        if (t.type === 'iframeBlock') {
-                            // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
-                            rule = storage.getIframeBlocks()[t.index];
-                            value = rule ? (rule.value || '') : '';
-                        } else if (t.scope === 'global') {
-                            rule = storage.getDomainBlocks()[t.index];
-                            value = rule ? rule.domain : '';
-                        } else if (t.scope === 'current') {
-                            rule = storage.getData()[t.type] && storage.getData()[t.type][t.index];
-                        } else {
-                            const siteRec = storage.getAllSiteRules().find(r => r.domain === t.domain && r.type === t.type && r.index === t.index);
-                            rule = siteRec ? siteRec.rule : null;
-                        }
-                        if (rule) captured.push({ scope: t.scope, domain: t.domain, type: t.type, rule: { ...rule }, value });
-                    });
-                    // 冗余-1：已移除 restoreInlineForDomain 循环——reapplyAll 内部 restoreAllInlineStyles
-                    // 会清除全部内联隐藏样式（不依赖规则存在），此处的逐域名还原完全被覆盖，属冗余操作
-                    // 按 (scope|domain|type) 分组，组内索引降序删除，保证低索引不受高索引删除影响
-                    const groups = new Map();
-                    tasks.forEach(t => {
-                        const gk = `${t.scope}|${t.domain}|${t.type}`;
-                        if (!groups.has(gk)) groups.set(gk, []);
-                        groups.get(gk).push(t);
-                    });
-                    groups.forEach(groupTasks => {
-                        groupTasks.sort((a, b) => b.index - a.index);
-                        groupTasks.forEach(t => {
-                            if (t.type === 'iframeBlock') storage.removeIframeRule(t.index);
-                            else if (t.scope === 'global') storage.removeRule('domainBlock', t.index);
-                            else if (t.scope === 'current') storage.removeRule(t.type, t.index);
-                            else storage.removeRuleForDomain(t.domain, t.type, t.index);
-                        });
-                    });
-                    // 删除后统一重新应用所有拦截规则
-                    BlockEngine.reapplyAll();
-                    // iframeBlock 规则变更需重新扫描（reapplyAll 不覆盖 iframe 扫描）
-                    if (tasks.some(t => t.type === 'iframeBlock')) {
-                        try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
-                    }
-                    // 推入批量撤销条目（一次撤销恢复全部）
-                    if (captured.length > 0) {
-                        this._pushUndo({ batch: true, rules: captured });
-                        this.showToast(`已批量删除 ${captured.length} 条规则`, 'warning', 5000, () => {
-                            this._performUndo();
-                            records = rebuildRecords();
-                            renderList();
-                        });
-                    }
-                    batchSelected.clear();
-                    batchMode = false;
-                    const batchBtn = panel.querySelector('#btn-batch');
-                    if (batchBtn) {
-                        batchBtn.textContent = '☑ 批量选择';
-                        batchBtn.classList.toggle('btn-success', false);
-                        batchBtn.classList.toggle('btn-outline', true);
-                    }
-                    const delBtn = panel.querySelector('#btn-batch-delete');
-                    if (delBtn) delBtn.style.display = 'none';
-                    records = rebuildRecords();
-                    renderList();
-                });
-            });
-
-            // 高亮颜色 Hex 输入：实时校验、预览并持久化
-            const colorInput = panel.querySelector('#ui-highlight-color');
-            const colorPreview = panel.querySelector('#color-preview');
-            if (colorInput) {
-                colorInput.addEventListener('input', (e) => {
-                    const val = e.target.value.trim();
-                    // 非法 Hex 值给视觉反馈(BUG-11)：红框提示用户格式错误，合法时还原边框并实时预览
-                    if (/^#[0-9A-Fa-f]{6}$/.test(val)) {
-                        colorInput.style.borderColor = '';
-                        document.documentElement.style.setProperty('--pro-blocker-highlight-color', val);
-                        if (colorPreview) colorPreview.style.background = val;
-                        GM_setValue('config_highlight_color', val);
-                    } else {
-                        colorInput.style.borderColor = '#FF3B30';
-                    }
-                });
-            }
-
-            panel.querySelector('#btn-toggle-mode').addEventListener('click', () => {
-                const newMode = storage.toggleMode();
-                this.showToast(`策略已调整为：${newMode === 'preemptive' ? '极速预判模式' : '智能自动模式'}，页面即将刷新。`, 'info', 2000);
-                setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
-            });
-
-            const resetBtn = panel.querySelector('#btn-reset-flash');
-            if (resetBtn) {
-                resetBtn.addEventListener('click', () => {
-                    this.showConfirm('清除闪现标记', '确认清除本站的闪现标记？清除后将恢复"智能自动"模式（除非你手动开启极速预判）。', () => {
-                        storage.resetFlash();
-                        this.showToast('闪现标记已清除，页面即将刷新。', 'success', 2000);
-                        setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
-                    });
-                });
-            }
-
-            panel.querySelector('#btn-export').addEventListener('click', () => this.showExportPanel());
-            panel.querySelector('#btn-import').addEventListener('click', () => this.showImportPanel());
-            panel.querySelector('#btn-ag-export').addEventListener('click', () => this.showAdGuardExportPanel());
-
-            panel.querySelector('#btn-clear-all').addEventListener('click', () => {
-                this.showConfirm('清除本站规则', '警告：此操作将清空【当前域名】下的所有拦截规则和配置（不影响全局域名黑名单）。确认继续？', () => {
-                    storage.clearDomain();
-                    window.location.reload();
-                });
-            });
-
-            panel.querySelector('#btn-close-manager').addEventListener('click', () => this.clearPanel());
-            panel.querySelector('#btn-iframe-panel').addEventListener('click', () => this.showIframePanel());
+                showManager() {
+            return ManagerPanel.call(this);
         }
 
-        showExportPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-            const json = storage.exportAll();
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">📤 导出规则</h3>
-                <p>下方文本框包含全部拦截规则、全局域名黑名单、iframe 拦截规则与白名单。复制后保存到任意位置，或在新设备的脚本中通过"导入规则"粘贴即可。</p>
-                <textarea id="export-text" readonly></textarea>
-                <div class="btn-group" style="margin-top: 10px;">
-                    <button class="btn-primary" id="btn-copy">📋 复制到剪贴板</button>
-                    <button class="btn-success" id="btn-download">💾 下载为文件</button>
-                    <button class="btn-outline" id="btn-back">返回</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-
-            const ta = panel.querySelector('#export-text');
-            ta.value = json;
-
-            panel.querySelector('#btn-copy').addEventListener('click', async () => {
-                const text = ta.value;
-                try {
-                    await navigator.clipboard.writeText(text);
-                    this.showToast('已复制到剪贴板！', 'success');
-                } catch (e) {
-                    ta.select();
-                    try { document.execCommand('copy'); this.showToast('已复制到剪贴板！', 'success'); }
-                    catch (e2) { this.showToast('复制失败，请手动选中文本复制。', 'error'); }
-                }
-            });
-
-            panel.querySelector('#btn-download').addEventListener('click', () => {
-                const blob = new Blob([json], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `pro-blocker-rules-${new Date().toISOString().slice(0, 10)}.json`;
-                a.click();
-                URL.revokeObjectURL(url);
-            });
-
-            panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
+                showExportPanel() {
+            return ExportPanel.call(this);
         }
 
         generateAdGuardRules() {
-            const raw = JSON.parse(storage.exportAll() || '{}');
+            const raw = JSON.parse(this.storage.exportAll() || '{}');
             // v2.0 格式：sites 按域名分组 + domains 纯字符串数组
             // v1.0 格式：blocks/dynamicBlocks 等平铺字典 + domainBlocks {domain,_ts}[]
             const isV2 = raw.sites && typeof raw.sites === 'object';
@@ -7934,610 +8606,21 @@
             return lines.join('\n');
         }
 
-        showAdGuardExportPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            let rulesText = this.generateAdGuardRules();
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">🛡️ 导出 AdGuard 规则</h3>
-                <p class="hint-text">已将当前所有拦截规则转换为 AdGuard / uBlock Origin 兼容语法。元素隐藏规则 (## / #?#) 可导入 AdGuard 浏览器扩展或 uBlock Origin；全局域名拦截段含 DNS 兼容版 (||domain^)，可导入 AdGuard DNS / AdGuard Home。</p>
-                <textarea class="export-box" id="ag-export-box" readonly></textarea>
-                <div class="btn-group">
-                    <button class="btn-primary" id="btn-ag-copy">📋 复制全部</button>
-                    <button class="btn-success" id="btn-ag-download">💾 下载 txt</button>
-                    <button class="btn-outline" id="btn-ag-back">返回</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-
-            const box = panel.querySelector('#ag-export-box');
-            box.value = rulesText;
-
-            panel.querySelector('#btn-ag-copy').addEventListener('click', async () => {
-                try {
-                    await navigator.clipboard.writeText(rulesText);
-                    this.showToast('AdGuard 规则已复制到剪贴板！', 'success');
-                } catch (e) {
-                    box.select();
-                    try { document.execCommand('copy'); this.showToast('AdGuard 规则已复制到剪贴板！', 'success'); }
-                    catch (e2) { this.showToast('复制失败，请手动选中文本复制。', 'error'); }
-                }
-            });
-
-            panel.querySelector('#btn-ag-download').addEventListener('click', () => {
-                const blob = new Blob([rulesText], { type: 'text/plain;charset=utf-8' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `adguard-rules-${new Date().toISOString().slice(0, 10)}.txt`;
-                a.click();
-                URL.revokeObjectURL(url);
-            });
-
-            panel.querySelector('#btn-ag-back').addEventListener('click', () => this.showManager());
+                showAdGuardExportPanel() {
+            return AdGuardExportPanel.call(this);
         }
 
         /**
          * 不可见覆盖层广告扫描面板：列出所有透明/隐藏的可跳转 overlay，支持逐项拦截与批量拦截
          * 解决"触碰到就跳转但看不见"的广告问题
          */
-        showOverlayScanPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            // 双引擎采集：BlockEngine.scanInvisibleOverlays（透明跳转覆盖层）+ OverlayAdScanner（不可见/覆盖层/博彩色情图片/追踪像素）
-            // 合并策略：按元素引用合并，BlockEngine 提供触发URL/跨域/尺寸，OverlayAdScanner 提供嫌疑分/分类/特征/原因
-            // 过滤策略：已封杀域名 / 已被脚本隐藏 / 已匹配现有规则的元素不再重复展示
-            const collectAll = async (opts = {}) => {
-                const deep = !!opts.deep;
-                const blockedDomains = new Set(storage.getDomainBlocks().map(r => r.domain));
-                // 异步时间分片扫描：避免大型页面 5000+ 候选导致主线程卡顿
-                const beRecords = await BlockEngine.scanInvisibleOverlaysAsync({ autoBlock: false });
-                let oasResult = { results: [], elapsed: '0', total: 0, deepExtras: null };
-                try {
-                    // 不一致-3 修复：deep=true 调用 deepScan（肤色/伪元素/沙箱解码高阶探测），
-                    //              deep=false 调用 scan（快速基线），两者维度/耗时显著区分
-                    oasResult = deep ? OverlayAdScanner.deepScan({ deep: true }) : OverlayAdScanner.scan();
-                } catch (e) { Log.warn(e.message || e); }
-                // 以元素引用为 key 建立 OverlayAdScanner 特征索引
-                const oasMap = new Map();
-                for (const r of (oasResult.results || [])) {
-                    if (r.el) oasMap.set(r.el, r);
-                }
-
-                // 判定元素是否已被封杀（域名已在黑名单 / 元素已被脚本隐藏 / 元素匹配现有规则）
-                const isAlreadyBlocked = (rec) => {
-                    if (!rec.el) return true;
-                    // 脚本自身 UI 永远视为已处理（不展示在扫描结果中）
-                    if (ProtectedCheck.isProtected(rec.el)) return true;
-                    // 元素已从 DOM 移除（被脚本 remove() 或被父级移除）
-                    if (!document.contains(rec.el)) return true;
-                    if (rec.triggerUrl) {
-                        try {
-                            const h = new URL(rec.triggerUrl, location.href).hostname;
-                            if (blockedDomains.has(h)) return true;
-                        } catch (e) { Log.warn(e.message || e); }
-                    }
-                    // 内联隐藏（脚本封杀后打的内联样式）：扩展 visibility/opacity/pointer-events 的 important 检查
-                    if (rec.el.style) {
-                        const s = rec.el.style;
-                        if (s.display === 'none') return true;
-                        if (s.visibility === 'hidden' && s.getPropertyPriority('visibility') === 'important') return true;
-                        if (s.opacity === '0' && s.getPropertyPriority('opacity') === 'important') return true;
-                        if (s.pointerEvents === 'none' && s.getPropertyPriority('pointer-events') === 'important') return true;
-                    }
-                    // CSS 规则隐藏：OAS 独有结果未经过 BlockEngine 的 getComputedStyle 过滤
-                    // 通过计算样式检查，避免已封杀的元素再次出现在扫描列表
-                    // 新增：父级隐藏检查——自身可见但被父级 display:none / visibility:hidden 隐藏
-                    if (document.contains(rec.el)) {
-                        try {
-                            const cs = window.getComputedStyle(rec.el);
-                            if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return true;
-                            let parent = rec.el.parentElement;
-                            while (parent && parent !== document.body) {
-                                const pcs = window.getComputedStyle(parent);
-                                if (pcs.display === 'none' || pcs.visibility === 'hidden') return true;
-                                parent = parent.parentElement;
-                            }
-                        } catch (e) { Log.warn(e.message || e); }
-                    }
-                    // 检查元素是否匹配现有的静态/属性规则（确保持久化拦截的元素不再展示）
-                    if (rec.el) {
-                        try {
-                            const data = storage.getData();
-                            // 静态选择器规则
-                            for (const r of (data.static || [])) {
-                                if (r.selector && rec.el.matches && rec.el.matches(r.selector)) return true;
-                            }
-                            // 属性选择器规则
-                            for (const r of (data.attribute || [])) {
-                                if (r.attrSelector && rec.el.matches && rec.el.matches(r.attrSelector)) return true;
-                            }
-                            // 动态类名规则
-                            if (typeof rec.el.className === 'string') {
-                                for (const r of (data.dynamic || [])) {
-                                    if (r.className && rec.el.classList.contains(r.className)) return true;
-                                }
-                            }
-                        } catch (e) { Log.warn(e.message || e); }
-                    }
-                    return false;
-                };
-
-                // ① BlockEngine 记录为基线，叠加 OAS 的嫌疑分/分类/特征
-                const merged = beRecords.map(rec => {
-                    const oas = rec.el ? oasMap.get(rec.el) : null;
-                    if (!oas) return rec;
-                    return {
-                        ...rec,
-                        suspicion: oas.suspicion || 0,
-                        category: oas.category || 'unknown',
-                        oasReasons: oas.reasons || [],
-                        features: oas.features || {},
-                        selector: oas.selector || '',
-                        // 高嫌疑分也算高风险（补充 BlockEngine 仅按面积判定 highRisk 的不足）
-                        highRisk: rec.highRisk || (oas.suspicion >= 50)
-                    };
-                }).filter(r => !isAlreadyBlocked(r));
-                // ② 补充 OAS 独有结果（BlockEngine 未覆盖的不可见元素/博彩色情图片/追踪像素）
-                // 用 Set O(1) 去重替代 beRecords.find O(n)，避免 O(n×m) 嵌套查找(冗余-4)
-                const beElSet = new Set(beRecords.map(r => r.el).filter(Boolean));
-                for (const oas of (oasResult.results || [])) {
-                    if (!oas.el || beElSet.has(oas.el)) continue;
-                    const rect = oas.el.getBoundingClientRect ? oas.el.getBoundingClientRect() : { width: 0, height: 0, top: 0, left: 0 };
-                    // getComputedStyle 缓存一次，避免重复 3 次调用(冗余-3)
-                    const cs = window.getComputedStyle(oas.el);
-                    const rec = {
-                        el: oas.el,
-                        tagName: oas.el.tagName,
-                        id: oas.el.id || '',
-                        className: typeof oas.el.className === 'string' ? oas.el.className.slice(0, 80) : '',
-                        opacity: parseFloat(cs.opacity) || 1,
-                        visibility: cs.visibility,
-                        position: cs.position,
-                        rect: { w: Math.round(rect.width), h: Math.round(rect.height), top: Math.round(rect.top), left: Math.round(rect.left) },
-                        triggerUrl: oas.features?.externalLink || '',
-                        hasOnClick: !!oas.features?.clickable,
-                        hasIframeChild: !!oas.features?.hasEmbed,
-                        crossDomain: !!oas.features?.externalLink,
-                        highRisk: oas.suspicion >= 50,
-                        suspicion: oas.suspicion || 0,
-                        category: oas.category || 'unknown',
-                        oasReasons: oas.reasons || [],
-                        features: oas.features || {},
-                        selector: oas.selector || ''
-                    };
-                    if (!isAlreadyBlocked(rec)) merged.push(rec);
-                }
-                // 按嫌疑分降序，高分置顶
-                merged.sort((a, b) => (b.suspicion || 0) - (a.suspicion || 0));
-                return { records: merged, oasElapsed: oasResult.elapsed, deepExtras: oasResult.deepExtras || null };
-            };
-
-            // 异步初始加载：扫描在空闲帧分片执行，先显示加载态再渲染结果
-            let records = [];
-            let oasElapsed = '0';
-            let selectedSet = new Set();
-            let onlyHigh = false;
-            // 已拦截元素指纹集合：跨重新扫描保留 blocked 状态(BUG-D8)
-            // 用 tagName+id+className+rect 组合作为元素指纹，避免元素引用失效后状态丢失
-            let blockedFingerprints = new Set();
-            const fingerprintOf = (r) => `${r.tagName}|${r.id || ''}|${typeof r.el?.className === 'string' ? r.el.className.slice(0, 80) : ''}|${r.rect?.w || 0}x${r.rect?.h || 0}`;
-            // 扫描进行中标志：render() 据此显示加载占位，避免空 records 误导用户以为扫描无结果(BUG-S2)
-            let scanning = true;
-
-            const categoryLabel = (cat) => ({
-                'invisible': '不可见',
-                'overlay': '覆盖层',
-                'tracking': '追踪像素',
-                'vice-image': '🚫博彩色情图'
-            }[cat] || '可疑');
-            const categoryColor = (cat) => ({
-                'invisible': 'rgba(120,144,156,0.65)',
-                'overlay': 'rgba(255,59,48,0.65)',
-                'tracking': 'rgba(255,149,0,0.65)',
-                'vice-image': 'rgba(255,0,80,0.75)'
-            }[cat] || 'rgba(255,149,0,0.5)');
-            const getScoreClass = (s) => s >= 50 ? 'high' : s >= 25 ? 'mid' : 'low';
-
-            const render = () => {
-                const box = panel.querySelector('#overlay-list');
-                const stats = panel.querySelector('#overlay-stats');
-                if (!box) return;
-
-                // 扫描进行中：显示加载占位，不展示"未发现"误导用户(BUG-S2)
-                if (scanning) {
-                    box.innerHTML = '<li class="empty-tip">⏳ 正在扫描覆盖层...</li>';
-                    if (stats) stats.textContent = '正在扫描...';
-                    const btnBlock = panel.querySelector('#btn-block-overlay');
-                    if (btnBlock) btnBlock.disabled = true;
-                    return;
-                }
-
-                const filtered = onlyHigh ? records.map((r, i) => ({ r, i })).filter(({ r }) => r.highRisk) : records.map((r, i) => ({ r, i }));
-
-                if (stats) {
-                    const blockedCount = records.filter(r => r.blocked).length;
-                    const viceCount = records.filter(r => r.category === 'vice-image').length;
-                    const invisibleCount = records.filter(r => r.category === 'invisible').length;
-                    const overlayCount = records.filter(r => r.category === 'overlay').length;
-                    stats.textContent = `共 ${records.length} 项 · 🚫博彩色情 ${viceCount} · 覆盖层 ${overlayCount} · 不可见 ${invisibleCount} · 已拦截 ${blockedCount} · 选中 ${selectedSet.size}`;
-                }
-
-                if (filtered.length === 0) {
-                    box.innerHTML = '<div class="empty-tip">未发现不可见覆盖层广告。可尝试取消"只看高风险"或使用"深度扫描"。</div>';
-                    const btnBlock = panel.querySelector('#btn-block-overlay');
-                    if (btnBlock) btnBlock.disabled = true;
-                    return;
-                }
-
-                box.innerHTML = filtered.map(({ r, i }) => {
-                    const checked = selectedSet.has(i);
-                    const catLabel = categoryLabel(r.category);
-                    const catColor = categoryColor(r.category);
-                    const catBadge = `<span class="tag" style="background:${catColor};">${catLabel}</span>`;
-                    const riskBadge = r.highRisk ? '<span class="tag" style="background:rgba(255,59,48,0.7);">高风险</span>' : '';
-                    const willChangeBadge = r.hasWillChange ? '<span class="tag" style="background:rgba(255,149,0,0.6);">合成层</span>' : '';
-                    const blockedBadge = r.blocked ? '<span class="tag" style="background:rgba(52,199,89,0.6);">已拦截</span>' : '';
-                    const viceBadge = r.features?.viceTarget ? `<span class="tag" style="background:rgba(255,0,80,0.75);">🚫${escapeHTML(r.features.viceTarget)}</span>` : '';
-                    const reasons = (r.oasReasons && r.oasReasons.length) ? r.oasReasons.slice(0, 3).join(' · ') : '';
-                    // 截断 triggerUrl 时添加 title 属性展示完整 URL(BUG-L4)
-                    const triggerRaw = r.triggerUrl || (r.hasOnClick ? 'onclick' : '—');
-                    const triggerDisplay = r.triggerUrl && r.triggerUrl.length > 80
-                        ? escapeHTML(r.triggerUrl.slice(0, 80)) + '...'
-                        : escapeHTML(triggerRaw);
-                    const trigger = r.triggerUrl
-                        ? `<span title="${escapeHTML(r.triggerUrl)}">${triggerDisplay}</span>`
-                        : triggerDisplay;
-                    const selector = r.selector ? `<div class="gd-meta">选择器：${escapeHTML(r.selector)}</div>` : '';
-                    const cls = r.className ? `<div class="gd-meta">class: ${escapeHTML(r.className)}</div>` : '';
-                    const suspicion = r.suspicion || 0;
-                    return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-idx="${i}">
-                        <div class="gd-left">
-                            <div class="gd-check">${checked ? '✓' : ''}</div>
-                            <div>
-                                <div class="gd-host">${catBadge}${riskBadge}${willChangeBadge}${blockedBadge}${viceBadge} ${escapeHTML(r.tagName)} ${r.id ? '#' + escapeHTML(r.id) : ''} · ${r.rect.w}×${r.rect.h}px</div>
-                                <div class="gd-meta">${reasons ? escapeHTML(reasons) : ''}${reasons ? ' · ' : ''}触发：${trigger}${r.crossDomain ? ' · 跨域' : ''}</div>
-                                ${selector}${cls}
-                            </div>
-                        </div>
-                        <div class="gd-score ${getScoreClass(suspicion)}">${suspicion}</div>
-                    </div>`;
-                }).join('');
-
-                const btnBlock = panel.querySelector('#btn-block-overlay');
-                if (btnBlock) {
-                    btnBlock.disabled = selectedSet.size === 0;
-                    btnBlock.textContent = selectedSet.size > 0
-                        ? `🛡️ 拦截选中的 ${selectedSet.size} 个覆盖层`
-                        : '🛡️ 未选择覆盖层';
-                }
-            };
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">👁 不可见覆盖层扫描</h3>
-                <p>双引擎检测：透明跳转覆盖层 + 不可见元素 + 高z-index覆盖层 + 1×1追踪像素 + 博彩/色情可点击图片。红色🚫为博彩/色情图片，建议优先拦截。</p>
-                <div class="gd-toolbar">
-                    <label><input type="checkbox" id="ov-only-high" /> 只看高风险</label>
-                    <button class="btn-outline" id="ov-select-high">选中高风险</button>
-                    <button class="btn-outline" id="ov-select-none">清空</button>
-                </div>
-                <div class="gd-stats" id="overlay-stats"></div>
-                <div class="gd-scroll-area" id="overlay-list"></div>
-                <label style="display:flex; align-items:center; gap:6px; margin:8px 0; font-size:12px; color:#ddd; cursor:pointer;">
-                    <input type="checkbox" id="ov-block-domain" checked style="cursor:pointer;" />
-                    <span>同时封杀跳转域名（加入全局黑名单，并预览/拦截全页该域资源）</span>
-                </label>
-                <div class="btn-group">
-                    <button class="btn-danger" id="btn-block-overlay" style="flex:100%; font-weight:bold;">🛡️ 拦截选中的覆盖层</button>
-                </div>
-                <div class="section-divider"></div>
-                <div class="btn-group">
-                    <button class="btn-info" id="btn-deep-scan" title="运行双引擎联合扫描">🤖 深度扫描</button>
-                    <button class="btn-warning" id="btn-preview-overlay">🔍 预览效果</button>
-                    <button class="btn-warning" id="btn-rescan">🔄 重新扫描</button>
-                    <button class="btn-outline" id="btn-close-overlay">关闭</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-            // 先渲染加载占位(BUG-S2)，再启动异步扫描；扫描完成后用真实结果重绘
-            render();
-            // 记录最近一次深度扫描的额外发现，供 Toast 统计展示（必须先于 runScan 声明，避免 TDZ）
-            let lastDeepExtras = null;
-            // 共享扫描执行器：初始加载 / 重新扫描 / 深度扫描统一调用，避免重复代码
-            // skipInitialRender=true 时跳过内部 scanning=true+render()，供首次加载复用外部已渲染的占位(问题5)
-            // opts.deep=true 开启真·深度扫描（肤色/伪元素/沙箱解码），false 仅基线扫描（不一致-3）
-            const runScan = async (skipInitialRender = false, opts = {}) => {
-                const deep = !!opts.deep;
-                if (!skipInitialRender) {
-                    scanning = true;
-                    render();
-                }
-                try {
-                    // collectAll 内部按 deep 调用 OverlayAdScanner.deepScan/scan，此处不再冗余预调用(BUG-M6)
-                    const collected = await collectAll({ deep });
-                    records = collected.records;
-                    oasElapsed = collected.oasElapsed;
-                    lastDeepExtras = collected.deepExtras || null;
-                    // 跨扫描保留已拦截状态(BUG-D8)：用指纹匹配回填 r.blocked
-                    records.forEach(r => { if (blockedFingerprints.has(fingerprintOf(r))) r.blocked = true; });
-                    // 默认选中所有未拦截的高风险记录(BUG-3)：必须基于原始 records 索引遍历，
-                    // 旧版 filter().map((r,i)=>i) 的 i 是过滤后数组索引，导致 selectedSet 指向错误元素
-                    selectedSet = new Set();
-                    records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
-                    scanning = false;
-                    render();
-                    return true; // 扫描成功(BUG-9)：供深度扫描回调判断是否显示完成 Toast
-                } catch (e) {
-                    scanning = false;
-                    Log.error('覆盖层扫描失败:', e);
-                    this.showToast('扫描失败：' + e.message, 'error');
-                    render();
-                    return false; // 扫描失败：避免回调再显示矛盾的"深度扫描完成"Toast
-                }
-            };
-            // 首次加载：外部已渲染加载占位，跳过 runScan 内部重复渲染(问题5)；初始为基线扫描
-            runScan(true, { deep: false });
-
-            // 预览状态：实例属性，clearPanel 切换/关闭面板时兜底还原，避免预览隐藏的元素永久残留
-            // 实时联动模式：预览激活时，选择变化自动更新预览（隐藏新增选中 / 还原取消选中），无需手动重置
-            this._overlayPreview = { active: false, elements: [], hiddenDomains: new Set() };
-            // previewBtn 必须先于 resetOverlayPreview 声明，否则闭包内引用触发 TDZ ReferenceError(BUG-4)
-            const previewBtn = panel.querySelector('#btn-preview-overlay');
-            const resetOverlayPreview = () => {
-                if (!this._overlayPreview.active) return;
-                this._overlayPreview.elements.forEach(el => BlockEngine.showElement(el));
-                this._overlayPreview = { active: false, elements: [], hiddenDomains: new Set() };
-                this._hidePreviewBanner();
-                previewBtn.textContent = '🔍 预览效果';
-            };
-
-            // 实时更新预览：根据当前 selectedSet 和域名勾选状态，增量隐藏/还原元素
-            const updatePreview = () => {
-                if (!this._overlayPreview.active) return;
-                // ① 先还原所有预览元素
-                this._overlayPreview.elements.forEach(el => BlockEngine.showElement(el));
-                this._overlayPreview.elements = [];
-                this._overlayPreview.hiddenDomains = new Set();
-                const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
-                // ② 重新隐藏当前选中的覆盖层
-                Array.from(selectedSet).forEach(idx => {
-                    const r = records[idx];
-                    if (!r || !r.el || !document.contains(r.el)) return;
-                    // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）跳过
-                    if (ProtectedCheck.isProtected(r.el)) return;
-                    if (r.el.style.display !== 'none') {
-                        // 统一隐藏口径(5.2 节)
-                        BlockEngine.hideElement(r.el);
-                        this._overlayPreview.elements.push(r.el);
-                    }
-                    if (blockDomainToo && r.triggerUrl) {
-                        try {
-                            const u = new URL(r.triggerUrl, location.href);
-                            if (u.hostname !== window.location.hostname) this._overlayPreview.hiddenDomains.add(u.hostname);
-                        } catch (e) { Log.warn(e.message || e); }
-                    }
-                });
-                // ③ 勾选域名时，同步预览全页该域名资源的隐藏效果（与正式拦截同口径）
-                // 必须隐藏：元素本身 + 直接父级 + findSingleChildWrapper（Bug4 预览口径一致）
-                this._previewHideDomainResources(this._overlayPreview.hiddenDomains, this._overlayPreview.elements);
-            };
-
-            panel.querySelector('#overlay-list').addEventListener('click', (e) => {
-                const row = e.target.closest('.gd-domain-row');
-                if (!row) return;
-                const idx = parseInt(row.dataset.idx, 10);
-                if (selectedSet.has(idx)) selectedSet.delete(idx);
-                else selectedSet.add(idx);
-                // 预览激活时实时更新，无需手动重置再预览（Bug2）
-                updatePreview();
-                render();
-            });
-
-            panel.querySelector('#ov-only-high').addEventListener('change', (e) => { onlyHigh = e.target.checked; render(); });
-            panel.querySelector('#ov-select-high').addEventListener('click', () => {
-                // 与 runScan 初始化逻辑一致(问题1)：排除已拦截项，避免重复生成持久化规则
-                records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
-                updatePreview();
-                render();
-            });
-            panel.querySelector('#ov-select-none').addEventListener('click', () => {
-                selectedSet.clear();
-                updatePreview();
-                render();
-            });
-
-
-            // 预览效果：预览「隐藏选中覆盖层 + 勾选域名时全页该域资源也被隐藏」，与正式拦截效果一致
-            // 激活后选择变化自动实时更新预览（Bug1&2），再次点击关闭预览
-            previewBtn.addEventListener('click', (e) => {
-                e.stopPropagation(); // 防止事件冒泡触发其他监听器
-                if (this._overlayPreview.active) {
-                    resetOverlayPreview();
-                    return;
-                }
-                if (selectedSet.size === 0) {
-                    this.showToast('请先选择需要预览的覆盖层。', 'warning');
-                    return;
-                }
-                this._overlayPreview = { active: true, elements: [], hiddenDomains: new Set() };
-                try {
-                    updatePreview();
-                } catch (err) {
-                    Log.error('覆盖层预览失败:', err);
-                    this._overlayPreview.active = false;
-                    this.showToast('预览失败：' + err.message, 'error');
-                    return;
-                }
-                this._showPreviewBanner(() => resetOverlayPreview());
-                previewBtn.textContent = '👁 恢复显示';
-            });
-
-            // 域名勾选变化时实时更新预览
-            panel.querySelector('#ov-block-domain').addEventListener('change', () => updatePreview());
-
-            panel.querySelector('#btn-block-overlay').addEventListener('click', () => {
-                if (selectedSet.size === 0) return;
-                const blockDomainToo = panel.querySelector('#ov-block-domain').checked;
-                // 正式拦截前先还原预览，避免预览态与正式拦截叠加造成状态混乱
-                resetOverlayPreview();
-                let ruleCount = 0;
-                let skippedSelfUI = 0;
-                // 收集选中记录的去重跨域域名，循环结束后批量封杀（避免重复添加规则）
-                const domainsToBlock = new Set();
-                // 仅修改 record 属性不删除数组元素，无需降序遍历；直接 forEach
-                Array.from(selectedSet).forEach(idx => {
-                    const r = records[idx];
-                    if (!r || !r.el || !document.contains(r.el)) return;
-                    // 统一保护：脚本自身 UI 宿主（含 Shadow DOM 内部）绝不拦截，否则所有面板都会消失
-                    if (ProtectedCheck.isProtected(r.el)) {
-                        skippedSelfUI++;
-                        return;
-                    }
-                    // 统一隐藏口径：补齐 opacity:0，与 applyCSSRules/scanAndBlockDynamic 一致(BUG-D4)
-                    BlockEngine.hideElement(r.el);
-                    r.blocked = true;
-                    // 记录指纹：重新扫描后据此回填 blocked 状态(BUG-D8)
-                    blockedFingerprints.add(fingerprintOf(r));
-                    // 自动生成持久化规则：基于元素特征生成属性选择器，确保刷新后仍能拦截
-                    // 无 id/class 时回退到物理结构选择器(BUG-D5)，避免刷新后拦截失效
-                    try {
-                        const el = r.el;
-                        const tag = el.tagName.toLowerCase();
-                        let attrSelector = null;
-                        // 优先用 id 生成属性规则（唯一性最强）
-                        if (el.id) {
-                            attrSelector = `${tag}[id="${CSS.escape(el.id)}"]`;
-                        } else if (typeof el.className === 'string' && el.className.trim()) {
-                            // 用第一个有辨识度的 class 生成属性规则
-                            const classes = el.className.trim().split(/\s+/).filter(c => c.length >= 3);
-                            if (classes.length > 0) {
-                                attrSelector = `${tag}[class*="${CSS.escape(classes[0])}"]`;
-                            }
-                        }
-                        // skipApply=true：跳过 addRule 内部 applyCSSRules，循环结束后统一调用一次(冗余-2)
-                        if (attrSelector) {
-                            storage.addRule('attribute', { attrSelector, type: 'attribute' }, true);
-                            ruleCount++;
-                        } else {
-                            // 兜底：无 id/class 时用物理结构选择器(nth-of-type 路径)，刷新后仍可定位(BUG-D5)
-                            const structSelector = BlockEngine.generateStructuralSelector(el);
-                            if (structSelector) {
-                                storage.addRule('structural', { structSelector, type: 'structural' }, true);
-                                ruleCount++;
-                            }
-                        }
-                    } catch (e) { Log.warn(e.message || e); }
-                    // 仅在勾选「封杀域名」时收集跨域跳转域名（去重）
-                    if (blockDomainToo && r.triggerUrl) {
-                        try {
-                            const u = new URL(r.triggerUrl, location.href);
-                            if (u.hostname !== window.location.hostname) {
-                                domainsToBlock.add(u.hostname);
-                            }
-                        } catch (e) { Log.warn(e.message || e); }
-                    }
-                });
-                // 循环内 addRule 均用 skipApply=true 跳过，此处统一重建一次样式表(冗余-2)
-                if (ruleCount > 0) BlockEngine.applyCSSRules();
-                // 批量封杀收集到的域名：添加 domainBlock 规则（元素已单独隐藏，hideMode='none'）
-                const domainCount = domainsToBlock.size;
-                if (domainCount > 0) {
-                    DomainBlockExecutor.execute(Array.from(domainsToBlock), { hideMode: 'none' });
-                }
-                selectedSet.clear();
-                render();
-                const domainNote = blockDomainToo ? `，${domainCount} 个跨域跳转域名已加入全局黑名单` : '（未封杀域名）';
-                const ruleNote = ruleCount > 0 ? `，已生成 ${ruleCount} 条持久化规则` : '';
-                const skipNote = skippedSelfUI > 0 ? `（跳过 ${skippedSelfUI} 个脚本自身元素）` : '';
-                this.showToast(`已拦截选中的覆盖层${domainNote}${ruleNote}${skipNote}`, 'success');
-            });
-
-            // 深度扫描：真·深度覆盖层挖掘（v0.7.0 重构）
-            // 开启高开销探测：Canvas 肤色采样 / CSS 伪元素穿透 / 混淆跳转沙箱解码 / Icon Font 映射
-            // 耗时 200ms~2s，runScan 内部已通过 scanInvisibleOverlaysAsync 时间分片，避免主线程卡顿(不一致-3)
-            panel.querySelector('#btn-deep-scan').addEventListener('click', (e) => {
-                const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
-                btn.disabled = true;
-                btn.textContent = '⏳ 深度挖掘中...';
-                resetOverlayPreview();
-                // runScan 返回成功/失败标志(BUG-9)：失败时 catch 已显示"扫描失败"Toast，
-                // 此处仅成功时显示"深度扫描完成"，避免两个矛盾 Toast 同时出现
-                runScan(false, { deep: true }).then(ok => {
-                    btn.disabled = false;
-                    btn.textContent = '🤖 深度扫描';
-                    if (ok) {
-                        const ex = lastDeepExtras;
-                        const note = ex ? `（深度新增：🎨肤色图 ${ex.viceImages.length} · 🔐混淆跳转 ${ex.obfuscatedUrls.length} · ::伪元素 ${ex.pseudoInjects.length} · 🔤自定义字体 ${ex.customFontEls.length}）` : '';
-                        this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。${note}`, 'success', 6000);
-                    }
-                });
-            });
-
-            // 重新扫描：快速基线扫描（耗时 < 50ms），仅双引擎基线，不开启高开销探测(不一致-3)
-            panel.querySelector('#btn-rescan').addEventListener('click', () => {
-                resetOverlayPreview();
-                runScan(false, { deep: false });
-            });
-
-            panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
+                showOverlayScanPanel() {
+            return OverlayScanPanel.call(this);
         }
 
 
-        showImportPanel() {
-            this.clearPanel();
-            const panel = document.createElement('div');
-            panel.className = 'panel';
-
-            panel.innerHTML = `
-                <h3 title="按住可拖动窗口">📥 导入规则</h3>
-                <p>将之前导出的规则 JSON 文本粘贴到下方文本框，选择导入模式后点击"开始导入"。</p>
-                <label for="import-mode">导入模式</label>
-                <select id="import-mode">
-                    <option value="merge" selected>合并导入（推荐，自动去重）</option>
-                    <option value="replace">覆盖导入（清空现有规则后导入）</option>
-                </select>
-                <label for="import-text">规则 JSON 文本</label>
-                <textarea id="import-text" placeholder='在此粘贴导出的 JSON 文本...'></textarea>
-                <div class="btn-group" style="margin-top: 10px;">
-                    <button class="btn-primary" id="btn-do-import">开始导入</button>
-                    <button class="btn-outline" id="btn-back">返回</button>
-                </div>
-            `;
-
-            this.makeDraggable(panel);
-            this.shadowRoot.appendChild(panel);
-
-            panel.querySelector('#btn-do-import').addEventListener('click', () => {
-                const text = panel.querySelector('#import-text').value.trim();
-                if (!text) { this.showToast('请粘贴规则 JSON 文本。', 'warning'); return; }
-                const mode = panel.querySelector('#import-mode').value;
-                const doImport = () => {
-                    try {
-                        storage.importAll(text, mode === 'merge');
-                        this.showToast('导入成功！页面即将刷新以应用规则。', 'success', 2000);
-                        setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
-                    } catch (e) {
-                        this.showToast('导入失败：' + e.message, 'error');
-                    }
-                };
-                // 覆盖模式需用户确认（confirm 已从 importAll 移出）
-                if (mode === 'replace') {
-                    this.showConfirm('覆盖导入确认', '覆盖导入将清除现有所有规则，确定继续？', doImport);
-                } else {
-                    doImport();
-                }
-            });
-
-            panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
+                showImportPanel() {
+            return ImportPanel.call(this);
         }
 
         clearPanel() {
@@ -9165,7 +9248,7 @@
 
                 // 2. 应用路径模式（复用 getPathMatcher）
                 try {
-                    const pathPatterns = storage.getData().pathPattern.filter(r => !r._disabled);
+                    const pathPatterns = this.storage.getData().pathPattern.filter(r => !r._disabled);
                     if (pathPatterns.length > 0) {
                         const matcher = BlockEngine.getPathMatcher();
                         doc.querySelectorAll('a[href], img[src], script[src], link[href], iframe[src]').forEach(el => {
@@ -9542,7 +9625,7 @@
 
         _getIframeBlockRules() {
             if (this._iframeBlockRules !== null) return this._iframeBlockRules;
-            this._iframeBlockRules = storage.getIframeBlocks();
+            this._iframeBlockRules = this.storage.getIframeBlocks();
             return this._iframeBlockRules;
         },
 
@@ -9694,7 +9777,7 @@
             }
             if (selector && !rec.crossOrigin && rec.frameHost) {
                 try {
-                    storage.addRuleForDomain(rec.frameHost, 'attribute', {
+                    this.storage.addRuleForDomain(rec.frameHost, 'attribute', {
                         attrSelector: selector,
                         type: 'attribute',
                         _meta: 'iframe-scan'
@@ -9729,7 +9812,7 @@
                         el.style.removeProperty('visibility');
                     });
                     // 2. 按未禁用规则重隐藏
-                    const rules = storage.getAllSiteRules().filter(r => r.domain === host && r.type === 'attribute');
+                    const rules = this.storage.getAllSiteRules().filter(r => r.domain === host && r.type === 'attribute');
                     rules.forEach(r => {
                         try {
                             if (r.rule && r.rule.attrSelector && !r.rule._disabled) {
@@ -9843,21 +9926,24 @@
 
     // ── GM 菜单注册表（抽离为纯函数，可被 jest 直接单测，关闭 TD-08 / T5 的 0% 覆盖缺口）──
     const MENU_ITEMS = [
-        ['🖱 手动选择屏蔽元素', '选择模式', 'startSelection'],
-        ['📝 添加文本/正则/积木/属性/路径规则', '规则面板', 'showRegexPanel'],
-        ['🌐 全局检索域名', '域名检索', 'showGlobalDomainPanel'],
-        ['👁 扫描不可见覆盖层广告', '覆盖层扫描', 'showOverlayScanPanel'],
-        ['⚙️ 管理规则与防御策略', '管理面板', 'showManager'],
-        ['🖼️ iframe 防线管理', 'iframe面板', 'showIframePanel'],
-        ['📤 导出规则（跨设备迁移）', '导出面板', 'showExportPanel'],
-        ['🛡️ 导出 AdGuard 规则', 'AdGuard 导出', 'showAdGuardExportPanel'],
-        ['📥 导入规则', '导入面板', 'showImportPanel']
+        ['🖱 手动选择屏蔽元素', '选择模式', 'selection'],
+        ['📝 添加文本/正则/积木/属性/路径规则', '规则面板', 'regex'],
+        ['🌐 全局检索域名', '域名检索', 'domain'],
+        ['👁 扫描不可见覆盖层广告', '覆盖层扫描', 'overlay'],
+        ['⚙️ 管理规则与防御策略', '管理面板', 'manager'],
+        ['🖼️ iframe 防线管理', 'iframe面板', 'iframe'],
+        ['📤 导出规则（跨设备迁移）', '导出面板', 'export'],
+        ['🛡️ 导出 AdGuard 规则', 'AdGuard 导出', 'adguard'],
+        ['📥 导入规则', '导入面板', 'import']
     ];
 
-    // 纯函数：将菜单项注册到任意 register（GM_registerMenuCommand 或测试桩）；
-    // 通过 uiFactory 惰性获取 UI 实例并统一走 _safeCall 错误处理（《重构》Ch.7 消除重复模板）
+    // 纯函数：将菜单项注册到任意 register（GM_registerMenuCommand 或测试桩）。
+    // 经 PanelRegistry 将面板 key 解析为 UIManager 方法，新增面板 = 注册一行 + MENU_ITEMS 加一项，
+    // 分派逻辑零改动（《敏捷软件开发》OCP；《重构》Ch.7 消除重复模板）
     function _buildMenu(register, uiFactory) {
-        MENU_ITEMS.forEach(([label, title, method]) => {
+        MENU_ITEMS.forEach(([label, title, key]) => {
+            const method = PanelRegistry[key];
+            if (!method) { Log.error('未知面板 key: ' + key); return; }
             register(label, () => {
                 const ui = uiFactory();
                 ui._safeCall(title, () => ui[method]());
@@ -9873,11 +9959,6 @@
 
         // 网络层拦截须最先执行：在页面任何 fetch/XHR/script 加载前完成 hook，确保广告请求被源头丢弃
         NetworkInterceptor.init();
-        // 跳转拦截（window.open/location/form）：补充 NetworkInterceptor 未覆盖的导航型广告
-        try {
-            const _blockedDomains = storage.getDomainBlocks().map(r => r.domain);
-            OverlayAdScanner.enableNavigationInterceptor(_blockedDomains);
-        } catch (e) { Log.warn(e.message || e); }
         // Shadow DOM 穿透须在页面脚本调用 attachShadow 前完成代理
         BlockEngine.hookAttachShadow();
         BlockEngine.fastInject();
@@ -9891,6 +9972,12 @@
         MessageGuard.init();
         // iframe 检测与分类：订阅 FrameDetector 事件
         IframeGuard.init();
+
+        // ── L2 服务层：覆盖层扫描端口（OverlayService）注入导航拦截（原置于网络层之前，现归位到服务层，消除启动直连引擎具体实现）──
+        try {
+            const _blockedDomains = StorageService.getDomainBlocks().map(r => r.domain);
+            OverlayService.enableNavigationInterceptor(_blockedDomains);
+        } catch (e) { Log.warn(e.message || e); }
 
         // 子帧自治上报（§6.1 策略A）：子帧向父帧 postMessage 上报自身分类结果
         // 顶层窗口无需上报；延迟到 DOMContentLoaded 后计算评分（确保正文已渲染）
@@ -9934,7 +10021,11 @@
 
     // 测试可注入性：node/jest 下导出内部符号，供 UI 契约测试 require（不影响浏览器运行）
     if (typeof module !== 'undefined' && module.exports) {
-        module.exports = { MENU_ITEMS, _buildMenu };
+        module.exports = {
+            MENU_ITEMS, _buildMenu, PanelRegistry, OverlayService, StorageService,
+            SelectionPanel, RegexPanel, GlobalDomainPanel, OverlayScanPanel, ManagerPanel,
+            IframePanel, ExportPanel, AdGuardExportPanel, ImportPanel, UIManager
+        };
     }
 
 })();
