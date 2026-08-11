@@ -4099,39 +4099,6 @@
         } catch (e) { }
     }
 
-    // 跨脚本保护：监听广告拦截器 UI 的挂载，确保不被误拦截
-    // 广告拦截器可能将 video-accelerator 的 UI 误判为广告覆盖层
-    try {
-        const _observeAdBlockerUI = () => {
-            if (typeof MutationObserver === 'undefined') return;
-            const observer = new MutationObserver((mutations) => {
-                for (const m of mutations) {
-                    for (const node of m.addedNodes) {
-                        if (node.nodeType !== 1) continue;
-                        // 如果广告拦截器插入了 va-ui-host，确保它不被隐藏
-                        if (node.id === 'va-ui-host' && node.style.display === 'none') {
-                            node.style.display = '';
-                            Logger.warn('Cross-script', 'Ad blocker re-hidden va-ui-host, restored');
-                        }
-                        // 递归检查子节点
-                        if (node.querySelectorAll) {
-                            node.querySelectorAll('#va-ui-host').forEach(el => {
-                                if (el.style.display === 'none') {
-                                    el.style.display = '';
-                                }
-                            });
-                        }
-                    }
-                }
-            });
-            observer.observe(document.documentElement || document.body, {
-                childList: true,
-                subtree: true
-            });
-        };
-        _observeAdBlockerUI();
-    } catch (e) { }
-
     try {
         PW.__VA__ = Object.assign(PW.__VA__ || {}, {
             version: VERSION,
