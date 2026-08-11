@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      19.0.0
+// @version      19.0.1
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -25,7 +25,7 @@
 
     // 同源守卫：跨域 iframe 中 PW.document 与顶层 document 不同源，不可混用
     // IS_TOP 已在上方判断，顶层用 document，iframe 内用 PW.document（同源时安全）
-    const DOC = IS_TOP ? document : (function() {
+    const DOC = IS_TOP ? document : (function () {
         try { return PW.document; } catch (e) { return null; }
     })();
     // 顶层文档（跨域 iframe 中 DOC 可能是 iframe 文档，此常量始终指向顶层）
@@ -3589,31 +3589,31 @@
          * 配置映射表：单一定义，三个方法共享，消除 3× 重复（R5 认知负荷优化）
          */
         static _configMap = [
-            { id: 'va-proto',       key: 'protoHook',         type: 'chk' },
-            { id: 'va-pointer',     key: 'earlyPointer',      type: 'chk' },
-            { id: 'va-fast',        key: 'fastDetect',        type: 'chk' },
-            { id: 'va-visible',     key: 'visibleOnly',       type: 'chk' },
-            { id: 'va-userintent',  key: 'userIntentFirst',   type: 'chk' },
-            { id: 'va-standby',     key: 'standbyMode',       type: 'chk' },
-            { id: 'va-adguard',     key: 'adGuard',           type: 'chk' },
-            { id: 'va-area',        key: 'minVideoArea',      type: 'num', def: 0 },
-            { id: 'va-fetch',       key: 'fetchPriority',     type: 'chk' },
-            { id: 'va-preconnect',  key: 'preconnect',        type: 'chk' },
-            { id: 'va-instant',     key: 'instantPlay',       type: 'chk' },
-            { id: 'va-big',         key: 'bigBuffer',         type: 'chk' },
-            { id: 'va-btgt',        key: 'bufferTarget',      type: 'num', def: 60 },
-            { id: 'va-prebuf',      key: 'minPreBuffer',      type: 'num', def: 2 },
-            { id: 'va-quality',     key: 'qualityManage',     type: 'chk' },
-            { id: 'va-autodown',    key: 'autoDowngrade',     type: 'chk' },
-            { id: 'va-auto',        key: 'autoPlay',          type: 'chk' },
-            { id: 'va-seek',        key: 'seekGuard',         type: 'chk' },
-            { id: 'va-seekto',      key: 'seekTimeout',       type: 'num', def: 5000 },
-            { id: 'va-watchdog',    key: 'watchdog',          type: 'chk' },
-            { id: 'va-rvfc',        key: 'rvfcMonitor',       type: 'chk' },
-            { id: 'va-budget',      key: 'recoveryBudget',    type: 'num', def: 8 },
-            { id: 'va-toast',       key: 'showToast',         type: 'chk' },
-            { id: 'va-detect',      key: 'showDetect',        type: 'chk' },
-            { id: 'va-loglevel',    key: 'logLevel',          type: 'str' },
+            { id: 'va-proto', key: 'protoHook', type: 'chk' },
+            { id: 'va-pointer', key: 'earlyPointer', type: 'chk' },
+            { id: 'va-fast', key: 'fastDetect', type: 'chk' },
+            { id: 'va-visible', key: 'visibleOnly', type: 'chk' },
+            { id: 'va-userintent', key: 'userIntentFirst', type: 'chk' },
+            { id: 'va-standby', key: 'standbyMode', type: 'chk' },
+            { id: 'va-adguard', key: 'adGuard', type: 'chk' },
+            { id: 'va-area', key: 'minVideoArea', type: 'num', def: 0 },
+            { id: 'va-fetch', key: 'fetchPriority', type: 'chk' },
+            { id: 'va-preconnect', key: 'preconnect', type: 'chk' },
+            { id: 'va-instant', key: 'instantPlay', type: 'chk' },
+            { id: 'va-big', key: 'bigBuffer', type: 'chk' },
+            { id: 'va-btgt', key: 'bufferTarget', type: 'num', def: 60 },
+            { id: 'va-prebuf', key: 'minPreBuffer', type: 'num', def: 2 },
+            { id: 'va-quality', key: 'qualityManage', type: 'chk' },
+            { id: 'va-autodown', key: 'autoDowngrade', type: 'chk' },
+            { id: 'va-auto', key: 'autoPlay', type: 'chk' },
+            { id: 'va-seek', key: 'seekGuard', type: 'chk' },
+            { id: 'va-seekto', key: 'seekTimeout', type: 'num', def: 5000 },
+            { id: 'va-watchdog', key: 'watchdog', type: 'chk' },
+            { id: 'va-rvfc', key: 'rvfcMonitor', type: 'chk' },
+            { id: 'va-budget', key: 'recoveryBudget', type: 'num', def: 8 },
+            { id: 'va-toast', key: 'showToast', type: 'chk' },
+            { id: 'va-detect', key: 'showDetect', type: 'chk' },
+            { id: 'va-loglevel', key: 'logLevel', type: 'str' },
         ];
 
         _bindSettings() {
