@@ -52,5 +52,35 @@ describe('ProtectedCheck', () => {
             };
             expect(() => protectedCheck.isProtected(el)).not.toThrow();
         });
+
+        // 跨脚本保护测试
+        it('should return true for video-accelerator va-ui-host', () => {
+            const el = { id: 'va-ui-host' };
+            expect(protectedCheck.isProtected(el)).toBe(true);
+        });
+
+        it('should return true for element inside va-ui-host', () => {
+            const host = { id: 'va-ui-host' };
+            const child = {
+                closest: jest.fn().mockReturnValue(host)
+            };
+            expect(protectedCheck.isProtected(child)).toBe(true);
+        });
+
+        it('should return true for video-accelerator fab button', () => {
+            const el = {
+                classList: { contains: jest.fn().mockReturnValue(true) }
+            };
+            expect(protectedCheck.isProtected(el)).toBe(true);
+        });
+
+        it('should return true for va-ui-host shadow root', () => {
+            const el = {
+                getRootNode: jest.fn().mockReturnValue({
+                    host: { id: 'va-ui-host' }
+                })
+            };
+            expect(protectedCheck.isProtected(el)).toBe(true);
+        });
     });
 });

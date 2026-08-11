@@ -12,6 +12,8 @@
 // @grant        unsafeWindow
 // @run-at       document-start
 // @license      MIT
+// @downloadURL  https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
+// @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/video-accelerator.user.js
 // ==/UserScript==
 
 (function () {
