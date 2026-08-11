@@ -68,13 +68,14 @@
     const isVideoResource = function (url) { return VIDEO_RE.test(url || ''); };
 
     const isLive = function (v) {
-        try { return v && v.duration === Infinity; } catch (e) { return false; }
+        try { return !!(v && v.duration === Infinity); } catch (e) { return false; }
     };
 
     // 集中关键阈值与评分语义常量，消除散落的魔法数字，便于统一调参（可维护性优化）
     const VA_TUNING = {
         SCAN_VIDEO_CAP: 800,             // 单次扫描 video/iframe 上限
         SCAN_SHADOW_CAP: 250,            // shadowRoot 宿主遍历上限
+        SCAN_SHADOW_RESCAN_PATROLS: 5,   // 周期巡逻中每 N 次做一次 shadow 深扫（其余浅扫 video/iframe）
         PATROL_COOLDOWN_MS: 10000,       // 巡逻静默冷却（有活跃会话时跳过扫描，毫秒）
         ERROR_RECOVER_THROTTLE_MS: 2500, // 紧急恢复触发节流（毫秒）
         LARGE_AREA_PX: 200000,           // 判定「大尺寸视频」的面积阈值（px²）
@@ -402,7 +403,7 @@
                 obj = raw;
             }
 
-            this._cache = Object.assign({}, this.defaults, obj || {});
+            this._cache = this._mergeConfig(this.defaults, obj);
             this._normalize();
 
             if (migrated) {
@@ -423,7 +424,7 @@
             const mva = parseInt(c.minVideoArea, 10);
             c.minVideoArea = isNaN(mva)
                 ? VA_TUNING.MIN_VIDEO_AREA_DEFAULT
-                : Math.min(VA_TUNING.MIN_VIDEO_AREA_MAX, Math.max(0, mva));
+                : clamp(mva, 0, VA_TUNING.MIN_VIDEO_AREA_MAX);
 
             const levels = ['debug', 'info', 'warn', 'error'];
             if (levels.indexOf(c.logLevel) < 0) c.logLevel = 'info';
@@ -435,6 +436,20 @@
                 'qualityManage', 'userIntentFirst', 'standbyMode', 'adGuard', 'frameMesh'
             ];
             boolKeys.forEach(function (k) { c[k] = !!c[k]; });
+        }
+
+        // 安全合并配置：跳过 __proto__/constructor/prototype 等元键，
+        // 阻断通过导入 JSON 或跨帧配置注入的原型污染（纵深防御）。
+        // override 为 null/undefined 时仅返回 defaults 的副本。
+        _mergeConfig(base, override) {
+            const out = Object.assign({}, base);
+            if (override && typeof override === 'object' && !Array.isArray(override)) {
+                for (const k of Object.keys(override)) {
+                    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+                    out[k] = override[k];
+                }
+            }
+            return out;
         }
 
         save() {
@@ -480,7 +495,7 @@
             try {
                 const obj = JSON.parse(str);
                 if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
-                this._cache = Object.assign({}, this.defaults, obj);
+                this._cache = this._mergeConfig(this.defaults, obj);
                 this._normalize();
                 this.save();
                 this.bus.emit('CONFIG_CHANGE', { import: true, config: this.load(), local: true });
@@ -499,7 +514,7 @@
 
         applyRemote(config) {
             if (!config || typeof config !== 'object' || Array.isArray(config)) return;
-            this._cache = Object.assign({}, this.defaults, config);
+            this._cache = this._mergeConfig(this.defaults, config);
             this._normalize();
             this.bus.emit('CONFIG_CHANGE', { remote: true, config: this.load() });
         }
@@ -1162,6 +1177,7 @@
             this._observedDocs = new WeakSet();
             this._pendingNodes = new Set();
             this._scanScheduled = false;
+            this._shadowRescanCounter = 0;
             this._viewportObs = null;
             this._viewportTargets = new WeakSet();
             this._spaInstalled = false;
@@ -1377,7 +1393,7 @@
             return false;
         }
 
-        _scanWithin(root) {
+        _scanWithin(root, deep = true) {
             if (!root) return;
 
             try {
@@ -1418,24 +1434,27 @@
                 }
             } catch (e) { }
 
-            try {
-                if (root.querySelectorAll) {
-                    // 仅在「带 class/id 的元素」中查找 shadowRoot 宿主，避免对超大 DOM 做
-                    // querySelectorAll('*') 全量遍历（性能优化，主功能仍由 video/iframe 选择器保证）
-                    const all = root.querySelectorAll('[class],[id]');
-                    const limit = Math.min(all.length, VA_TUNING.SCAN_SHADOW_CAP);
+            // 仅在「带 class/id 的元素」中查找 shadowRoot 宿主，避免对超大 DOM 做
+            // querySelectorAll('*') 全量遍历（性能优化，主功能仍由 video/iframe 选择器保证）。
+            // deep=false 时跳过该全量查询（周期巡逻用），shadow 宿主发现改由加载/SPA 路由/定期深扫覆盖。
+            if (deep) {
+                try {
+                    if (root.querySelectorAll) {
+                        const all = root.querySelectorAll('[class],[id]');
+                        const limit = Math.min(all.length, VA_TUNING.SCAN_SHADOW_CAP);
 
-                    for (let i = 0; i < limit; i++) {
-                        const sr = all[i].shadowRoot;
-                        if (sr) this._scanWithin(sr);
+                        for (let i = 0; i < limit; i++) {
+                            const sr = all[i].shadowRoot;
+                            if (sr) this._scanWithin(sr);
+                        }
                     }
-                }
-            } catch (e) { }
+                } catch (e) { }
+            }
         }
 
-        refresh() {
+        refresh(deep = true) {
             try {
-                if (DOC.documentElement) this._scanWithin(DOC.documentElement);
+                if (DOC.documentElement) this._scanWithin(DOC.documentElement, deep);
             } catch (e) { }
         }
 
@@ -1453,7 +1472,12 @@
                 }
             } catch (e) { }
 
-            try { this.refresh(); } catch (e) { }
+            try {
+                // 周期巡逻默认浅扫（video/iframe）；每 SCAN_SHADOW_RESCAN_PATROLS 次做一次深扫，
+                // 以发现动态注入的 shadowRoot 宿主。深扫避免了每次巡逻都对整页 [class],[id] 做全量查询。
+                const deep = (this._shadowRescanCounter++ % VA_TUNING.SCAN_SHADOW_RESCAN_PATROLS) === 0;
+                this.refresh(deep);
+            } catch (e) { }
             this.bus.emit('PATROL', {});
         }
     }
@@ -3121,41 +3145,8 @@
        UIManager v2
     ═══════════════════════════════════════════════════════════ */
 
-    class UIManager {
-        constructor(bus) {
-            this.bus = bus;
-            this._state = {};
-            this._visible = false;
-            this._logs = [];
-            this._logFilter = 'all';
-            this._timeline = [];
-            this._lastStallMarker = 0;
-            this._lastRecoveries = 0;
-            this._lastTimelineRender = 0;
-            this._toastT = null;
-            this._depEl = null;
 
-            this._build();
-            this._mountWhenReady();
-            this._subscribe();
-        }
-
-        _build() {
-            const existing = DOC.getElementById('va-ui-host');
-            if (existing) existing.remove();
-
-            this.host = DOC.createElement('div');
-            this.host.id = 'va-ui-host';
-            this.host.style.cssText = 'position:fixed;z-index:2147483646;top:0;left:0;width:0;height:0;overflow:visible;';
-
-            this.root = this.host.attachShadow({ mode: 'closed' });
-
-            // 跨脚本保护：监听广告拦截器 UI 的 DOM 节点（pro-blocker-ui-host）
-            // 防止广告拦截器将视频加速 UI 误判为广告覆盖层
-            this._observeAdBlockerUI();
-
-            const style = DOC.createElement('style');
-            style.textContent = `
+    const VA_UI_CSS = `
                 :host{
                     --va-bg:rgba(12,12,18,.94);
                     --va-card:rgba(255,255,255,.05);
@@ -3337,7 +3328,43 @@
                     background:rgba(255,159,10,.08);border:1px solid rgba(255,159,10,.25);
                     border-radius:8px;padding:6px 8px;margin:6px 0;
                 }
-            `;
+    `;
+
+    class UIManager {
+        constructor(bus) {
+            this.bus = bus;
+            this._state = {};
+            this._visible = false;
+            this._logs = [];
+            this._logFilter = 'all';
+            this._timeline = [];
+            this._lastStallMarker = 0;
+            this._lastRecoveries = 0;
+            this._lastTimelineRender = 0;
+            this._toastT = null;
+            this._depEl = null;
+
+            this._build();
+            this._mountWhenReady();
+            this._subscribe();
+        }
+
+        _build() {
+            const existing = DOC.getElementById('va-ui-host');
+            if (existing) existing.remove();
+
+            this.host = DOC.createElement('div');
+            this.host.id = 'va-ui-host';
+            this.host.style.cssText = 'position:fixed;z-index:2147483646;top:0;left:0;width:0;height:0;overflow:visible;';
+
+            this.root = this.host.attachShadow({ mode: 'closed' });
+
+            // 跨脚本保护：监听广告拦截器 UI 的 DOM 节点（pro-blocker-ui-host）
+            // 防止广告拦截器将视频加速 UI 误判为广告覆盖层
+            this._observeAdBlockerUI();
+
+            const style = DOC.createElement('style');
+            style.textContent = VA_UI_CSS;
             this.root.appendChild(style);
 
             this._toast = DOC.createElement('div');
@@ -3387,7 +3414,7 @@
                                 <span>网络类型: <b id="va-net">-</b></span>
                             </div>
                             <div class="row">
-                                <span>画质: <b id="va-quality">-</b></span>
+                                <span>画质: <b id="va-quality-status">-</b></span>
                                 <span>带宽: <b id="va-bw">-</b></span>
                                 <span>分辨率: <b id="va-res">-</b></span>
                             </div>
@@ -3695,7 +3722,7 @@
 
                 const handler = function () {
                     let value;
-                    if (cfg.type === 'num') value = parseInt(el.value, 10) || cfg.def;
+                    if (cfg.type === 'num') { const n = parseInt(el.value, 10); value = isNaN(n) ? cfg.def : n; }
                     else if (cfg.type === 'str') value = el.value;
                     else value = el.checked;
                     bus.emit('CONFIG_SET', { key: cfg.key, value: value });
@@ -3721,7 +3748,7 @@
                 const el = panel.querySelector('#' + cfg.id);
                 if (!el) return;
                 let value;
-                if (cfg.type === 'num') value = parseInt(el.value, 10) || cfg.def;
+                if (cfg.type === 'num') { const n = parseInt(el.value, 10); value = isNaN(n) ? cfg.def : n; }
                 else if (cfg.type === 'str') value = el.value;
                 else value = el.checked;
                 patch[cfg.key] = value;
@@ -4054,7 +4081,7 @@
                 qText = q.height + 'p';
             }
 
-            set('va-quality', qText);
+            set('va-quality-status', qText);
 
             const canQ = s.canChangeQuality === true;
             const upBtn = this._panel.querySelector('#va-up');

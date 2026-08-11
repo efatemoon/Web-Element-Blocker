@@ -382,7 +382,7 @@
         _markDirty(key, value) {
             this._pendingWrites[key] = value;
             if (this._saveTimer) clearTimeout(this._saveTimer);
-            this._saveTimer = setTimeout(() => this._flush(), 300);
+            this._saveTimer = setTimeout(() => this._flush(), TIMING.TOAST_DISMISS_MS);
         }
 
         // 立即落盘所有待写数据
@@ -868,9 +868,7 @@
                 } else {
                     this._markDirty('iframeBlocks', incoming.map(r => ({ ...r, _ts: Date.now() })));
                 }
-                if (typeof IframeGuard !== 'undefined' && IframeGuard._iframeBlockRules !== null) {
-                    IframeGuard._iframeBlockRules = null;
-                }
+                if (typeof IframeGuard !== 'undefined') IframeGuard.invalidateBlockRules();
             } else if (!merge) {
                 this._markDirty('iframeBlocks', []);
             }
@@ -932,7 +930,7 @@
             list.push({ matchType: rule.matchType, value: rule.value, _ts: Date.now() });
             this._markDirty('iframeBlocks', list);
             if (!skipApply) {
-                IframeGuard._iframeBlockRules = null; // 清缓存
+                IframeGuard.invalidateBlockRules(); // 清缓存
                 EventBus.emit('rule:changed', { type: 'iframeBlock' });
             }
             return true;
@@ -942,7 +940,7 @@
             if (index < 0 || index >= list.length) return false;
             list.splice(index, 1);
             this._markDirty('iframeBlocks', list);
-            IframeGuard._iframeBlockRules = null;
+            IframeGuard.invalidateBlockRules();
             EventBus.emit('rule:changed', { type: 'iframeBlock' });
             return true;
         }
@@ -951,7 +949,7 @@
             if (index < 0 || index >= list.length) return false;
             list[index]._disabled = !list[index]._disabled;
             this._markDirty('iframeBlocks', list);
-            IframeGuard._iframeBlockRules = null;
+            IframeGuard.invalidateBlockRules();
             EventBus.emit('rule:changed', { type: 'iframeBlock' });
             return list[index]._disabled;
         }
@@ -1024,9 +1022,13 @@
 
     }
 
-    const storage = new StorageManager();
+    // 真实浏览器才实例化 StorageManager（其构造器依赖 window/document）；node/jest 下置 null，
+    // 使产物可被 require 做 UI 契约测试（Feathers《Working Effectively with Legacy Code》§3 接缝）
+    const storage = (typeof document !== 'undefined' && typeof window !== 'undefined' && typeof window.HTMLElement !== 'undefined') ? new StorageManager() : null;
 
     // 门面模式：RuleStore 和 ConfigStore 委托到 storage 实例
+    // node/jest 下 storage 为 null，跳过门面装配（产物仍可 require 做 UI 契约测试）
+    if (storage) {
     ['getDomainBlocks', 'addRule', 'removeRule', 'toggleDisabled', 'getData',
         'getIframeBlocks', 'addIframeRule', 'removeIframeRule', 'toggleIframeRuleDisabled',
         'exportAll', 'importAll', 'invalidateDataCache', 'getDomainSet',
@@ -1041,6 +1043,7 @@
         if (typeof storage[m] === 'function') ConfigStore[m] = (...args) => storage[m](...args);
         else ConfigStore[m] = storage[m];
     });
+    }
 
     /**
      * 路径规则倒排索引：提取每条 pattern 最长 ≥4 字符 token 建 Map<token, Set<pattern>>，
@@ -3791,6 +3794,16 @@
     })();
 
     // ═══════════════════════════════════════════════════════════
+    // ── 全局时序常量（消除魔法数字，TD-02 / TD-04 其余批次）──
+    const TIMING = {
+        RELOAD_DELAY_MS: 1500,      // 规则变更/导入后页面重载延迟
+        REPORT_DELAY_MS: 100,       // 子帧分类上报延迟
+        TOAST_DISMISS_MS: 300,      // Toast 自动消失延迟
+        OBSERVER_TIMEOUT_MS: 30000, // 帧观察器自动断开超时（防 GC 泄漏）
+        DEEP_SCAN_DELAY_MS: 50,     // 深扫防抖
+        MICRO_DELAY_MS: 10          // 微任务延迟
+    };
+
     // OverlayDetector：统一覆盖层检测引擎
     // 职责：不可见覆盖层扫描 + 肤色检测 + 追踪像素检测
     // 合并自：OverlayAdScanner + BlockEngine.scanInvisibleOverlays
@@ -4975,7 +4988,7 @@
             if (!toast || !toast.isConnected) return;
             toast.classList.remove('pro-toast-show');
             toast.classList.add('pro-toast-hide');
-            setTimeout(() => toast.remove(), 300);
+            setTimeout(() => toast.remove(), TIMING.TOAST_DISMISS_MS);
         }
 
         // 内嵌确认弹窗：替代 confirm()，onConfirm 为确认回调
@@ -5157,11 +5170,14 @@
         // 面板入口错误边界：包裹面板渲染逻辑，异常时显示错误面板而非崩溃
         // title 用于错误面板标题，retry 为重试回调（通常重新调用该面板入口）
         _safeCall(title, fn, retry) {
+            // 重试回退与入口函数保持一致（FIX-GM-2 / 整洁架构 Ch.4 失败语义分级）：
+            // 调用方通常省略 retry，则点击"重试"重新执行同一面板入口；显式传入则使用指定回退。
+            const onRetry = (typeof retry === 'function') ? retry : fn;
             try {
                 fn();
             } catch (e) {
                 Log.error(title + '失败:', e);
-                this._showErrorPanel(title + '失败', e && e.message ? e.message : String(e), retry);
+                this._showErrorPanel(title + '失败', e && e.message ? e.message : String(e), onRetry);
             }
         }
 
@@ -5255,43 +5271,30 @@
             this._keydownHandler = (e) => {
                 if (e.key === 'Escape') this.stopSelection();
             };
-            document.addEventListener('keydown', this._keydownHandler);
+            this._trackDoc('keydown', this._keydownHandler);
             // 拦截事件必须尽可能早地阻止广告跳转：
             // ① pointerdown：在 mousedown/touchstart 之前触发，是最早可拦截的人机交互事件
             // ② document 级 capture：确保在所有目标阶段处理之前拦截（无论 body 是否被广告脚本清空）
             // ③ 同时拦截 mouseover/click/touch*/auxclick：覆盖鼠标 + 触屏 + pointer + 中键四种交互模型
-            const registerOnDoc = (doc) => {
-                doc.addEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
-                doc.addEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
-                doc.addEventListener('mouseover', this._handleMouseOver, { capture: true });
-                doc.addEventListener('click', this._handleClick, { capture: true, passive: false });
-                doc.addEventListener('contextmenu', this._contextmenuHandler, { capture: true });
-                doc.addEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
-                doc.addEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
-                doc.addEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
+            const registerOnDoc = () => {
+                this._trackDoc('pointerdown', this._handlePointerDown, { capture: true, passive: false });
+                this._trackDoc('mousedown', this._handleMouseDown, { capture: true, passive: false });
+                this._trackDoc('mouseover', this._handleMouseOver, { capture: true });
+                this._trackDoc('click', this._handleClick, { capture: true, passive: false });
+                this._trackDoc('contextmenu', this._contextmenuHandler, { capture: true });
+                this._trackDoc('touchstart', this._handleTouchStart, { capture: true, passive: false });
+                this._trackDoc('touchmove', this._handleTouchMove, { capture: true, passive: false });
+                this._trackDoc('touchend', this._handleTouchEnd, { capture: true, passive: false });
                 // 拦截 auxclick（中键点击打开新标签、右键点击）：防止绕过 click 拦截触发跳转
-                doc.addEventListener('auxclick', this._handleAuxClick, { capture: true });
+                this._trackDoc('auxclick', this._handleAuxClick, { capture: true });
             };
-            registerOnDoc(document);
+            registerOnDoc();
         }
 
         stopSelection() {
-            if (this._keydownHandler) {
-                document.removeEventListener('keydown', this._keydownHandler);
-                this._keydownHandler = null;
-            }
-            document.removeEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
-            document.removeEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
-            document.removeEventListener('mouseover', this._handleMouseOver, { capture: true });
-            document.removeEventListener('click', this._handleClick, { capture: true, passive: false });
-            if (this._contextmenuHandler) {
-                document.removeEventListener('contextmenu', this._contextmenuHandler, { capture: true });
-                this._contextmenuHandler = null;
-            }
-            if (this._handleTouchStart) document.removeEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
-            if (this._handleTouchMove) document.removeEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
-            if (this._handleTouchEnd) document.removeEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
-            if (this._handleAuxClick) document.removeEventListener('auxclick', this._handleAuxClick, { capture: true });
+            this._untrackDocAll();
+            this._keydownHandler = null;
+            this._contextmenuHandler = null;
             if (this.highlightEl) {
                 this.highlightEl.classList.remove('pro-blocker-highlight');
                 this.highlightEl = null;
@@ -5301,6 +5304,22 @@
             this._unfreezeNavigation();
             // 清除 iframe 上下文
             this._selectionIframeContext = null;
+        }
+
+        // ── 集中式文档监听器追踪（TD-GM-08）──
+        // 选择模式在 document 上批量注册拦截监听；退出时统一注销，避免残留监听导致
+        // 面板内点击被拦截或内存泄漏。引用 Feathers《Working Effectively with Legacy Code》§3 接缝；
+        // Fowler《重构》§12.2 消除重复
+        _trackDoc(type, handler, opts) {
+            document.addEventListener(type, handler, opts);
+            (this._docListeners || (this._docListeners = [])).push({ type, handler, opts });
+        }
+        _untrackDocAll() {
+            if (!this._docListeners) return;
+            this._docListeners.forEach(({ type, handler, opts }) => {
+                try { document.removeEventListener(type, handler, opts); } catch (e) { Log.warn(e.message || e); }
+            });
+            this._docListeners = [];
         }
 
         // 选择模式导航冻结：劫持所有可能触发跳转的 API，确保用户点击广告元素时页面不跳走
@@ -6153,7 +6172,7 @@
                 if (typeof requestIdleCallback === 'function') {
                     requestIdleCallback(() => runDeep(), { timeout: 500 });
                 } else {
-                    setTimeout(runDeep, 50);
+                    setTimeout(runDeep, TIMING.DEEP_SCAN_DELAY_MS);
                 }
             });
 
@@ -6503,7 +6522,7 @@
                     if (!/^[a-z0-9.\-]+$/.test(domain)) { this.showToast('校验失败：域名格式无效（仅允许字母、数字、点和横线）。', 'error'); return; }
                     const added = storage.addIframeRule({ matchType: 'srcDomain', value: domain });
                     if (!added) { this.showToast('该域名已存在 iframeBlock 规则，已跳过重复添加。', 'info'); return; }
-                    IframeGuard._iframeBlockRules = null;
+                    IframeGuard.invalidateBlockRules();
                     EventBus.emit('rule:changed', { type: 'iframeBlock' });
                     this.showToast(`已添加 iframe 拦截规则：${domain}`, 'success');
                     this.clearPanel();
@@ -6579,19 +6598,6 @@
                         storage.addRule('regex', { regex: text, level: level, type: 'regex' });
                     }
                     BlockEngine.applyRegexRules();
-                }
-
-                if (mode === 'iframeBlock') {
-                    const domain = panel.querySelector('#iframe-domain-input').value.trim().toLowerCase();
-                    if (!domain) { this.showToast('校验失败：请输入要拦截的 iframe 域名。', 'warning'); return; }
-                    if (!/^[a-z0-9.\-]+$/.test(domain)) { this.showToast('校验失败：域名格式无效（仅允许字母、数字、点和横线）。', 'error'); return; }
-                    const added = storage.addIframeRule({ matchType: 'srcDomain', value: domain });
-                    if (!added) { this.showToast('该域名已存在 iframeBlock 规则，已跳过重复添加。', 'info'); return; }
-                    IframeGuard._iframeBlockRules = null;
-                    EventBus.emit('rule:changed', { type: 'iframeBlock' });
-                    this.showToast(`已添加 iframe 拦截规则：${domain}`, 'success');
-                    this.clearPanel();
-                    return;
                 }
 
                 this.clearPanel();
@@ -6826,7 +6832,7 @@
                 }
 
                 // 异步深扫，避免同步阻塞 UI
-                await new Promise(r => setTimeout(r, 10));
+                await new Promise(r => setTimeout(r, TIMING.MICRO_DELAY_MS));
 
                 // 缓存命中：5s 内复用结果，避免每次打开面板都全量深扫
                 const now = Date.now();
@@ -7094,7 +7100,7 @@
             });
             panel.querySelector('#iframe-max-depth').addEventListener('change', (e) => {
                 const d = parseInt(e.target.value, 10);
-                if (d >= 1 && d <= 5) {
+                if (d >= IframeGuard.MIN_DEPTH && d <= IframeGuard.MAX_DEPTH) {
                     IframeGuard.setMaxDepth(d);
                     IframeDeepScanner.maxDepth = d;
                     this.showToast(`扫描深度已设为 ${d} 层`, 'success');
@@ -7631,7 +7637,7 @@
             panel.querySelector('#btn-toggle-mode').addEventListener('click', () => {
                 const newMode = storage.toggleMode();
                 this.showToast(`策略已调整为：${newMode === 'preemptive' ? '极速预判模式' : '智能自动模式'}，页面即将刷新。`, 'info', 2000);
-                setTimeout(() => window.location.reload(), 1500);
+                setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
             });
 
             const resetBtn = panel.querySelector('#btn-reset-flash');
@@ -7640,7 +7646,7 @@
                     this.showConfirm('清除闪现标记', '确认清除本站的闪现标记？清除后将恢复"智能自动"模式（除非你手动开启极速预判）。', () => {
                         storage.resetFlash();
                         this.showToast('闪现标记已清除，页面即将刷新。', 'success', 2000);
-                        setTimeout(() => window.location.reload(), 1500);
+                        setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
                     });
                 });
             }
@@ -8518,7 +8524,7 @@
                     try {
                         storage.importAll(text, mode === 'merge');
                         this.showToast('导入成功！页面即将刷新以应用规则。', 'success', 2000);
-                        setTimeout(() => window.location.reload(), 1500);
+                        setTimeout(() => window.location.reload(), TIMING.RELOAD_DELAY_MS);
                     } catch (e) {
                         this.showToast('导入失败：' + e.message, 'error');
                     }
@@ -8615,8 +8621,18 @@
     const FrameDetector = {
         _observer: null,
         _interactionTime: 0,
+        _init: false,
+
+        // PENDING-GM-01 配套：单层 iframe 枚举，DOM 查询下沉（DIP）
+        // 供 IframeGuard._liveFrames 复用，避免 IframeGuard 直接触碰 document
+        queryIframes(root) {
+            try { return Array.from(root.querySelectorAll('iframe')); }
+            catch (e) { Log.warn(e.message || e); return []; }
+        },
 
         init() {
+            if (this._init) return;
+            this._init = true;
             this._hookCreateElement();
             this._startObserver();
             this._trackInteractions();
@@ -8657,7 +8673,7 @@
                 });
                 obs.observe(iframe, { attributes: true, attributeFilter: ['src', 'srcdoc'] });
                 // 超时兜底——iframe 创建后 30s 未设 src 则断开 observer，防止 GC 泄漏
-                cleanupTimer = setTimeout(() => { try { obs.disconnect(); } catch (e) { Log.warn(e.message || e); } }, 30000);
+                cleanupTimer = setTimeout(() => { try { obs.disconnect(); } catch (e) { Log.warn(e.message || e); } }, TIMING.OBSERVER_TIMEOUT_MS);
             } catch (e) { Log.warn(e.message || e); }
         },
 
@@ -9291,6 +9307,8 @@
         _processedIframes: new WeakSet(),
         _stats: { blocked: 0, protected: 0, scanned: 0, cleaned: 0 },
         _maxDepth: 3,
+        MIN_DEPTH: 1,
+        MAX_DEPTH: 5,
         _init: false,
         _iframeBlockRules: null, // iframeBlock 规则缓存
         // B1 修复：帧记录单一数据源——冻结几何测量，防止「测量-动作耦合」导致分数不一致+振荡
@@ -9351,10 +9369,11 @@
         // 枚举当前文档树中所有存活 iframe（含同源嵌套帧，深度受 _maxDepth 约束）
         // WeakMap 不可枚举，故以 DOM 为唯一真实来源反查记录：既不持有强引用（无泄漏），
         // 又天然跳过已脱离文档的废弃帧
+        // PENDING-03：DOM 查询下沉 FrameDetector，IframeGuard 不再直接触碰 document（DIP）
         _liveFrames(root = document, depth = 0, out = []) {
             if (depth > this._maxDepth) return out;
             try {
-                root.querySelectorAll('iframe').forEach(f => {
+                FrameDetector.queryIframes(root).forEach(f => {
                     out.push(f);
                     try {
                         const doc = f.contentDocument;
@@ -9384,12 +9403,12 @@
         _loadConfig() {
             const config = GM_getValue('iframeConfig', {});
             const depth = parseInt(config.maxDepth, 10);
-            this._maxDepth = (depth >= 1 && depth <= 5) ? depth : 3;
+            this._maxDepth = (depth >= this.MIN_DEPTH && depth <= this.MAX_DEPTH) ? depth : 3;
         },
 
         setMaxDepth(depth) {
             const d = parseInt(depth, 10);
-            if (d >= 1 && d <= 5) {
+            if (d >= this.MIN_DEPTH && d <= this.MAX_DEPTH) {
                 this._maxDepth = d;
                 const config = GM_getValue('iframeConfig', {});
                 config.maxDepth = d;
@@ -9400,6 +9419,11 @@
         // 首次全量扫描（委托给 FrameDetector）
         scanAll() {
             FrameDetector.scanAll();
+        },
+
+        // PENDING-GM-01：暴露公开方法，消除外部模块对私有 _iframeBlockRules 的直写（R3-1 / DIP）
+        invalidateBlockRules() {
+            this._iframeBlockRules = null;
         },
 
         // 规则变更后重新评估所有 iframe（包括已处理的）：清除 WeakSet 后全量重扫
@@ -9817,7 +9841,35 @@
         }
     };
 
+    // ── GM 菜单注册表（抽离为纯函数，可被 jest 直接单测，关闭 TD-08 / T5 的 0% 覆盖缺口）──
+    const MENU_ITEMS = [
+        ['🖱 手动选择屏蔽元素', '选择模式', 'startSelection'],
+        ['📝 添加文本/正则/积木/属性/路径规则', '规则面板', 'showRegexPanel'],
+        ['🌐 全局检索域名', '域名检索', 'showGlobalDomainPanel'],
+        ['👁 扫描不可见覆盖层广告', '覆盖层扫描', 'showOverlayScanPanel'],
+        ['⚙️ 管理规则与防御策略', '管理面板', 'showManager'],
+        ['🖼️ iframe 防线管理', 'iframe面板', 'showIframePanel'],
+        ['📤 导出规则（跨设备迁移）', '导出面板', 'showExportPanel'],
+        ['🛡️ 导出 AdGuard 规则', 'AdGuard 导出', 'showAdGuardExportPanel'],
+        ['📥 导入规则', '导入面板', 'showImportPanel']
+    ];
+
+    // 纯函数：将菜单项注册到任意 register（GM_registerMenuCommand 或测试桩）；
+    // 通过 uiFactory 惰性获取 UI 实例并统一走 _safeCall 错误处理（《重构》Ch.7 消除重复模板）
+    function _buildMenu(register, uiFactory) {
+        MENU_ITEMS.forEach(([label, title, method]) => {
+            register(label, () => {
+                const ui = uiFactory();
+                ui._safeCall(title, () => ui[method]());
+            });
+        });
+    }
+
     // ================= 初始化与执行流 =================
+    // 真实浏览器才执行初始化：node/jest 环境（window.HTMLElement 未定义）跳过本块，
+    // 使产物可被 require 做 UI 契约测试，且完全不改变浏览器运行行为（Feathers《Working
+    // Effectively with Legacy Code》§3 接缝；Fowler《重构》§12.2 提取可测函数）
+    if (typeof document !== 'undefined' && typeof window !== 'undefined' && typeof window.HTMLElement !== 'undefined') {
 
     // 网络层拦截须最先执行：在页面任何 fetch/XHR/script 加载前完成 hook，确保广告请求被源头丢弃
     NetworkInterceptor.init();
@@ -9861,9 +9913,9 @@
             } catch (e) { Log.warn(e.message || e); }
         };
         if (document.readyState === 'complete' || document.readyState === 'interactive') {
-            setTimeout(_reportSelf, 100);
+            setTimeout(_reportSelf, TIMING.REPORT_DELAY_MS);
         } else {
-            document.addEventListener('DOMContentLoaded', () => setTimeout(_reportSelf, 100));
+            document.addEventListener('DOMContentLoaded', () => setTimeout(_reportSelf, TIMING.REPORT_DELAY_MS));
         }
     }
 
@@ -9874,22 +9926,15 @@
             return uiInstance;
         }
 
-        // GM 菜单注册辅助函数：消除 9 处重复模板（《重构》Ch.7 Duplicate Code）
-        function _registerMenu(label, title, method) {
-            GM_registerMenuCommand(label, () => {
-                const ui = getUI();
-                ui._safeCall(title, () => ui[method](), () => ui[method]());
-            });
-        }
-        _registerMenu('🖱 手动选择屏蔽元素', '选择模式', 'startSelection');
-        _registerMenu('📝 添加文本/正则/积木/属性/路径规则', '规则面板', 'showRegexPanel');
-        _registerMenu('🌐 全局检索域名', '域名检索', 'showGlobalDomainPanel');
-        _registerMenu('👁 扫描不可见覆盖层广告', '覆盖层扫描', 'showOverlayScanPanel');
-        _registerMenu('⚙️ 管理规则与防御策略', '管理面板', 'showManager');
-        _registerMenu('🖼️ iframe 防线管理', 'iframe面板', 'showIframePanel');
-        _registerMenu('📤 导出规则（跨设备迁移）', '导出面板', 'showExportPanel');
-        _registerMenu('🛡️ 导出 AdGuard 规则', 'AdGuard 导出', 'showAdGuardExportPanel');
-        _registerMenu('📥 导入规则', '导入面板', 'showImportPanel');
+        // GM 菜单注册：复用 _buildMenu 纯函数，消除 9 处重复模板
+        _buildMenu(GM_registerMenuCommand, getUI);
+    }
+
+    } // end: 真实浏览器初始化守卫
+
+    // 测试可注入性：node/jest 下导出内部符号，供 UI 契约测试 require（不影响浏览器运行）
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = { MENU_ITEMS, _buildMenu };
     }
 
 })();
