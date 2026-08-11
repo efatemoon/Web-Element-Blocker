@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      19.0.2
+// @version      19.0.3
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -19,7 +19,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '19.0.1';
+    const VERSION = '19.0.3';
     const PW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
     let IS_TOP = true;
@@ -47,6 +47,16 @@
 
     const IFRAME_ID = 'if_' + Math.random().toString(36).slice(2, 11);
     const HOOKED_DOCS = new Set([DOC]);
+
+    // postMessage 目标源：接收侧已强制同源校验，发送侧也收紧到本源，
+    // 避免把本地配置广播给任意跨域 iframe（安全加固 W5）。
+    // 不透明源（sandbox / file://）下 origin 为 'null'，无法作为目标源，退回 '*'
+    const MSG_TARGET = (function () {
+        try {
+            const o = PW.location && PW.location.origin;
+            return (o && o !== 'null') ? o : '*';
+        } catch (e) { return '*'; }
+    })();
 
     /* ═══════════════════════════════════════════════════════════
        基础工具
@@ -76,6 +86,7 @@
         PRIMARY_MATCH_BONUS: 30,         // 命中站点主选择器加分
         IGNORE_MATCH_PENALTY: 80,        // 命中站点忽略选择器惩罚
         AD_LIKE_SHORT_PENALTY: 18,       // 疑似广告短视频（短+静音+循环）惩罚
+        TAKEOVER_SCORE: 70,              // 触发接管的评分阈值（须 > STANDBY_SCORE）
         ARBITER_COOLDOWN_MS: 2000,       // 接管决策冷却（防止同一视频频繁接管，毫秒）
         // 以下缓冲/保活阈值，单独放在 VA_BUFFER 子对象，避免 VA_TUNING 过长
     };
@@ -91,7 +102,6 @@
         BACK_BUFFER_MAX_S: 120,          // 后向缓冲上限（秒），超出则裁剪
         BACK_BUFFER_TRIM_S: 30,          // 后向缓冲裁剪目标（秒）
         TIMELINE_RENDER_THROTTLE_MS: 1000, // 时间线渲染节流（毫秒）
-        QUALITY_CHANGE_COOLDOWN_MS: 2000, // 画质切换冷却（毫秒）
         STALL_LOG_THROTTLE_MS: 2000,     // 停滞日志节流（毫秒）
         LOG_LINE_LIMIT: 200,             // 日志行最大数量
         USER_GESTURE_WINDOW_MS: 3000,    // 用户手势有效窗口（毫秒）
@@ -515,7 +525,7 @@
     const ConfigManager = new ConfigManagerClass(Bus);
 
     /* ═══════════════════════════════════════════════════════════
-       Logger / Metrics
+       Logger
     ═══════════════════════════════════════════════════════════ */
 
     const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -548,15 +558,6 @@
     }
 
     const Logger = new LoggerClass(Bus);
-
-    const Metrics = {
-        counters: Object.create(null),
-        inc(name, value) {
-            value = value || 1;
-            this.counters[name] = (this.counters[name] || 0) + value;
-            Bus.emit('METRIC_EMIT', { type: 'counter', name: name, value: value });
-        }
-    };
 
     /* ═══════════════════════════════════════════════════════════
        GlobalScheduler / ListenerBag / UserGesture
@@ -780,7 +781,7 @@
                         type: type,
                         frameId: IFRAME_ID,
                         ts: NOW()
-                    }, payload || {}), '*');
+                    }, payload || {}), MSG_TARGET);
                 } catch (e) { }
             }
         }
@@ -800,7 +801,7 @@
                         const iframes = doc.querySelectorAll('iframe');
                         iframes.forEach(function (iframe) {
                             try {
-                                if (iframe.contentWindow) iframe.contentWindow.postMessage(msg, '*');
+                                if (iframe.contentWindow) iframe.contentWindow.postMessage(msg, MSG_TARGET);
                             } catch (e) { }
                         });
                     } catch (e) { }
@@ -862,7 +863,7 @@
                             ver: 19,
                             type: 'VA_CFG_SYNC',
                             config: ConfigManager.load()
-                        }, '*');
+                        }, MSG_TARGET);
                     } catch (e) { }
                 } else if (d.type === 'VA_HELLO_ACK') {
                     this.frames.set(d.frameId, { lastSeen: NOW() });
@@ -1831,7 +1832,7 @@
                         return;
                     }
 
-                    if (candidate.score >= 70) {
+                    if (candidate.score >= VA_TUNING.TAKEOVER_SCORE) {
                         if (candidate.cooldownUntil > now) return;
                         if (candidate.video.__vaSession) return;
 
@@ -2049,17 +2050,6 @@
             }
         }
 
-        canAutoPlay() {
-            return ConfigManager.get('autoPlay') &&
-                !this._userPaused &&
-                !this.video.ended &&
-                (
-                    UserGesture.recent(5000) ||
-                    this.video.muted ||
-                    this._playedOnce
-                );
-        }
-
         tryPlayByUser() {
             this._programmaticPause = false;
             tryPlay(this.video);
@@ -2247,8 +2237,9 @@
 
                 try {
                     if (!v.paused && !v.ended) {
+                        // 只记录「最近出帧时间」；_lastTime 由 _stallCheck 独占维护，
+                        // 此处若一并写入会让卡顿比较器读到自己刚写的值（C2 单一归属）
                         this._lastFrameTs = NOW();
-                        this._lastTime = v.currentTime;
                         this._rvfcId = v.requestVideoFrameCallback(step);
                     } else {
                         this._rvfcRunning = false;
@@ -2381,7 +2372,9 @@
                         this._lowCount = 0;
                     }
                 }
-            } else if (ahead < VA_BUFFER.BUFFER_LEVEL_RECOVER && ahead >= VA_BUFFER.BUFFER_LEVEL_WARNING && !v.paused && !this.isSeeking) {
+                // 警告区间应为「低于警告水位」（1~5s），原写法是 5~8s，
+                // 反而把 1~5s 这段更危险的缓冲落进 else 分支，完全不做预加载增强（W3）
+            } else if (ahead < VA_BUFFER.BUFFER_LEVEL_WARNING && !v.paused && !this.isSeeking) {
                 Bus.emit('BUFFER_LOW', { session: this, level: 1, ahead: ahead });
 
                 if (now - this._lastBoost > VA_BUFFER.BOOST_THROTTLE_MS) {
@@ -2425,11 +2418,15 @@
             const now = NOW();
             const t = v.currentTime;
 
+            // frameRecent = 最近仍在出帧 → 说明画面还在推进，不是真卡死，用于「抑制误报」。
+            // 原实现把它当作卡顿的「前置条件」，导致：真卡死时 RVFC 会停止回调，
+            // frameRecent 变 false，反而永远进不了检测分支；关闭 RVFC 或浏览器不支持
+            // （如 Firefox）时 frameRecent 恒为 false，看门狗整体失效（C2）
             const frameRecent = ConfigManager.get('rvfcMonitor') &&
                 this._lastFrameTs &&
                 (now - this._lastFrameTs < VA_BUFFER.FRAME_RECENT_WINDOW_MS);
 
-            if (t === this._lastTime && frameRecent) {
+            if (t === this._lastTime && !frameRecent) {
                 if (!this._stallStart) this._stallStart = NOW();
 
                 const stalled = NOW() - this._stallStart;
@@ -2995,7 +2992,7 @@
             return b;
         }
 
-        _canAttempt(session, level) {
+        _canAttempt(session) {
             if (!session || session._dead) return false;
             if (!ConfigManager.get('watchdog')) return false;
             if (session._userPaused) return false;
@@ -3044,7 +3041,7 @@
             const session = payload.session;
 
             if (payload.level === 1) {
-                if (NOW() - session._lastBoost > 8000) {
+                if (NOW() - session._lastBoost > VA_BUFFER.BOOST_THROTTLE_MS) {
                     session._lastBoost = NOW();
                     session._boostLoad();
                 }
@@ -3052,7 +3049,7 @@
             }
 
             if (payload.level === 2) {
-                if (!this._canAttempt(session, 1)) {
+                if (!this._canAttempt(session)) {
                     this.bus.emit('RECOVERY_BLOCKED', { sessionId: session.id, level: 1 });
                     return;
                 }
@@ -3075,7 +3072,7 @@
             const session = payload.session;
             const level = payload.level;
 
-            if (!this._canAttempt(session, level)) {
+            if (!this._canAttempt(session)) {
                 this.bus.emit('RECOVERY_BLOCKED', { sessionId: session.id, level: level });
                 return;
             }
@@ -3547,6 +3544,7 @@
             try {
                 const observer = new MutationObserver((mutations) => {
                     for (const m of mutations) {
+                        // 新增节点场景：拦截器把 UI 包装进隐藏容器
                         for (const node of m.addedNodes) {
                             if (node.nodeType !== 1) continue;
                             if (node.id === 'va-ui-host' && node.style.display === 'none') {
@@ -3561,11 +3559,21 @@
                                 });
                             }
                         }
+                        // 属性变更场景：拦截器直接在已挂载的 host 上设 style="display:none"（W9）
+                        if (m.type === 'attributes' && m.target && m.target.nodeType === 1 && m.target.id === 'va-ui-host') {
+                            const el = m.target;
+                            if (el.style && el.style.display === 'none') {
+                                el.style.display = '';
+                                Logger.warn('Cross-script', 'Ad blocker set va-ui-host display:none, restored');
+                            }
+                        }
                     }
                 });
                 observer.observe(document.documentElement || document.body, {
                     childList: true,
-                    subtree: true
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['style', 'class']
                 });
             } catch (e) { }
         }
@@ -3677,10 +3685,11 @@
                     bus.emit('CONFIG_SET', { key: cfg.key, value: value });
                 };
 
-                const isNum = cfg.type === 'num';
-                // checkbox 用 change 而非 input：input 在 checked 更新前触发，读到旧值写入 storage（C2）
-                if (isNum || cfg.type === 'str') el.addEventListener('input', handler);
-                else el.addEventListener('change', handler);
+                // 统一用 change：
+                // - checkbox：input 在 checked 更新前触发，会读到旧值写入 storage
+                // - number：input 每敲一个字符就写入，_normalize 立刻 clamp 并回填输入框，
+                //   导致「输入 5000 时打到 5 就被改成 2000」，用户无法正常键入（W4）
+                el.addEventListener('change', handler);
             });
         }
 
@@ -3723,12 +3732,12 @@
         }
 
         _updateDependency() {
+            // 缓存查找结果；注意必须回读到局部变量，
+            // 否则首次调用时局部 el 仍为 null，后面 el.style 会抛 TypeError（C1）
+            if (!this._depEl) this._depEl = this._panel.querySelector('#va-dep-down');
+
             const el = this._depEl;
-            if (!el) {
-                const found = this._panel.querySelector('#va-dep-down');
-                if (found) this._depEl = found;
-                else return;
-            }
+            if (!el) return;
 
             const show = ConfigManager.get('autoDowngrade') && !ConfigManager.get('qualityManage');
             el.style.display = show ? 'block' : 'none';
