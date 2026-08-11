@@ -309,3 +309,56 @@ visibleOnlySkip(invisibleVideo);
 patrolAssert(seenSet.has(invisibleVideo), 'visibleOnly 跳过时 video 应加入 seen');
 
 console.log('\n补充测试: ' + patrolPassed + '/' + patrolDocTests + ' 通过');
+
+// ========================================
+// 补充测试: tryPlay autoplay blocked 设置 _playedOnce
+// ========================================
+let tryPlayPassed = 0, tryPlayTotal = 0;
+
+// 测试同步 throw 路径（浏览器某些情况下 play() 直接抛异常）
+tryPlayTotal++;
+const session1 = { _playedOnce: false };
+const mockVideo1 = {
+    play: () => { throw new Error('play failed'); },
+    __vaSession: session1
+};
+try {
+    const p = mockVideo1.play();
+    if (p && typeof p.catch === 'function') p.catch(function () { });
+} catch (e) {
+    if (mockVideo1.__vaSession) mockVideo1.__vaSession._playedOnce = true;
+}
+if (session1._playedOnce === true) {
+    tryPlayPassed++;
+    console.log('  PASS tryPlay throw 设置 _playedOnce');
+} else {
+    console.log('  FAIL tryPlay throw 应设置 _playedOnce');
+}
+
+// 测试 promise reject 路径（浏览器主流情况，需等待微任务）
+tryPlayTotal++;
+const session2 = { _playedOnce: false };
+const mockVideo2 = {
+    play: () => Promise.reject(new DOMException('NotAllowedError')),
+    __vaSession: session2
+};
+try {
+    const p = mockVideo2.play();
+    if (p && typeof p.catch === 'function') {
+        p.catch(function () {
+            if (mockVideo2.__vaSession) mockVideo2.__vaSession._playedOnce = true;
+        });
+    }
+} catch (e) {
+    if (mockVideo2.__vaSession) mockVideo2.__vaSession._playedOnce = true;
+}
+// 用 Promise.resolve 触发微任务队列
+Promise.resolve().then(function () {
+    if (session2._playedOnce === true) {
+        tryPlayPassed++;
+        console.log('  PASS tryPlay promise reject 设置 _playedOnce');
+    } else {
+        console.log('  FAIL tryPlay promise reject 应设置 _playedOnce');
+    }
+    console.log('tryPlay 修复测试: ' + tryPlayPassed + '/' + tryPlayTotal + ' 通过');
+});

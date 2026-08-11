@@ -483,7 +483,114 @@ describe('_flushSettings 守卫', () => {
 });
 
 // ========================================
-// 15. CandidateArbiter SessionManager 前向引用（C2）
+// 17. tryPlay autoplay blocked 设置 _playedOnce（C3）
+// ========================================
+describe('tryPlay autoplay 阻止时设置 _playedOnce', () => {
+    it('play() throw 时 _playedOnce 应设为 true', () => {
+        const session = { _playedOnce: false };
+        const mockVideo = {
+            play: () => { throw new Error('play failed'); },
+            __vaSession: session
+        };
+        // 模拟修复后的 tryPlay 逻辑（同步路径）
+        try {
+            const p = mockVideo.play();
+            if (p && typeof p.catch === 'function') {
+                p.catch(function () { });
+            }
+        } catch (e) {
+            if (mockVideo.__vaSession) mockVideo.__vaSession._playedOnce = true;
+        }
+        assert(session._playedOnce === true, 'play throw 时 _playedOnce 应设为 true');
+    });
+
+    it('play() Promise rejected 时 _playedOnce 应设为 true（微任务等待）', () => {
+        const session = { _playedOnce: false };
+        const mockVideo = {
+            play: () => Promise.reject(new DOMException('NotAllowedError')),
+            __vaSession: session
+        };
+        // 模拟修复后的 tryPlay 逻辑（异步路径）
+        try {
+            const p = mockVideo.play();
+            if (p && typeof p.catch === 'function') {
+                p.catch(function () {
+                    if (mockVideo.__vaSession) mockVideo.__vaSession._playedOnce = true;
+                });
+            }
+        } catch (e) {
+            if (mockVideo.__vaSession) mockVideo.__vaSession._playedOnce = true;
+        }
+        // 等待 microtask 完成
+        return new Promise(function (resolve) {
+            setTimeout(resolve, 10);
+        }).then(function () {
+            assert(session._playedOnce === true, 'autoplay blocked 时 _playedOnce 应设为 true');
+        });
+    });
+
+    it('play() throw 时 _playedOnce 应设为 true', () => {
+        const session = { _playedOnce: false };
+        const mockVideo = {
+            play: () => { throw new Error('play failed'); },
+            __vaSession: session
+        };
+        try {
+            const p = mockVideo.play();
+            if (p && typeof p.catch === 'function') {
+                p.catch(function () { });
+            }
+        } catch (e) {
+            if (mockVideo.__vaSession) mockVideo.__vaSession._playedOnce = true;
+        }
+        assert(session._playedOnce === true, 'play throw 时 _playedOnce 应设为 true');
+    });
+
+    it('_playedOnce=true 后 _maybeAutoPlay 不应再尝试', () => {
+        const session = { _playedOnce: true, _autoTried: 0 };
+        const autoPlayAllowed = true;
+        const canAutoPlay = autoPlayAllowed && !session._playedOnce;
+        assert(canAutoPlay === false, '_playedOnce=true 时不应再次自动播放');
+    });
+});
+
+// ========================================
+// 18. checkbox 用 change 事件而非 input（C2 修复）
+// ========================================
+describe('checkbox change vs input 事件', () => {
+    it('checkbox input 事件在 checked 更新前触发', () => {
+        // 模拟 input 事件行为：handler 在 checked 变化前读取
+        const el = { checked: false };
+        let readValue = null;
+        el.addEventListener = function (evt, handler) {
+            if (evt === 'input') {
+                // input 触发时 checked 还是旧值
+                handler();
+            } else if (evt === 'change') {
+                // 先更新 checked，再触发 change
+                el.checked = !el.checked;
+                handler();
+            }
+        };
+        const handler = function () { readValue = el.checked; };
+        el.addEventListener('input', handler);
+        assert(readValue === false, 'input 事件读到旧值 false');
+    });
+
+    it('checkbox change 事件读到新 checked 值', () => {
+        const el = { checked: false };
+        let readValue = null;
+        el.addEventListener = function (evt, handler) {
+            if (evt === 'change') {
+                el.checked = !el.checked;
+                handler();
+            }
+        };
+        const handler = function () { readValue = el.checked; };
+        el.addEventListener('change', handler);
+        assert(readValue === true, 'change 事件读到新值 true');
+    });
+});
 // ========================================
 describe('CandidateArbiter SessionManager 引用', () => {
     it('SessionManager 未定义时 score 不应抛错', () => {

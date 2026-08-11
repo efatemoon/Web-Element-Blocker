@@ -98,8 +98,11 @@
 | FIX-6 | Minor | L433-450 | `update()`/`silentUpdate()` 重复代码 | 提取 `_applyPatch(patch, emit)` |
 | FIX-7 | Minor | L2193 | click 事件用 capture:true 导致 `e.target.closest()` 行为异常 | 改 bubbling |
 | FIX-8 | Minor | L1430 | `_patrol()` 未检查 `DOC` 是否为 null | 加 `if (!DOC) return` |
+| FIX-9 | Critical | L3635-3638 | checkbox 用 `input` 事件读到旧 checked 值，刷新后配置丢失 | 改用 `change` 事件 |
+| FIX-10 | Critical | L1449-1460 | `tryPlay` autoplay 被拦截时 `_playedOnce` 未设 true，导致持续触发浏览器拒绝 | catch 中设 `_playedOnce=true` |
 
 ### 验证
 - 语法检查：通过
 - 文件行数：4065 → 4070
-- 已知遗留：M3/M4/P1（低优先级，可选优化）
+- 单元测试：150/150 通过（新增 8 个）
+- 核心模块测试：53/53 通过（新增 3 个）

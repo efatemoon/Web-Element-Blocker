@@ -168,9 +168,16 @@
             if (!v || typeof v.play !== 'function') return;
             const p = v.play();
             if (p && typeof p.catch === 'function') {
-                p.catch(function (e) { Logger.debug('Session', 'autoplay blocked', e && e.name); });
+                p.catch(function (e) {
+                    Logger.debug('Session', 'autoplay blocked', e && e.name);
+                    // 浏览器阻止自动播放时，标记已尝试，避免下次 canplay 再次尝试触发浏览器策略拒绝
+                    if (v.__vaSession) v.__vaSession._playedOnce = true;
+                });
             }
-        } catch (e) { Logger.debug('Session', 'play threw', e && e.message); }
+        } catch (e) {
+            Logger.debug('Session', 'play threw', e && e.message);
+            if (v.__vaSession) v.__vaSession._playedOnce = true;
+        }
     };
 
     function videoFromEvent(e) {
@@ -3159,10 +3166,9 @@
 
                 .fab{
                     position:fixed;bottom:18px;right:18px;width:42px;height:42px;border-radius:50%;
-                    color:#fff;display:flex;align-items:center;justify-content:center;
+                    z-index:2147483646;user-select:none;background:rgba(120,120,120,.5);
+                    box-shadow:0 0 0 3px rgba(120,120,120,.35);color:#fff;display:flex;align-items:center;justify-content:center;
                     font-size:18px;cursor:pointer;opacity:.72;transition:opacity .15s,transform .15s;
-                    z-index:9;user-select:none;background:rgba(120,120,120,.5);
-                    box-shadow:0 0 0 3px rgba(120,120,120,.35);
                 }
                 .fab:hover{opacity:1;transform:scale(1.06)}
                 .fab[data-state=active]{background:rgba(10,132,255,.78);box-shadow:0 0 0 3px rgba(48,209,88,.55)}
@@ -3174,6 +3180,7 @@
 
                 .panel{
                     position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+                    z-index:2147483646;
                     background:var(--va-bg);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
                     border:1px solid var(--va-border);border-radius:var(--va-radius);
                     box-shadow:0 20px 60px rgba(0,0,0,.5);
@@ -3269,7 +3276,7 @@
                 .toast{
                     position:fixed;top:18px;right:18px;padding:9px 14px;border-radius:12px;
                     background:rgba(28,28,35,.95);border:1px solid var(--va-border);color:#fff;font-size:13px;
-                    transform:translateX(120%);transition:transform .25s,opacity .25s;opacity:0;pointer-events:none;z-index:10;
+                    transform:translateX(120%);transition:transform .25s,opacity .25s;opacity:0;pointer-events:none;z-index:2147483646;
                 }
                 .toast.show{transform:translateX(0);opacity:1}
                 .toast.ok{border-left:3px solid var(--va-success)}
@@ -3633,8 +3640,9 @@
                 };
 
                 const isNum = cfg.type === 'num';
-                if (isNum) el.addEventListener('change', handler);
-                else el.addEventListener('input', handler);
+                // checkbox 用 change 而非 input：input 在 checked 更新前触发，读到旧值写入 storage（C2）
+                if (isNum || cfg.type === 'str') el.addEventListener('input', handler);
+                else el.addEventListener('change', handler);
             });
         }
 
