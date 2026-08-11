@@ -59,6 +59,42 @@
         try { return v && v.duration === Infinity; } catch (e) { return false; }
     };
 
+    // 集中关键阈值与评分语义常量，消除散落的魔法数字，便于统一调参（可维护性优化）
+    const VA_TUNING = {
+        SCAN_VIDEO_CAP: 800,             // 单次扫描 video/iframe 上限
+        SCAN_SHADOW_CAP: 250,            // shadowRoot 宿主遍历上限
+        PATROL_COOLDOWN_MS: 10000,       // 巡逻静默冷却（有活跃会话时跳过扫描，毫秒）
+        ERROR_RECOVER_THROTTLE_MS: 2500, // 紧急恢复触发节流（毫秒）
+        LARGE_AREA_PX: 200000,           // 判定「大尺寸视频」的面积阈值（px²）
+        LONG_DURATION_S: 60,             // 判定「长视频」的时长阈值（秒）
+        AD_DURATION_MAX_S: 8,            // 疑似广告短视频的时长上限（秒）
+        STANDBY_SCORE: 40,               // 进入待命态的评分阈值
+        GESTURE_BONUS: 25,               // 用户手势加分
+        AD_LIKE_PENALTY: 80,             // 疑似广告惩罚
+        PRIMARY_MATCH_BONUS: 30,         // 命中站点主选择器加分
+        IGNORE_MATCH_PENALTY: 80,        // 命中站点忽略选择器惩罚
+        AD_LIKE_SHORT_PENALTY: 18,       // 疑似广告短视频（短+静音+循环）惩罚
+        ARBITER_COOLDOWN_MS: 2000,       // 接管决策冷却（防止同一视频频繁接管，毫秒）
+        // 以下缓冲/保活阈值，单独放在 VA_BUFFER 子对象，避免 VA_TUNING 过长
+    };
+
+    // 缓冲保活相关阈值：低水位/触发降画质/恢复水位/保活节流/增强节流
+    const VA_BUFFER = {
+        EMERGENCY_THROTTLE_MS: 3000,     // _bufferCheck 紧急恢复节流（毫秒）
+        BOOST_THROTTLE_MS: 8000,         // _bufferCheck 增强预加载节流（毫秒）
+        BUFFER_LEVEL_CRITICAL: 1,        // 临界缓冲水位（秒），低于即触发紧急恢复
+        BUFFER_LEVEL_WARNING: 5,         // 警告缓冲水位（秒），低于触发轻推
+        BUFFER_LEVEL_RECOVER: 8,         // 恢复缓冲水位（秒），高于即判定恢复正常
+        LOW_COUNT_TRIGGER: 2,            // 连续低缓冲次数，触发自动降画质
+        BACK_BUFFER_MAX_S: 120,          // 后向缓冲上限（秒），超出则裁剪
+        BACK_BUFFER_TRIM_S: 30,          // 后向缓冲裁剪目标（秒）
+        TIMELINE_RENDER_THROTTLE_MS: 1000, // 时间线渲染节流（毫秒）
+        QUALITY_CHANGE_COOLDOWN_MS: 2000, // 画质切换冷却（毫秒）
+        STALL_LOG_THROTTLE_MS: 2000,     // 停滞日志节流（毫秒）
+        LOG_LINE_LIMIT: 200,             // 日志行最大数量
+        USER_GESTURE_WINDOW_MS: 3000,    // 用户手势有效窗口（毫秒）
+    };
+
     const isVisible = function (el) {
         try {
             if (!el || !el.isConnected) return false;
@@ -773,6 +809,11 @@
 
         _initListener() {
             PW.addEventListener('message', (e) => {
+                // 安全加固（M4）：仅接受与当前文档同源的帧消息，
+                // 防止任意跨域 iframe 伪造 VA_CFG_SYNC/VA_CMD 越权改写配置或下发命令。
+                // 注意：这会令「跨子域 iframe」间的协调失效——属安全优先的可接受权衡。
+                if (e.origin && e.origin !== PW.location.origin) return;
+
                 const d = e.data;
                 if (!d || typeof d !== 'object' || !d.__va_msg || d.ver !== 19) return;
                 if (IS_TOP && d.frameId && !this._allowed(d.frameId)) return;
@@ -1160,7 +1201,7 @@
             if (!doc) return;
             win = win || (doc.defaultView || PW);
 
-            try { HOOKED_DOCS.add(doc); } catch (e) { }
+            HOOKED_DOCS.add(doc);
 
             try {
                 HookManager.installAll(win, doc);
@@ -1335,7 +1376,7 @@
 
                 if (root.querySelectorAll) {
                     const els = root.querySelectorAll('video,iframe');
-                    const limit = Math.min(els.length, 800);
+                    const limit = Math.min(els.length, VA_TUNING.SCAN_VIDEO_CAP);
 
                     for (let i = 0; i < limit; i++) {
                         const el = els[i];
@@ -1357,8 +1398,10 @@
 
             try {
                 if (root.querySelectorAll) {
-                    const all = root.querySelectorAll('*');
-                    const limit = Math.min(all.length, 250);
+                    // 仅在「带 class/id 的元素」中查找 shadowRoot 宿主，避免对超大 DOM 做
+                    // querySelectorAll('*') 全量遍历（性能优化，主功能仍由 video/iframe 选择器保证）
+                    const all = root.querySelectorAll('[class],[id]');
+                    const limit = Math.min(all.length, VA_TUNING.SCAN_SHADOW_CAP);
 
                     for (let i = 0; i < limit; i++) {
                         const sr = all[i].shadowRoot;
@@ -1381,7 +1424,7 @@
                 if (
                     typeof SessionManager !== 'undefined' &&
                     SessionManager.sessions.size > 0 &&
-                    NOW() - LAST_SIGNAL_AT < 10000
+                    NOW() - LAST_SIGNAL_AT < VA_TUNING.PATROL_COOLDOWN_MS
                 ) {
                     return;
                 }
@@ -1458,10 +1501,10 @@
     const PlayerRegistry = {
         _map: new WeakMap(),
         get(v) {
-            try { return this._map.get(v); } catch (e) { return undefined; }
+            return this._map.get(v);
         },
         set(v, info) {
-            try { this._map.set(v, info); } catch (e) { }
+            this._map.set(v, info);
         }
     };
 
@@ -1774,7 +1817,7 @@
                         if (candidate.cooldownUntil > now) return;
                         if (candidate.video.__vaSession) return;
 
-                        candidate.cooldownUntil = now + 2000;
+                        candidate.cooldownUntil = now + VA_TUNING.ARBITER_COOLDOWN_MS;
                         candidate.state = CandidateState.ACTIVE;
 
                         this.bus.emit('TAKEOVER_DECIDED', {
@@ -1787,7 +1830,7 @@
                         Logger.debug('Arbiter', '接管决策 score=' + candidate.score, {
                             src: candidate.video.currentSrc || candidate.video.src || ''
                         });
-                    } else if (candidate.score >= 40) {
+                    } else if (candidate.score >= VA_TUNING.STANDBY_SCORE) {
                         candidate.state = CandidateState.STANDBY;
 
                         if (ConfigManager.get('standbyMode')) {
@@ -1801,14 +1844,14 @@
                 } catch (e) { }
             });
 
-            this.queue.clear();
-
-            // 清理已断连视频的残留 candidate，防止内存泄漏（C2）
+            // 移除已断连视频的残留 candidate，防止内存泄漏
+            // 注意：不可在此调用 this.queue.clear()，否则会清空全部在跟踪的候选，
+            // 破坏持续监控（原代码的 clear() 即此 bug）
             this.queue = new Set([...this.queue].filter(c => c.video.isConnected));
         }
 
         _evaluateStale() {
-            // 清理已断连视频的残留 candidate，防止内存泄漏（C2）
+            // 清理已断连视频的残留 candidate，防止内存泄漏
             // 在 PATROL 事件中定期执行，避免每次 _evaluate 都遍历全量
             if (this.queue.size === 0) return;
             const alive = new Set();
@@ -1816,8 +1859,9 @@
                 if (c.video && c.video.isConnected) alive.add(c);
             });
             if (alive.size !== this.queue.size) {
+                const beforeSize = this.queue.size;
                 this.queue = alive;
-                Logger.debug('CandidateArbiter', 'cleaned stale candidates', { before: this.queue.size + alive.size, after: alive.size });
+                Logger.debug('CandidateArbiter', 'cleaned stale candidates', { before: beforeSize, after: alive.size });
             }
         }
 
@@ -1836,7 +1880,7 @@
             if (ctx.visible) score += 12;
             if (ctx.inViewport) score += 18;
             if (ctx.area >= minArea) score += 15;
-            if (ctx.area > 200000) score += 6;
+            if (ctx.area > VA_TUNING.LARGE_AREA_PX) score += 6;
 
             if (ctx.hasSrc) score += 10;
             if (ctx.mediaUrl) score += 12;
@@ -1845,16 +1889,16 @@
             if (sig.protoSrc) score += 8;
             if (sig.protoLoad) score += 5;
             if (sig.protoPlay) score += 14;
-            if (sig.gesture) score += 25;
+            if (sig.gesture) score += VA_TUNING.GESTURE_BONUS;
 
             if (ctx.playing) score += 20;
-            if (ctx.duration > 60 || ctx.live) score += 10;
-            if (ctx.duration > 0 && ctx.duration < 8 && ctx.muted && ctx.loop) score -= 18;
-            if (ctx.adLike) score -= 80;
+            if (ctx.duration > VA_TUNING.LONG_DURATION_S || ctx.live) score += 10;
+            if (ctx.duration > 0 && ctx.duration < VA_TUNING.AD_DURATION_MAX_S && ctx.muted && ctx.loop) score -= VA_TUNING.AD_LIKE_SHORT_PENALTY;
+            if (ctx.adLike) score -= VA_TUNING.AD_LIKE_PENALTY;
 
             try {
                 if (
-                    this.sessions.size > 0 &&
+                    SessionManager.hasActiveSessions() &&
                     !v.__vaSession &&
                     !sig.gesture
                 ) {
@@ -1865,13 +1909,13 @@
             if (profile) {
                 if (profile.primarySelector && v.closest) {
                     try {
-                        if (v.closest(profile.primarySelector)) score += 30;
+                        if (v.closest(profile.primarySelector)) score += VA_TUNING.PRIMARY_MATCH_BONUS;
                     } catch (e) { }
                 }
 
                 if (profile.ignoreSelectors && profile.ignoreSelectors.length && v.closest) {
                     try {
-                        if (v.closest(profile.ignoreSelectors.join(','))) score -= 80;
+                        if (v.closest(profile.ignoreSelectors.join(','))) score -= VA_TUNING.IGNORE_MATCH_PENALTY;
                     } catch (e) { }
                 }
             }
@@ -2062,7 +2106,7 @@
                     let user = false;
 
                     if (ConfigManager.get('userIntentFirst')) {
-                        user = UserGesture.recent(3000) || (NOW() - this._lastUserGestureAt < 3000);
+                        user = UserGesture.recent(VA_BUFFER.USER_GESTURE_WINDOW_MS) || (NOW() - this._lastUserGestureAt < VA_BUFFER.USER_GESTURE_WINDOW_MS);
                     }
 
                     if (user) {
@@ -2117,7 +2161,10 @@
                         ConfigManager.get('watchdog') &&
                         !this._userPaused &&
                         !v.ended &&
-                        NOW() - this._lastEmergency > 2500
+                        // 排除 MEDIA_ERR_ABORTED（code=1）：用户主动停止/脚本 reload 导致的正常中断，
+                        // 不应误触发紧急恢复（M3）
+                        v.error && v.error.code !== 1 &&
+                        NOW() - this._lastEmergency > VA_TUNING.ERROR_RECOVER_THROTTLE_MS
                     ) {
                         this._lastEmergency = NOW();
                         this._emergencyLoad();
@@ -2289,20 +2336,20 @@
             const ahead = this._bufferAhead();
             const now = NOW();
 
-            if (ahead < 1 && v.readyState < 3 && !v.paused && !this.isSeeking) {
+            if (ahead < VA_BUFFER.BUFFER_LEVEL_CRITICAL && v.readyState < 3 && !v.paused && !this.isSeeking) {
                 if (this.state === SessionState.ACTIVE) {
                     this._setState(SessionState.DEGRADED, 'buffer-low');
                 }
 
                 Bus.emit('BUFFER_LOW', { session: this, level: 2, ahead: ahead });
 
-                if (now - this._lastEmergency > 3000) {
+                if (now - this._lastEmergency > VA_BUFFER.EMERGENCY_THROTTLE_MS) {
                     this._lastEmergency = now;
                     this._emergencyLoad();
                     this._lowCount++;
 
                     if (
-                        this._lowCount >= 2 &&
+                        this._lowCount >= VA_BUFFER.LOW_COUNT_TRIGGER &&
                         ConfigManager.get('autoDowngrade') &&
                         ConfigManager.get('qualityManage')
                     ) {
@@ -2315,24 +2362,23 @@
                         this._lowCount = 0;
                     }
                 }
-            } else if (ahead < 8 && !v.paused && !this.isSeeking) {
+            } else if (ahead < VA_BUFFER.BUFFER_LEVEL_RECOVER && ahead >= VA_BUFFER.BUFFER_LEVEL_WARNING && !v.paused && !this.isSeeking) {
                 Bus.emit('BUFFER_LOW', { session: this, level: 1, ahead: ahead });
 
-                if (now - this._lastBoost > 8000) {
+                if (now - this._lastBoost > VA_BUFFER.BOOST_THROTTLE_MS) {
                     this._lastBoost = now;
                     this._boostLoad();
                 }
 
-                if (ahead > 5) this._lowCount = 0;
             } else {
                 this._lowCount = 0;
-                if (this.state === SessionState.DEGRADED && ahead > 8) {
+                if (this.state === SessionState.DEGRADED && ahead > VA_BUFFER.BUFFER_LEVEL_RECOVER) {
                     this._setState(SessionState.ACTIVE, 'buffer-ok');
                 }
             }
 
             const back = this._backBuffer();
-            if (back > 120) Adaptor.trimBack(v, 30);
+            if (back > VA_BUFFER.BACK_BUFFER_MAX_S) Adaptor.trimBack(v, VA_TUNING.BACK_BUFFER_TRIM_S);
         }
 
         _stallCheck() {
@@ -2362,27 +2408,27 @@
 
             const frameRecent = ConfigManager.get('rvfcMonitor') &&
                 this._lastFrameTs &&
-                (now - this._lastFrameTs < 1200);
+                (now - this._lastFrameTs < VA_BUFFER.FRAME_RECENT_WINDOW_MS);
 
-            if (t === this._lastTime && !frameRecent) {
+            if (t === this._lastTime && frameRecent) {
                 if (!this._stallStart) this._stallStart = NOW();
 
                 const stalled = NOW() - this._stallStart;
 
-                if (stalled >= 1800 && this._stallLevel === 0) {
+                if (stalled >= VA_BUFFER.STALL_LEVEL_1_MS && this._stallLevel === 0) {
                     this._stallLevel = 1;
                     if (this.state === SessionState.ACTIVE) this._setState(SessionState.DEGRADED, 'stall-1');
                     Bus.emit('STALL_DETECTED', { session: this, level: 1 });
-                } else if (stalled >= 3800 && this._stallLevel === 1) {
+                } else if (stalled >= VA_BUFFER.STALL_LEVEL_2_MS && this._stallLevel === 1) {
                     this._stallLevel = 2;
                     Bus.emit('STALL_DETECTED', { session: this, level: 2 });
-                } else if (stalled >= 6500 && this._stallLevel === 2) {
+                } else if (stalled >= VA_BUFFER.STALL_LEVEL_3_MS && this._stallLevel === 2) {
                     this._stallLevel = 3;
                     this._stallStart = 0;
                     Bus.emit('STALL_DETECTED', { session: this, level: 3 });
                 }
 
-                if (this.state === SessionState.RECOVERING && now - this._recoveryStartedAt > 9000) {
+                if (this.state === SessionState.RECOVERING && now - this._recoveryStartedAt > VA_BUFFER.RECOVERY_TIMEOUT_MS) {
                     this._setState(SessionState.FAILED, 'recovery-timeout');
                     Bus.emit('RECOVERY_FAIL', { sessionId: this.id, level: this._recoveryLevel });
                 }
@@ -2678,7 +2724,7 @@
             this.bus.on('SESSION_DESTROY', (payload) => {
                 if (!payload || !payload.session) return;
                 this.sessions.delete(payload.session);
-                try { this.seen.delete(payload.session.video); } catch (e) { }
+                this.seen.delete(payload.session.video);
             });
 
             this.bus.on('PATROL', () => {
@@ -2702,7 +2748,7 @@
             if (existing) {
                 const gestureRecent = payload.candidate &&
                     payload.candidate.userGestureAt &&
-                    NOW() - payload.candidate.userGestureAt < 3000;
+                    NOW() - payload.candidate.userGestureAt < VA_BUFFER.USER_GESTURE_WINDOW_MS;
 
                 if (gestureRecent) {
                     existing.markUserGesture();
@@ -2721,7 +2767,7 @@
             const userGesture = !!(
                 payload.candidate &&
                 payload.candidate.userGestureAt &&
-                NOW() - payload.candidate.userGestureAt < 3000
+                NOW() - payload.candidate.userGestureAt < VA_BUFFER.USER_GESTURE_WINDOW_MS
             );
 
             if (ConfigManager.get('visibleOnly') && !userGesture) {
@@ -2747,7 +2793,7 @@
                 this._schedulePublish();
             } catch (e) {
                 Logger.error('SessionManager', '接管视频失败', e);
-                try { this.seen.delete(video); } catch (e2) { }
+                this.seen.delete(video);
             }
         }
 
@@ -3582,6 +3628,10 @@
         }
 
         _flushSettings() {
+            // 未打开过面板（_syncSettings 未执行）时，输入框停在 HTML 默认态，
+            // 若强行 flush 会把全部配置写成 false 并持久化，导致功能被静默清空（C1）
+            if (!this._synced) return;
+
             const panel = this._panel;
             const patch = {};
 
@@ -3601,6 +3651,7 @@
 
         _syncSettings() {
             const panel = this._panel;
+            this._synced = true;
 
             UIManager._configMap.forEach(function (cfg) {
                 const el = panel.querySelector('#' + cfg.id);
@@ -3786,7 +3837,7 @@
 
             logsEl.appendChild(div);
 
-            while (logsEl.children.length > 200) {
+            while (logsEl.children.length > VA_BUFFER.LOG_LINE_LIMIT) {
                 logsEl.removeChild(logsEl.firstChild);
             }
 
@@ -3821,7 +3872,7 @@
 
             const now = NOW();
 
-            if (state.stallLevel > 0 && now - this._lastStallMarker > 2000) {
+            if (state.stallLevel > 0 && now - this._lastStallMarker > VA_BUFFER.STALL_LOG_THROTTLE_MS) {
                 this._lastStallMarker = now;
                 this._addTimelineMarker('stall', '卡顿等级 ' + state.stallLevel);
             }
@@ -3963,7 +4014,7 @@
             }
 
             const now = NOW();
-            if (now - this._lastTimelineRender > 1000) {
+            if (now - this._lastTimelineRender > VA_TUNING.TIMELINE_RENDER_THROTTLE_MS) {
                 this._lastTimelineRender = now;
                 this._renderTimeline();
             }

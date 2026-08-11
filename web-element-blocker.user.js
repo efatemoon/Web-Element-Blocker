@@ -4636,6 +4636,7 @@
         return { scan, deepScan, enableNavigationInterceptor, detectSkinTone, extractPseudoContent, decodeObfuscatedUrl };
     })();
 
+
     /**
      * 用户交互界面：基于 Shadow DOM 隔离
      */
@@ -8571,7 +8572,6 @@
             });
         }
     }
-
     // ================= iframe 防线模块（v2.0 动态 iframe 广告拦截） =================
     // 依据《动态 iframe 广告拦截完整重构方案 v2.0》实现：
     //   FrameDetector · EventBus · WhitelistStore · ContentClassifier · FrameMessenger · MessageGuard · IframeGuard
@@ -9836,15 +9836,22 @@
             return uiInstance;
         }
 
-        GM_registerMenuCommand('🖱 手动选择屏蔽元素', () => { const ui = getUI(); ui._safeCall('选择模式', () => ui.startSelection(), () => ui.startSelection()); });
-        GM_registerMenuCommand('📝 添加文本/正则/积木/属性/路径规则', () => { const ui = getUI(); ui._safeCall('规则面板', () => ui.showRegexPanel(), () => ui.showRegexPanel()); });
-        GM_registerMenuCommand('🌐 全局检索域名', () => { const ui = getUI(); ui._safeCall('域名检索', () => ui.showGlobalDomainPanel(), () => ui.showGlobalDomainPanel()); });
-        GM_registerMenuCommand('👁 扫描不可见覆盖层广告', () => { const ui = getUI(); ui._safeCall('覆盖层扫描', () => ui.showOverlayScanPanel(), () => ui.showOverlayScanPanel()); });
-        GM_registerMenuCommand('⚙️ 管理规则与防御策略', () => { const ui = getUI(); ui._safeCall('管理面板', () => ui.showManager(), () => ui.showManager()); });
-        GM_registerMenuCommand('🖼️ iframe 防线管理', () => { const ui = getUI(); ui._safeCall('iframe面板', () => ui.showIframePanel(), () => ui.showIframePanel()); });
-        GM_registerMenuCommand('📤 导出规则（跨设备迁移）', () => { const ui = getUI(); ui._safeCall('导出面板', () => ui.showExportPanel(), () => ui.showExportPanel()); });
-        GM_registerMenuCommand('🛡️ 导出 AdGuard 规则', () => { const ui = getUI(); ui._safeCall('AdGuard 导出', () => ui.showAdGuardExportPanel(), () => ui.showAdGuardExportPanel()); });
-        GM_registerMenuCommand('📥 导入规则', () => { const ui = getUI(); ui._safeCall('导入面板', () => ui.showImportPanel(), () => ui.showImportPanel()); });
+        // GM 菜单注册辅助函数：消除 9 处重复模板（《重构》Ch.7 Duplicate Code）
+        function _registerMenu(label, title, method) {
+            GM_registerMenuCommand(label, () => {
+                const ui = getUI();
+                ui._safeCall(title, () => ui[method](), () => ui[method]());
+            });
+        }
+        _registerMenu('🖱 手动选择屏蔽元素', '选择模式', 'startSelection');
+        _registerMenu('📝 添加文本/正则/积木/属性/路径规则', '规则面板', 'showRegexPanel');
+        _registerMenu('🌐 全局检索域名', '域名检索', 'showGlobalDomainPanel');
+        _registerMenu('👁 扫描不可见覆盖层广告', '覆盖层扫描', 'showOverlayScanPanel');
+        _registerMenu('⚙️ 管理规则与防御策略', '管理面板', 'showManager');
+        _registerMenu('🖼️ iframe 防线管理', 'iframe面板', 'showIframePanel');
+        _registerMenu('📤 导出规则（跨设备迁移）', '导出面板', 'showExportPanel');
+        _registerMenu('🛡️ 导出 AdGuard 规则', 'AdGuard 导出', 'showAdGuardExportPanel');
+        _registerMenu('📥 导入规则', '导入面板', 'showImportPanel');
     }
 
 })();
