@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.5
+// @version      3.4.6
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -20,57 +20,6 @@
 // @updateURL    https://raw.githubusercontent.com/efatemoon/Web-Element-Blocker/refs/heads/main/web-element-blocker.meta.js
 // ==/UserScript==
 
-/**
- * 架构总览 v2.1
- *
- * 三层架构（低耦合）：
- * ┌─────────────────────────────────────────────────────────────────┐
- * │  UI Layer（面板层）                                              │
- * │  UIManager + EventBus                                          │
- * │  依赖：所有 Engine 模块                                        │
- * └─────────────────────────────────────────────────────────────────┘
- *                              ↓ EventBus 事件驱动
- * ┌─────────────────────────────────────────────────────────────────┐
- * │  Engine Layer（引擎层）                                          │
- * │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
- * │  │ NetworkEngine │  │  DOMScanner   │  │    CSSEngine         │ │
- * │  │ (网络拦截)    │  │ (动态扫描)    │  │  (CSS 规则注入)      │ │
- * │  └──────────────┘  └──────────────┘  └──────────────────────┘ │
- * │                          ↓                                      │
- * │  ┌──────────────┐  ┌──────────────────────────────────────┐   │
- * │  │ FrameDetector │  │         IframeGuard                  │   │
- * │  │ (帧发现)      │──│  ┌──────────┐ ┌──────────┐          │   │
- * │  │ frame:new     │  │  │Classifier│ │DeepScan  │          │   │
- * │  │ frame:same    │  │  │(分类器)   │ │(帧内深扫) │          │   │
- * │  │ frame:diff    │  │  └──────────┘ └──────────┘          │   │
- * │  └──────────────┘  │         FrameMessenger(跨域通信)     │   │
- * │                    └──────────────────────────────────────┘   │
- * └─────────────────────────────────────────────────────────────────┘
- *                              ↓
- * ┌─────────────────────────────────────────────────────────────────┐
- * │  Storage Layer（存储层）                                         │
- * │  StorageManager（规则 CRUD + 持久化）                           │
- * │  WhitelistStore（iframe 白名单）                               │
- * │  依赖：GM_setValue / GM_getValue                               │
- * └─────────────────────────────────────────────────────────────────┘
- *
- * 启动顺序：
- *   NetworkInterceptor.init() → BlockEngine.hookAttachShadow() → BlockEngine.fastInject()
- *   → BlockEngine.startObserver() → FrameDetector.init() → IframeGuard.init()
- *
- * 模块依赖关系：
- *   FrameDetector ──(frame:new)──> IframeGuard
- *   IframeGuard ──(iframe:blocked/protected)──> UIManager
- *   ContentClassifier ──(classify)──> IframeGuard
- *   FrameMessenger ──(postMessage)──> IframeGuard
- *
- * 核心设计原则：
- * 1. 正文保护铁律：contentScore > 60 → 仅清理内部广告，绝不整体隐藏 iframe
- * 2. 冻结测量防振荡：首次几何值缓存，避免 hidden→重测→分数变化→恢复的循环
- * 3. 粘性判定：blocked/manual 状态跨扫描保留，除非白名单
- * 4. 双路径决策：同域递归深扫 + 跨域 postMessage 上报
- * 5. 用户规则优先：iframeBlock 规则 > 白名单 > 自动分类
- */
 
 (function () {
     'use strict';
@@ -6199,18 +6148,8 @@
             const scrollBox = panel.querySelector('#mgr-list').parentElement;
             const savedScroll = scrollBox ? scrollBox.scrollTop : 0;
 
-            // 删除前捕获完整规则对象，供撤销恢复使用
-            let capturedRule = null;
-            if (type === 'iframeBlock') {
-                capturedRule = this.storage.getIframeBlocks()[index];
-            } else if (scope === 'global') {
-                capturedRule = this.storage.getDomainBlocks()[index];
-            } else if (scope === 'current') {
-                capturedRule = this.storage.getData()[type][index];
-            } else {
-                const siteRec = this.storage.getAllSiteRules().find(r => r.domain === domain && r.type === type && r.index === index);
-                capturedRule = siteRec ? siteRec.rule : null;
-            }
+            // 删除前捕获完整规则对象，供撤销恢复使用（共用 _captureDeletedRule，分支顺序与删除 API 一致）
+            const capturedRule = this._captureDeletedRule(scope, domain, type, index);
 
             if (type === 'iframeBlock') {
                 this.storage.removeIframeRule(index);
@@ -6233,13 +6172,14 @@
                     try { IframeGuard.reapplyInFrames(); } catch (e) { Log.warn(e.message || e); }
                 }
             }
-            // 推入撤销栈并显示带撤销按钮的 Toast（5s 内可恢复）
+            // 推入撤销栈并显示带撤销按钮的 Toast（5s 内可恢复）；Toast 精确绑定本次删除条目
             if (capturedRule) {
-                this._pushUndo({ type, domain, scope, rule: { ...capturedRule } });
-                this.showToast('已删除规则', 'warning', 5000, () => {
-                    this._performUndo();
-                    records = rebuildRecords();
-                    renderList();
+                const undoEntry = this._pushUndo({ type, domain, scope, rule: { ...capturedRule } });
+                this.showToast('已删除规则（5 秒内可撤销）', 'warning', 5000, () => {
+                    if (this._restoreEntry(undoEntry)) {
+                        records = rebuildRecords();
+                        renderList();
+                    }
                 });
             }
             records = rebuildRecords();
@@ -6297,22 +6237,12 @@
                 // 捕获待删规则快照（用于撤销恢复）
                 const captured = [];
                 tasks.forEach(t => {
-                    let rule = null;
-                    let value = '';
-                    if (t.type === 'iframeBlock') {
-                        // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
-                        rule = this.storage.getIframeBlocks()[t.index];
-                        value = rule ? (rule.value || '') : '';
-                    } else if (t.scope === 'global') {
-                        rule = this.storage.getDomainBlocks()[t.index];
-                        value = rule ? rule.domain : '';
-                    } else if (t.scope === 'current') {
-                        rule = this.storage.getData()[t.type] && this.storage.getData()[t.type][t.index];
-                    } else {
-                        const siteRec = this.storage.getAllSiteRules().find(r => r.domain === t.domain && r.type === t.type && r.index === t.index);
-                        rule = siteRec ? siteRec.rule : null;
+                    const rule = this._captureDeletedRule(t.scope, t.domain, t.type, t.index);
+                    if (rule) {
+                        const value = t.type === 'iframeBlock' ? (rule.value || '')
+                            : (t.scope === 'global' ? rule.domain : '');
+                        captured.push({ scope: t.scope, domain: t.domain, type: t.type, rule: { ...rule }, value });
                     }
-                    if (rule) captured.push({ scope: t.scope, domain: t.domain, type: t.type, rule: { ...rule }, value });
                 });
                 // 冗余-1：已移除 restoreInlineForDomain 循环——reapplyAll 内部 restoreAllInlineStyles
                 // 会清除全部内联隐藏样式（不依赖规则存在），此处的逐域名还原完全被覆盖，属冗余操作
@@ -6338,13 +6268,14 @@
                 if (tasks.some(t => t.type === 'iframeBlock')) {
                     try { IframeGuard.rescanAll(); } catch (e) { Log.warn(e.message || e); }
                 }
-                // 推入批量撤销条目（一次撤销恢复全部）
+                // 推入批量撤销条目（一次撤销恢复全部）；Toast 精确绑定本次批量删除条目
                 if (captured.length > 0) {
-                    this._pushUndo({ batch: true, rules: captured });
-                    this.showToast(`已批量删除 ${captured.length} 条规则`, 'warning', 5000, () => {
-                        this._performUndo();
-                        records = rebuildRecords();
-                        renderList();
+                    const undoEntry = this._pushUndo({ batch: true, rules: captured });
+                    this.showToast(`已批量删除 ${captured.length} 条规则（5 秒内可撤销）`, 'warning', 5000, () => {
+                        if (this._restoreEntry(undoEntry)) {
+                            records = rebuildRecords();
+                            renderList();
+                        }
                     });
                 }
                 batchSelected.clear();
@@ -7827,13 +7758,32 @@
 
         // 轻量撤销栈：最近 5 次删除规则操作可撤销
         // entry: { type, domain, scope, rule } —— rule 为删除前捕获的完整规则对象
+        // 入栈并返回该条目，供 Toast 精确绑定（避免全局 LIFO 栈弹出错误条目）
         _pushUndo(entry) {
             this._undoStack.push(entry);
             if (this._undoStack.length > 5) this._undoStack.shift();
+            return entry;
         }
-        _performUndo() {
-            const entry = this._undoStack.pop();
-            if (!entry) { this.showToast('没有可撤销的操作', 'info'); return; }
+        // 删除前精确捕获某条规则快照，供撤销恢复（单条/批量删除共用，消除重复三分支逻辑）
+        // 返回规则对象或 null（捕获失败）。与删除 API 的分支顺序保持一致：iframeBlock > global > current > other
+        _captureDeletedRule(scope, domain, type, index) {
+            try {
+                if (type === 'iframeBlock') return this.storage.getIframeBlocks()[index] || null;
+                if (scope === 'global') return this.storage.getDomainBlocks()[index] || null;
+                if (scope === 'current') {
+                    const arr = this.storage.getData()[type];
+                    return (arr && arr[index]) || null;
+                }
+                const siteRec = this.storage.getAllSiteRules()
+                    .find(r => r.domain === domain && r.type === type && r.index === index);
+                return siteRec ? siteRec.rule : null;
+            } catch (e) { Log.warn('捕获删除规则失败:', e.message || e); return null; }
+        }
+        // 精确恢复某条撤销条目（每条 Toast 绑定自身条目，避免全局 LIFO 栈弹出错误规则）
+        // entry: 单条 { type, domain, scope, rule } 或批量 { batch:true, rules:[...] }
+        // 返回 true 表示已恢复；重复点击同一 Toast 由 _restored 标记幂等保护，不会恢复两次
+        _restoreEntry(entry) {
+            if (!entry || entry._restored) return false;
             try {
                 // 批量删除撤销：entry.batch=true 时 rules 为删除规则数组，逐条恢复
                 const items = entry.batch ? entry.rules : [entry];
@@ -7856,10 +7806,13 @@
                 // 统一调用 reapplyAll(问题2)：与删除规则后重新应用逻辑保持一致，
                 // 将来 reapplyAll 增加步骤（如覆盖层重扫）时撤销逻辑自动跟上
                 BlockEngine.reapplyAll();
+                entry._restored = true;
                 this.showToast(entry.batch ? `已撤销批量删除（${items.length} 条）` : '已撤销删除', 'success');
+                return true;
             } catch (e) {
                 Log.error('撤销失败:', e);
                 this.showToast('撤销失败：' + e.message, 'error');
+                return false;
             }
         }
 

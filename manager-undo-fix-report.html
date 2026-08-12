@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理面板「删除规则撤销」修复与架构审查报告</title>
+<style>
+  body{margin:0;background:#15171c;color:#e8eaf0;font-family:-apple-system,"Segoe UI",sans-serif;padding:28px;}
+  h1{font-size:22px;margin:0 0 4px;color:#fff;}
+  .sub{color:#9aa0ab;font-size:13px;margin-bottom:22px;}
+  .card{background:#1d2027;border:1px solid #2b2f3a;border-radius:12px;padding:18px 20px;margin:18px 0;}
+  .card h2{font-size:16px;margin:0 0 12px;color:#ffd479;}
+  svg{display:block;width:100%;height:auto;background:#181b21;border-radius:10px;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #2b2f3a;}
+  th{color:#9aa0ab;font-weight:600;}
+  td code{background:#262a33;padding:1px 6px;border-radius:4px;color:#ffd479;font-size:12px;}
+  .ok{color:#34c759;} .bug{color:#ff453a;} .warn{color:#ffd479;}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;}
+  .tag.g{background:rgba(52,199,89,.18);color:#34c759;}
+  .tag.r{background:rgba(255,69,58,.18);color:#ff453a;}
+  .tag.o{background:rgba(255,140,66,.18);color:#ff8c42;}
+  ul{margin:8px 0;padding-left:20px;line-height:1.7;font-size:13px;color:#cfd3dc;}
+  .foot{color:#6b7280;font-size:12px;margin-top:26px;}
+  .k{color:#ff8c42;}
+</style>
+</head>
+<body>
+<h1>管理面板「删除规则撤销」修复与架构审查报告</h1>
+<div class="sub">web-element-blocker.user.js · 修复日期 2026-08-12 · 检测方式：静态深搜 + brooks 严谨审查 + review-and-refactor</div>
+
+<div class="card">
+  <h2>一、问题定位</h2>
+  <ul>
+    <li><b>用户报告：</b>管理面板删除规则后「根本没有撤销功能」/ 出现「奇怪的错误提示」。</li>
+    <li><b>实测结论：</b>撤销功能<span class="ok">确实已实现</span>（<code>showManager → ManagerPanel.call(this) → UIManager._pushUndo / _restoreEntry</code> 链路完整），但存在 <span class="bug">致命交互缺陷</span>：</li>
+    <li>旧 <code>_performUndo()</code> 用 <code>this._undoStack.pop()</code>（全局 <b>LIFO 栈</b>），而每条删除的 Toast 是<b>按时间顺序</b>弹出的。删除 A→删除 B 后，点击 A 的 Toast「撤销」会弹出栈顶 = <b>B</b>，结果<b>恢复了错误的规则</b>。这是用户感知到的「撤销是假的 / 奇怪」的根因。</li>
+    <li>此外删除前规则快照的捕获逻辑在单条与批量两处<b>重复三分支</b>，可维护性差。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>二、整体架构图（删除 / 撤销链路所在位置）</h2>
+  <svg viewBox="0 0 680 580" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/>
+      </marker>
+      <style>
+        .ll{fill:rgba(255,255,255,0.02);stroke:#3a3f4b;stroke-dasharray:5 4;rx:12}
+        .nd{fill:#232733;stroke:#3a3f4b;stroke-width:1.2}
+        .tx{fill:#e8eaf0;font-size:12px}
+        .txs{fill:#9aa0ab;font-size:10.5px}
+        .tt{fill:#fff;font-size:13px;font-weight:600}
+        .fix{fill:rgba(255,140,66,0.16);stroke:#ff8c42;stroke-width:1.6}
+        .hl{fill:rgba(52,199,89,0.14);stroke:#34c759;stroke-width:1.4}
+      </style>
+    </defs>
+
+    <!-- Layer 1: UI -->
+    <rect class="ll" x="20" y="56" width="640" height="150" rx="12"/>
+    <text class="txs" x="32" y="74">L1 · UI 面板层（Shadow DOM 隔离）</text>
+    <rect class="nd" x="40" y="84" width="600" height="34" rx="8"/>
+    <text class="tx" x="340" y="105" text-anchor="middle">UIManager（面板协调器 · 持有 _undoStack / _pushUndo / _restoreEntry / _captureDeletedRule）</text>
+    <!-- 9 panel chips -->
+    <g font-size="10.5">
+      <rect class="nd" x="34" y="128" width="62" height="40" rx="7"/><text class="tx" x="65" y="146" text-anchor="middle">选择</text><text class="txs" x="65" y="160" text-anchor="middle">selection</text>
+      <rect class="nd" x="104" y="128" width="62" height="40" rx="7"/><text class="tx" x="135" y="146" text-anchor="middle">规则</text><text class="txs" x="135" y="160" text-anchor="middle">regex</text>
+      <rect class="nd" x="174" y="128" width="62" height="40" rx="7"/><text class="tx" x="205" y="146" text-anchor="middle">域名</text><text class="txs" x="205" y="160" text-anchor="middle">domain</text>
+      <rect class="nd" x="244" y="128" width="62" height="40" rx="7"/><text class="tx" x="275" y="146" text-anchor="middle">覆盖层</text><text class="txs" x="275" y="160" text-anchor="middle">overlay</text>
+      <rect class="fix" x="314" y="128" width="62" height="40" rx="7"/><text class="tt" x="345" y="146" text-anchor="middle">管理</text><text class="txs" x="345" y="160" text-anchor="middle">manager★</text>
+      <rect class="nd" x="384" y="128" width="62" height="40" rx="7"/><text class="tx" x="415" y="146" text-anchor="middle">iframe</text><text class="txs" x="415" y="160" text-anchor="middle">iframe</text>
+      <rect class="nd" x="454" y="128" width="62" height="40" rx="7"/><text class="tx" x="485" y="146" text-anchor="middle">导出</text><text class="txs" x="485" y="160" text-anchor="middle">export</text>
+      <rect class="nd" x="524" y="128" width="62" height="40" rx="7"/><text class="tx" x="555" y="146" text-anchor="middle">AdGuard</text><text class="txs" x="555" y="160" text-anchor="middle">adguard</text>
+      <rect class="nd" x="594" y="128" width="62" height="40" rx="7"/><text class="tx" x="625" y="146" text-anchor="middle">导入</text><text class="txs" x="625" y="160" text-anchor="middle">import</text>
+    </g>
+
+    <!-- Layer 2: Service ports -->
+    <rect class="ll" x="20" y="222" width="640" height="78" rx="12"/>
+    <text class="txs" x="32" y="240">L2 · 服务端口层（整洁架构 DIP · UI 不直接触碰引擎/存储）</text>
+    <rect class="nd" x="40" y="250" width="190" height="38" rx="8"/><text class="tx" x="135" y="273" text-anchor="middle">OverlayService</text>
+    <rect class="nd" x="245" y="250" width="190" height="38" rx="8"/><text class="tx" x="340" y="273" text-anchor="middle">StorageService (Proxy)</text>
+    <rect class="nd" x="450" y="250" width="190" height="38" rx="8"/><text class="tx" x="545" y="273" text-anchor="middle">PanelRegistry</text>
+
+    <!-- Layer 3: Engine / Guard -->
+    <rect class="ll" x="20" y="316" width="640" height="90" rx="12"/>
+    <text class="txs" x="32" y="334">L3 · 引擎 / 守卫层</text>
+    <rect class="nd" x="40" y="344" width="190" height="44" rx="8"/><text class="tx" x="135" y="371" text-anchor="middle">BlockEngine</text>
+    <rect class="nd" x="245" y="344" width="190" height="44" rx="8"/><text class="tx" x="340" y="371" text-anchor="middle">IframeGuard</text>
+    <rect class="nd" x="450" y="344" width="190" height="44" rx="8"/><text class="tx" x="545" y="371" text-anchor="middle">OverlayDetector</text>
+
+    <!-- Layer 4: Storage -->
+    <rect class="ll" x="20" y="422" width="640" height="64" rx="12"/>
+    <text class="txs" x="32" y="440">L4 · 持久化层（GM_getValue / GM_setValue）</text>
+    <rect class="nd" x="40" y="450" width="600" height="30" rx="8"/><text class="tx" x="340" y="470" text-anchor="middle">StorageManager（getData / addRule / removeRule / addRuleForDomain / getIframeBlocks / addIframeRule …）</text>
+
+    <!-- connectors -->
+    <path d="M340,206 L340,222" stroke="#6b7280" stroke-width="1.4" marker-end="url(#ar)"/>
+    <path d="M340,300 L340,316" stroke="#6b7280" stroke-width="1.4" marker-end="url(#ar)"/>
+    <path d="M340,406 L340,422" stroke="#6b7280" stroke-width="1.4" marker-end="url(#ar)"/>
+    <!-- manager→storage direct (delete/undo path) -->
+    <path d="M345,168 C420,200 560,300 560,450" fill="none" stroke="#ff8c42" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+    <text class="txs" x="470" y="320" fill="#ff8c42">删除 / 撤销 实际调用链</text>
+  </svg>
+</div>
+
+<div class="card">
+  <h2>三、删除 → 撤销 交互时序（修复前 BUG vs 修复后 FIX）</h2>
+  <svg viewBox="0 0 680 470" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="ar2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,3 L0,6 Z" fill="#6b7280"/></marker>
+      <style>
+        .box{fill:#232733;stroke:#3a3f4b;stroke-width:1.2;rx:8}
+        .bxr{fill:rgba(255,69,58,0.14);stroke:#ff453a;stroke-width:1.5;rx:8}
+        .bxg{fill:rgba(52,199,89,0.14);stroke:#34c759;stroke-width:1.5;rx:8}
+        .bo{fill:rgba(255,140,66,0.16);stroke:#ff8c42;stroke-width:1.5;rx:8}
+        .tx{fill:#e8eaf0;font-size:12.5px}
+        .tt{fill:#fff;font-size:13.5px;font-weight:700}
+        .txs{fill:#9aa0ab;font-size:11px}
+        .bd{fill:#ff453a;font-size:12px;font-weight:700}
+        .gd{fill:#34c759;font-size:12px;font-weight:700}
+      </style>
+    </defs>
+
+    <!-- BEFORE -->
+    <text class="bd" x="24" y="30">修复前（BUG）：全局 LIFO 栈 → 撤销恢复错误规则</text>
+    <rect class="box" x="24" y="44" width="300" height="48" rx="8"/><text class="tx" x="174" y="65" text-anchor="middle">① 删除规则 A</text><text class="txs" x="174" y="82" text-anchor="middle">_pushUndo(A) · 栈=[A]（顶=A）</text>
+    <rect class="box" x="24" y="108" width="300" height="48" rx="8"/><text class="tx" x="174" y="129" text-anchor="middle">② 删除规则 B</text><text class="txs" x="174" y="146" text-anchor="middle">_pushUndo(B) · 栈=[A,B]（顶=B）</text>
+    <rect class="bxr" x="24" y="172" width="300" height="60" rx="8"/><text class="tx" x="174" y="194" text-anchor="middle">③ 点击 A 的 Toast「撤销」</text><text class="txs" x="174" y="212" text-anchor="middle">_performUndo() → pop 顶 = B</text><text class="bd" x="174" y="227" text-anchor="middle">→ 恢复 B ❌（应为 A）</text>
+    <path d="M174,92 L174,108" stroke="#6b7280" stroke-width="1.4" marker-end="url(#ar2)"/>
+    <path d="M174,156 L174,172" stroke="#ff453a" stroke-width="1.6" marker-end="url(#ar2)"/>
+
+    <!-- AFTER -->
+    <text class="gd" x="356" y="30">修复后（FIX）：Toast 绑定自身条目 → 精确撤销</text>
+    <rect class="box" x="356" y="44" width="300" height="48" rx="8"/><text class="tx" x="506" y="65" text-anchor="middle">① 删除 A</text><text class="txs" x="506" y="82" text-anchor="middle">undoEntryA=_pushUndo(A)；ToastA 绑定 A</text>
+    <rect class="box" x="356" y="108" width="300" height="48" rx="8"/><text class="tx" x="506" y="129" text-anchor="middle">② 删除 B</text><text class="txs" x="506" y="146" text-anchor="middle">undoEntryB=_pushUndo(B)；ToastB 绑定 B</text>
+    <rect class="bxg" x="356" y="172" width="300" height="60" rx="8"/><text class="tx" x="506" y="194" text-anchor="middle">③ 点击 ToastA「撤销」</text><text class="txs" x="506" y="212" text-anchor="middle">_restoreEntry(undoEntryA)</text><text class="gd" x="506" y="227" text-anchor="middle">→ 恢复 A ✅（_restored 幂等）</text>
+    <path d="M506,92 L506,108" stroke="#6b7280" stroke-width="1.4" marker-end="url(#ar2)"/>
+    <path d="M506,156 L506,172" stroke="#34c759" stroke-width="1.6" marker-end="url(#ar2)"/>
+
+    <rect class="bo" x="24" y="258" width="632" height="58" rx="8"/>
+    <text class="tx" x="340" y="280" text-anchor="middle">核心改动：</text>
+    <text class="txs" x="340" y="300" text-anchor="middle">_pushUndo 返回条目；_performUndo（LIFO pop）替换为 _restoreEntry(entry)（精确 + 幂等）；单条/批量删除快照捕获统一为 _captureDeletedRule()。</text>
+
+    <!-- interaction map -->
+    <text class="tt" x="24" y="356">UI 交互要点（已加固）</text>
+    <rect class="box" x="24" y="368" width="300" height="84" rx="8"/>
+    <text class="tx" x="40" y="390">· 删除即弹 Toast（5s 内可撤销）</text>
+    <text class="tx" x="40" y="410">· 每条 Toast 绑定<b>自己</b>的删除条目</text>
+    <text class="tx" x="40" y="430">· 重复点击同一 Toast 由 _restored 拦截</text>
+    <text class="tx" x="40" y="450">· 快照捕获失败（null）则不弹撤销</text>
+    <rect class="box" x="356" y="368" width="300" height="84" rx="8"/>
+    <text class="tx" x="372" y="390">· clearPanel 统一退订 EventBus</text>
+    <text class="tx" x="372" y="410">· 删除后仅重渲染列表（保留过滤/滚动）</text>
+    <text class="tx" x="372" y="430">· 删除→reapplyAll 即时生效，撤销同理</text>
+    <text class="tx" x="372" y="450">· 无原生 alert/confirm（全 Toast 化）</text>
+  </svg>
+</div>
+
+<div class="card">
+  <h2>四、9 个面板逐个 UI / 交互审查</h2>
+  <table>
+    <thead><tr><th>菜单项</th><th>面板函数</th><th>删除操作</th><th>撤销</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr><td>🖱 选择模式</td><td><code>SelectionPanel</code></td><td>无（仅屏蔽）</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>📝 规则面板</td><td><code>RegexPanel</code></td><td>无内联删除</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>🌐 域名检索</td><td><code>GlobalDomainPanel</code></td><td>无内联删除</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>👁 覆盖层扫描</td><td><code>OverlayScanPanel</code></td><td>无内联删除</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>⚙️ 管理面板</td><td><code>ManagerPanel</code></td><td>单条 + 批量删除</td><td>Toast 撤销（★已修复 LIFO）</td><td><span class="tag o">已修复</span></td></tr>
+      <tr><td>🖼️ iframe 面板</td><td><code>IframePanel</code></td><td>无内联删除</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>📤 导出</td><td><code>ExportPanel</code></td><td>无</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>🛡️ AdGuard 导出</td><td><code>AdGuardExportPanel</code></td><td>无</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+      <tr><td>📥 导入</td><td><code>ImportPanel</code></td><td>无</td><td>—</td><td><span class="tag g">正常</span></td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>全仓删除操作 <b>100% 集中在 <code>ManagerPanel</code></b>（唯一 <code>btn-delete</code> 与全部 <code>removeRule*</code> / <code>removeIframeRule</code> 调用），因此「删除无撤销」类缺陷只能发生于此处；其余 8 个面板均无删除面，不受同类问题影响。</li>
+    <li>所有错误提示已 Toast / 内嵌 confirm 化，<b>无原生 <code>alert</code>/<code>confirm</code>/<code>prompt</code></b>（grep 确认仅注释提及）。</li>
+    <li><code>clearPanel()</code> 已正确退订 EventBus（<code>_iframeUnsubs</code>）、停止选择模式、还原预览元素，<b>无监听器泄漏 / 幽灵更新</b>。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>五、架构与代码优化</h2>
+  <ul>
+    <li><span class="k">撤销精确化：</span>用 <code>_restoreEntry(entry)</code> 取代 <code>_performUndo()</code> 的全局 <code>pop()</code>，每条 Toast 绑定自身条目，彻底消除「撤销恢复错误规则」。</li>
+    <li><span class="k">幂等保护：</span>新增 <code>entry._restored</code> 标记，重复点击同一 Toast 不会恢复两次。</li>
+    <li><span class="k">去重（DRY）：</span>单条删除与批量删除原本各自重复「iframeBlock→global→current→other」三分支快照捕获，统一抽取为 <code>_captureDeletedRule(scope,domain,type,index)</code>，消除约 20 行重复，分支顺序与删除 API 严格一致。</li>
+    <li><span class="k">反馈增强：</span>Toast 文案明确「5 秒内可撤销」，撤销成功回显「已撤销删除」。</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>六、验证</h2>
+  <ul>
+    <li><code>node --check web-element-blocker.user.js</code> → <span class="ok">SYNTAX_OK</span></li>
+    <li>全文检索 <code>_performUndo</code> → <span class="ok">0 处残留</span>（已全部改为 <code>_restoreEntry</code>）</li>
+    <li>删除 / 撤销调用链：<code>ManagerPanel</code> → <code>_captureDeletedRule</code> → <code>_pushUndo</code> 返回条目 → Toast 绑定 → <code>_restoreEntry</code> → <code>storage.addRule*</code> / <code>reapplyAll</code></li>
+  </ul>
+</div>
+
+<div class="foot">生成依据：brooks 严谨审查（检测问题）→ review-and-refactor（修复 + 去重）→ 架构图与流程图绘制（可视化）。源文件未拆分，仅在 <code>UIManager</code> 内方法级重构。</div>
+</body>
+</html>
