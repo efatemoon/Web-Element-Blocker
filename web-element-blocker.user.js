@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.4
+// @version      3.4.5
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -7072,298 +7072,298 @@
         // 0 命中=未生效（0分），1-2=精准命中（10分），3-5=略多（30分），
         // 6-15=可能误杀（60分），16-50=高度可疑（80分），>50=几乎确定误杀（100分）
         function calcImpactScore(count) {
-        if (count === 0) return 0;
-        if (count <= 2) return 10;
-        if (count <= 5) return 30;
-        if (count <= 15) return 60;
-        if (count <= 50) return 80;
-        return 100;
+            if (count === 0) return 0;
+            if (count <= 2) return 10;
+            if (count <= 5) return 30;
+            if (count <= 15) return 60;
+            if (count <= 50) return 80;
+            return 100;
         }
 
         // 统一 querySelectorAll 计数：失败时返回 0
         function countMatches(selector) {
-        let count = 0;
-        try { count = document.querySelectorAll(selector).length; } catch (e) { Log.warn(e.message || e); }
-        return count;
+            let count = 0;
+            try { count = document.querySelectorAll(selector).length; } catch (e) { Log.warn(e.message || e); }
+            return count;
         }
 
         // 规则影响度评估：遍历各桶规则，按选择器/DOM 命中数评分
         function evaluateRuleImpact(storage) {
-        const data = storage.getData();
-        const impacts = []; // {type, index, score, count}
-        
-        // 1. static 规则：直接 querySelectorAll 计数
-        (data.static || []).forEach((r, i) => {
-        if (r._disabled || !r.selector) return;
-        const count = countMatches(r.selector);
-        
-        impacts.push({ type: 'static', index: i, count, score: calcImpactScore(count) });
-        });
-        
-        // 2. dynamic 规则：取首个类名 token 转属性选择器计数
-        (data.dynamic || []).forEach((r, i) => {
-        if (r._disabled || !r.className) return;
-        const token = r.className.split(/\s+/).filter(Boolean)[0];
-        if (!token) return;
-        const count = countMatches(`[class*="${token}"]`);
-        impacts.push({ type: 'dynamic', index: i, count, score: calcImpactScore(count) });
-        });
-        
-        // 3. attribute 规则：直接使用 attrSelector 计数
-        (data.attribute || []).forEach((r, i) => {
-        if (r._disabled || !r.attrSelector) return;
-        const count = countMatches(r.attrSelector);
-        impacts.push({ type: 'attribute', index: i, count, score: calcImpactScore(count) });
-        });
-        
-        // 4. regex 规则：TreeWalker 采样前 500 个文本节点
-        //    contains 模式用 String.includes()，其余用 RegExp
-        //    ReDoS 预检(BUG-A4)：非 contains 模式必须通过 isRegexSafe，否则嵌套量词(如 (a+)+)
-        //    会在 500 节点上 test() → ReDoS 卡死页面
-        (data.regex || []).forEach((r, i) => {
-        if (r._disabled || !r.regex) return;
-        let count = 0;
-        try {
-        const isContains = r.mode === 'contains';
-        if (!isContains && !BlockEngine.isRegexSafe(r.regex)) return;
-        const regex = isContains ? null : new RegExp(r.regex, 'i');
-        const lowerText = isContains ? r.regex.toLowerCase() : null;
-        let checked = 0;
-        BlockEngine.walkTextNodes(document.body, (node) => {
-        if (checked >= 500) return false;
-        checked++;
-        const content = node.textContent || '';
-        if (isContains ? content.toLowerCase().includes(lowerText) : regex.test(content)) count++;
-        });
-        } catch (e) { Log.warn(e.message || e); }
-        impacts.push({ type: 'regex', index: i, count, score: calcImpactScore(count) });
-        });
-        
-        // 5. domainBlock 规则：按 6 通道属性选择器匹配计数（与 applyCSSRules 一致）
-        (data.domainBlock || []).forEach((r, i) => {
-        if (r._disabled || !r.domain) return;
-        const count = countMatches(ResourceSelectorBuilder.buildDomainAttr(r.domain));
-        impacts.push({ type: 'domainBlock', index: i, count, score: calcImpactScore(count) });
-        });
-        
-        // 6. pathPattern 规则：按 3 通道属性选择器匹配计数（与 applyCSSRules 一致）
-        (data.pathPattern || []).forEach((r, i) => {
-        if (r._disabled || !r.pattern) return;
-        const count = countMatches(ResourceSelectorBuilder.buildPathAttr(r.pattern));
-        impacts.push({ type: 'pathPattern', index: i, count, score: calcImpactScore(count) });
-        });
-        
-        // structural / complex 规则不评估：structural 选择器含 :nth-of-type 路径，
-        // complex 无单一选择器，评估成本高且命中数参考价值低
-        impacts.sort((a, b) => b.score - a.score);
-        return impacts;
+            const data = storage.getData();
+            const impacts = []; // {type, index, score, count}
+
+            // 1. static 规则：直接 querySelectorAll 计数
+            (data.static || []).forEach((r, i) => {
+                if (r._disabled || !r.selector) return;
+                const count = countMatches(r.selector);
+
+                impacts.push({ type: 'static', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // 2. dynamic 规则：取首个类名 token 转属性选择器计数
+            (data.dynamic || []).forEach((r, i) => {
+                if (r._disabled || !r.className) return;
+                const token = r.className.split(/\s+/).filter(Boolean)[0];
+                if (!token) return;
+                const count = countMatches(`[class*="${token}"]`);
+                impacts.push({ type: 'dynamic', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // 3. attribute 规则：直接使用 attrSelector 计数
+            (data.attribute || []).forEach((r, i) => {
+                if (r._disabled || !r.attrSelector) return;
+                const count = countMatches(r.attrSelector);
+                impacts.push({ type: 'attribute', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // 4. regex 规则：TreeWalker 采样前 500 个文本节点
+            //    contains 模式用 String.includes()，其余用 RegExp
+            //    ReDoS 预检(BUG-A4)：非 contains 模式必须通过 isRegexSafe，否则嵌套量词(如 (a+)+)
+            //    会在 500 节点上 test() → ReDoS 卡死页面
+            (data.regex || []).forEach((r, i) => {
+                if (r._disabled || !r.regex) return;
+                let count = 0;
+                try {
+                    const isContains = r.mode === 'contains';
+                    if (!isContains && !BlockEngine.isRegexSafe(r.regex)) return;
+                    const regex = isContains ? null : new RegExp(r.regex, 'i');
+                    const lowerText = isContains ? r.regex.toLowerCase() : null;
+                    let checked = 0;
+                    BlockEngine.walkTextNodes(document.body, (node) => {
+                        if (checked >= 500) return false;
+                        checked++;
+                        const content = node.textContent || '';
+                        if (isContains ? content.toLowerCase().includes(lowerText) : regex.test(content)) count++;
+                    });
+                } catch (e) { Log.warn(e.message || e); }
+                impacts.push({ type: 'regex', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // 5. domainBlock 规则：按 6 通道属性选择器匹配计数（与 applyCSSRules 一致）
+            (data.domainBlock || []).forEach((r, i) => {
+                if (r._disabled || !r.domain) return;
+                const count = countMatches(ResourceSelectorBuilder.buildDomainAttr(r.domain));
+                impacts.push({ type: 'domainBlock', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // 6. pathPattern 规则：按 3 通道属性选择器匹配计数（与 applyCSSRules 一致）
+            (data.pathPattern || []).forEach((r, i) => {
+                if (r._disabled || !r.pattern) return;
+                const count = countMatches(ResourceSelectorBuilder.buildPathAttr(r.pattern));
+                impacts.push({ type: 'pathPattern', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // structural / complex 规则不评估：structural 选择器含 :nth-of-type 路径，
+            // complex 无单一选择器，评估成本高且命中数参考价值低
+            impacts.sort((a, b) => b.score - a.score);
+            return impacts;
         }
 
         // 导出 AdGuard 兼容规则文本（v1.0 / v2.0 双格式兼容）
         function generateAdGuardRules(storage) {
-        const raw = JSON.parse(storage.exportAll() || '{}');
-        // v2.0 格式：sites 按域名分组 + domains 纯字符串数组
-        // v1.0 格式：blocks/dynamicBlocks 等平铺字典 + domainBlocks {domain,_ts}[]
-        const isV2 = raw.sites && typeof raw.sites === 'object';
-        const BUCKET_TO_TYPE = {
-        'static': 'static', 'dynamic': 'dynamic', 'regex': 'regex',
-        'attribute': 'attribute', 'structural': 'structural',
-        'complex': 'complex', 'pathPattern': 'pathPattern'
-        };
-        const allDomains = new Set(isV2 ? Object.keys(raw.sites) : []);
-        let ruleBuckets;
-        if (isV2) {
-        // v2.0：从 sites 提取各桶，补全 type 字段供 convertRule 使用
-        ruleBuckets = {};
-        for (const bucket in BUCKET_TO_TYPE) {
-        ruleBuckets[bucket] = {};
-        for (const domain in raw.sites) {
-        const arr = raw.sites[domain][bucket];
-        if (Array.isArray(arr) && arr.length) {
-        ruleBuckets[bucket][domain] = arr.map(r => ({ ...r, type: BUCKET_TO_TYPE[bucket] }));
-        }
-        }
-        }
-        } else {
-        // v1.0 兼容：直接用平铺字典
-        ruleBuckets = {
-        blocks: raw.blocks || {},
-        dynamicBlocks: raw.dynamicBlocks || {},
-        regexBlocks: raw.regexBlocks || {},
-        attrBlocks: raw.attrBlocks || {},
-        structBlocks: raw.structBlocks || {},
-        complexBlocks: raw.complexBlocks || {},
-        pathPatternBlocks: raw.pathPatternBlocks || {}
-        };
-        Object.keys(ruleBuckets).forEach(k => {
-        Object.keys(ruleBuckets[k]).forEach(d => allDomains.add(d));
-        });
-        }
-        // 校验域名：非空、无空白、长度合理
-        const isValidDomain = (d) => typeof d === 'string' && d.length > 0 && d.length < 200 && !/\s/.test(d);
-        // 全局域名黑名单：v2.0 为 string[]，v1.0 为 {domain,_ts}[]，统一提取 domain 字符串
-        const rawDomains = isV2 ? (raw.domains || []) : (raw.domainBlocks || []);
-        const globalDomains = (Array.isArray(rawDomains) ? rawDomains : [])
-        .map(r => (r && typeof r === 'object') ? r.domain : r)
-        .filter(isValidDomain);
-        
-        const lines = [
-        '! 由 Web Element Blocker 转换的 AdGuard 规则',
-        `! 生成时间：${new Date().toLocaleString()}`,
-        '! 兼容 AdGuard 浏览器扩展 / uBlock Origin。',
-        '! 注意：元素隐藏类规则 (## / #?#) 仅适用于浏览器扩展，不适用于 AdGuard DNS。',
-        '! AdGuard DNS 仅支持下方"全局域名拦截（DNS 兼容）"段落中的 ||domain^ 规则。',
-        ''
-        ];
-        
-        const escapeCssValue = (v) => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        const firstClassToken = (cls) => (cls || '').split(/\s+/).filter(Boolean)[0] || cls;
-        // 用户已写好的正则 → 仅转义定界符 / 并剔除换行（保留反斜杠的 regex 语义）
-        // BUG-A11 修复：旧版 replace(/\//g, '\\/') 会把用户已转义的 \/ 二次转义为 \\/，
-        // 在 AdGuard :has-text(/.../) 中语义被破坏（反斜杠+结束定界符）。
-        // 用 (\\*)\/ 捕获连续反斜杠：奇数=已转义保留，偶数=未转义补 \/
-        // 正确处理 a/b→a\/b、a\/b→a\/b、a\\/b→a\\\/b、a\\\/b→a\\\/b
-        const escapeAdGuardRegex = (r) => String(r).replace(/[\r\n]+/g, '').replace(/(\\*)\//g, (m, bs) => bs.length % 2 === 1 ? m : bs + '\\/');
-        // 纯文本 → 转义全部 regex 元字符与定界符，用于嵌入 /.../ 字面量
-        const escapeRegexLiteral = (v) => String(v).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&').replace(/[\r\n]+/g, '');
-        
-        /**
-        * 把单条规则转换为 AdGuard 兼容文本（OR 模式可能返回多行，用 \n 分隔）
-        * 标记说明：
-        *   ##  = 普通元素隐藏（标准 CSS 选择器）
-        *   #?# = 扩展 CSS（含 :has-text / :not(:has-text) 等扩展伪类，AdGuard 强制要求此标记）
-        * 文本匹配统一用 :has-text()，它是 uBlock Origin 主用名、AdGuard 的 :contains() 同义词，兼容性最佳。
-        */
-        const convertRule = (rule, domain) => {
-        if (!rule || !rule.type || !isValidDomain(domain)) return null;
-        switch (rule.type) {
-        case 'static':
-        return rule.selector ? `${domain}##${rule.selector}` : null;
-        case 'dynamic':
-        return rule.className ? `${domain}##[class*="${escapeCssValue(firstClassToken(rule.className))}"]` : null;
-        case 'attribute':
-        return rule.attrSelector ? `${domain}##${rule.attrSelector}` : null;
-        case 'structural':
-        return rule.structSelector ? `${domain}##${rule.structSelector}` : null;
-        case 'regex': {
-        if (!rule.regex) return null;
-        // contains 模式存储原始文本，导出为字面量 has-text(BUG-M7)
-        if (rule.mode === 'contains') {
-        return `${domain}#?#*:has-text("${escapeCssValue(rule.regex)}")`;
-        }
-        try { new RegExp(rule.regex); } catch (e) { return null; }
-        const body = escapeAdGuardRegex(rule.regex);
-        if (!body) return null;
-        // 扩展 CSS 必须用 #?# 标记
-        return `${domain}#?#*:has-text(/${body}/)`;
-        }
-        case 'pathPattern': {
-        if (!rule.pattern) return null;
-        const esc = escapeCssValue(rule.pattern);
-        // 与脚本内 CSS 注入保持一致：同时隐藏资源元素及其直接父容器（解决横幅空白）
-        // :has() 属于 AdGuard 扩展 CSS，需用 #?# 标记
-        // 用 :is() 包裹逗号选择器组，确保 > 对每项生效，避免后代匹配过度隐藏
-        const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
-        return `${domain}##${sel}\n${domain}#?#*:has(> :is(${sel}))`;
-        }
-        case 'complex': {
-        if (!rule.conditions || rule.conditions.length === 0) return null;
-        const andMode = rule.logic === 'AND';
-        const simpleParts = [];
-        const pseudoParts = [];
-        let hasPositiveCondition = false; // 是否存在正向条件(contains/equals)，用于过滤纯 not_contains 规则(BUG-S5)
-        rule.conditions.forEach(c => {
-        if (c.type === 'class') {
-        if (c.operator === 'contains' || c.operator === 'equals') { simpleParts.push(`[class*="${escapeCssValue(c.value)}"]`); hasPositiveCondition = true; }
-        if (c.operator === 'not_contains') pseudoParts.push(`:not([class*="${escapeCssValue(c.value)}"])`);
-        } else if (c.type === 'id') {
-        if (c.operator === 'equals') { simpleParts.push(`[id="${escapeCssValue(c.value)}"]`); hasPositiveCondition = true; }
-        else if (c.operator === 'contains') { simpleParts.push(`[id*="${escapeCssValue(c.value)}"]`); hasPositiveCondition = true; }
-        else if (c.operator === 'not_contains') pseudoParts.push(`:not([id*="${escapeCssValue(c.value)}"])`);
-        } else if (c.type === 'text') {
-        if (c.operator === 'contains') { pseudoParts.push(`:has-text("${escapeCssValue(c.value)}")`); hasPositiveCondition = true; }
-        if (c.operator === 'equals') { pseudoParts.push(`:has-text(/^\\s*${escapeRegexLiteral(c.value)}\\s*$/)`); hasPositiveCondition = true; }
-        if (c.operator === 'not_contains') pseudoParts.push(`:not(:has-text("${escapeCssValue(c.value)}"))`);
-        }
-        });
-        if (andMode) {
-        // 纯 not_contains 条件无法限定范围：*:not(:has-text(...)) 会隐藏页面几乎所有元素(BUG-S5)
-        if (!hasPositiveCondition) return null;
-        if (!pseudoParts.length && !simpleParts.length) return null;
-        const base = simpleParts.length ? `*${simpleParts.join('')}` : '*';
-        const marker = pseudoParts.length > 0 ? '#?#' : '##';
-        return `${domain}${marker}${base}${pseudoParts.join('')}`;
-        } else {
-        // OR 模式：not_contains 单独成行会匹配几乎所有元素，跳过 not_contains 条件(BUG-S5)
-        return rule.conditions.filter(c => c.operator !== 'not_contains').map(c => {
-        if (c.type === 'class') {
-        if (c.operator === 'contains') return `${domain}##*[class*="${escapeCssValue(c.value)}"]`;
-        if (c.operator === 'equals') return `${domain}##[class*="${escapeCssValue(c.value)}"]`;
-        } else if (c.type === 'id') {
-        if (c.operator === 'equals') return `${domain}##[id="${escapeCssValue(c.value)}"]`;
-        if (c.operator === 'contains') return `${domain}##[id*="${escapeCssValue(c.value)}"]`;
-        } else if (c.type === 'text') {
-        if (c.operator === 'contains') return `${domain}#?#*:has-text("${escapeCssValue(c.value)}")`;
-        if (c.operator === 'equals') return `${domain}#?#*:has-text(/^\\s*${escapeRegexLiteral(c.value)}\\s*$/)`;
-        }
-        return null;
-        }).filter(Boolean).join('\n');
-        }
-        }
-        default:
-        return null;
-        }
-        };
-        
-        allDomains.forEach(domain => {
-        // v2.0 用桶名（static/dynamic/...），v1.0 用存储键名（blocks/dynamicBlocks/...）
-        // 两种格式统一通过 Object.values 遍历所有桶，按域名提取规则
-        const rules = [];
-        for (const bucket in ruleBuckets) {
-        const arr = ruleBuckets[bucket][domain];
-        if (Array.isArray(arr)) rules.push(...arr);
-        }
-        if (rules.length === 0) return;
-        lines.push(`! ${domain}`);
-        rules.forEach(rule => {
-        const converted = convertRule(rule, domain);
-        if (converted) lines.push(converted);
-        });
-        lines.push('');
-        });
-        
-        if (globalDomains.length) {
-        // 浏览器扩展版：$third-party 限定第三方请求，避免误杀同域资源
-        lines.push('! 全局域名拦截（AdGuard 浏览器扩展 / uBlock Origin）');
-        globalDomains.forEach(host => lines.push(`||${host}^$third-party`));
-        lines.push('');
-        // DNS 兼容版：AdGuard DNS 会忽略含未知修饰符的整条规则，故去掉 $third-party
-        lines.push('! 全局域名拦截（AdGuard DNS 兼容，无修饰符）');
-        globalDomains.forEach(host => lines.push(`||${host}^`));
-        lines.push('');
-        }
-        
-        // ─── iframe 规则转换（§8.8 映射表） ───
-        const iframeRules = Array.isArray(raw.iframeRules) ? raw.iframeRules : [];
-        if (iframeRules.length > 0) {
-        lines.push('! iframe 拦截规则');
-        iframeRules.forEach(r => {
-        if (!r || !r.matchType) return;
-        if (r.matchType === 'srcDomain' && r.value) {
-        // ||domain^$subdocument,third-party
-        lines.push(`||${r.value}^$subdocument,third-party`);
-        } else if (r.matchType === 'geometry' && r.value) {
-        // 几何条件无法直接转 AdGuard，导出为注释说明
-        lines.push(`! [iframe geometry] ${r.value}（AdGuard 不支持几何规则，需手动添加元素隐藏规则）`);
-        } else if (r.matchType === 'srcdocKeyword' && r.value) {
-        // AdGuard 不支持 srcdoc 匹配，导出为注释
-        lines.push(`! [iframe srcdoc keyword] "${r.value}"（AdGuard 不支持 srcdoc 匹配）`);
-        }
-        });
-        lines.push('');
-        }
-        
-        return lines.join('\n');
+            const raw = JSON.parse(storage.exportAll() || '{}');
+            // v2.0 格式：sites 按域名分组 + domains 纯字符串数组
+            // v1.0 格式：blocks/dynamicBlocks 等平铺字典 + domainBlocks {domain,_ts}[]
+            const isV2 = raw.sites && typeof raw.sites === 'object';
+            const BUCKET_TO_TYPE = {
+                'static': 'static', 'dynamic': 'dynamic', 'regex': 'regex',
+                'attribute': 'attribute', 'structural': 'structural',
+                'complex': 'complex', 'pathPattern': 'pathPattern'
+            };
+            const allDomains = new Set(isV2 ? Object.keys(raw.sites) : []);
+            let ruleBuckets;
+            if (isV2) {
+                // v2.0：从 sites 提取各桶，补全 type 字段供 convertRule 使用
+                ruleBuckets = {};
+                for (const bucket in BUCKET_TO_TYPE) {
+                    ruleBuckets[bucket] = {};
+                    for (const domain in raw.sites) {
+                        const arr = raw.sites[domain][bucket];
+                        if (Array.isArray(arr) && arr.length) {
+                            ruleBuckets[bucket][domain] = arr.map(r => ({ ...r, type: BUCKET_TO_TYPE[bucket] }));
+                        }
+                    }
+                }
+            } else {
+                // v1.0 兼容：直接用平铺字典
+                ruleBuckets = {
+                    blocks: raw.blocks || {},
+                    dynamicBlocks: raw.dynamicBlocks || {},
+                    regexBlocks: raw.regexBlocks || {},
+                    attrBlocks: raw.attrBlocks || {},
+                    structBlocks: raw.structBlocks || {},
+                    complexBlocks: raw.complexBlocks || {},
+                    pathPatternBlocks: raw.pathPatternBlocks || {}
+                };
+                Object.keys(ruleBuckets).forEach(k => {
+                    Object.keys(ruleBuckets[k]).forEach(d => allDomains.add(d));
+                });
+            }
+            // 校验域名：非空、无空白、长度合理
+            const isValidDomain = (d) => typeof d === 'string' && d.length > 0 && d.length < 200 && !/\s/.test(d);
+            // 全局域名黑名单：v2.0 为 string[]，v1.0 为 {domain,_ts}[]，统一提取 domain 字符串
+            const rawDomains = isV2 ? (raw.domains || []) : (raw.domainBlocks || []);
+            const globalDomains = (Array.isArray(rawDomains) ? rawDomains : [])
+                .map(r => (r && typeof r === 'object') ? r.domain : r)
+                .filter(isValidDomain);
+
+            const lines = [
+                '! 由 Web Element Blocker 转换的 AdGuard 规则',
+                `! 生成时间：${new Date().toLocaleString()}`,
+                '! 兼容 AdGuard 浏览器扩展 / uBlock Origin。',
+                '! 注意：元素隐藏类规则 (## / #?#) 仅适用于浏览器扩展，不适用于 AdGuard DNS。',
+                '! AdGuard DNS 仅支持下方"全局域名拦截（DNS 兼容）"段落中的 ||domain^ 规则。',
+                ''
+            ];
+
+            const escapeCssValue = (v) => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            const firstClassToken = (cls) => (cls || '').split(/\s+/).filter(Boolean)[0] || cls;
+            // 用户已写好的正则 → 仅转义定界符 / 并剔除换行（保留反斜杠的 regex 语义）
+            // BUG-A11 修复：旧版 replace(/\//g, '\\/') 会把用户已转义的 \/ 二次转义为 \\/，
+            // 在 AdGuard :has-text(/.../) 中语义被破坏（反斜杠+结束定界符）。
+            // 用 (\\*)\/ 捕获连续反斜杠：奇数=已转义保留，偶数=未转义补 \/
+            // 正确处理 a/b→a\/b、a\/b→a\/b、a\\/b→a\\\/b、a\\\/b→a\\\/b
+            const escapeAdGuardRegex = (r) => String(r).replace(/[\r\n]+/g, '').replace(/(\\*)\//g, (m, bs) => bs.length % 2 === 1 ? m : bs + '\\/');
+            // 纯文本 → 转义全部 regex 元字符与定界符，用于嵌入 /.../ 字面量
+            const escapeRegexLiteral = (v) => String(v).replace(/[.*+?^${}()|[\]\\/]/g, '\\$&').replace(/[\r\n]+/g, '');
+
+            /**
+            * 把单条规则转换为 AdGuard 兼容文本（OR 模式可能返回多行，用 \n 分隔）
+            * 标记说明：
+            *   ##  = 普通元素隐藏（标准 CSS 选择器）
+            *   #?# = 扩展 CSS（含 :has-text / :not(:has-text) 等扩展伪类，AdGuard 强制要求此标记）
+            * 文本匹配统一用 :has-text()，它是 uBlock Origin 主用名、AdGuard 的 :contains() 同义词，兼容性最佳。
+            */
+            const convertRule = (rule, domain) => {
+                if (!rule || !rule.type || !isValidDomain(domain)) return null;
+                switch (rule.type) {
+                    case 'static':
+                        return rule.selector ? `${domain}##${rule.selector}` : null;
+                    case 'dynamic':
+                        return rule.className ? `${domain}##[class*="${escapeCssValue(firstClassToken(rule.className))}"]` : null;
+                    case 'attribute':
+                        return rule.attrSelector ? `${domain}##${rule.attrSelector}` : null;
+                    case 'structural':
+                        return rule.structSelector ? `${domain}##${rule.structSelector}` : null;
+                    case 'regex': {
+                        if (!rule.regex) return null;
+                        // contains 模式存储原始文本，导出为字面量 has-text(BUG-M7)
+                        if (rule.mode === 'contains') {
+                            return `${domain}#?#*:has-text("${escapeCssValue(rule.regex)}")`;
+                        }
+                        try { new RegExp(rule.regex); } catch (e) { return null; }
+                        const body = escapeAdGuardRegex(rule.regex);
+                        if (!body) return null;
+                        // 扩展 CSS 必须用 #?# 标记
+                        return `${domain}#?#*:has-text(/${body}/)`;
+                    }
+                    case 'pathPattern': {
+                        if (!rule.pattern) return null;
+                        const esc = escapeCssValue(rule.pattern);
+                        // 与脚本内 CSS 注入保持一致：同时隐藏资源元素及其直接父容器（解决横幅空白）
+                        // :has() 属于 AdGuard 扩展 CSS，需用 #?# 标记
+                        // 用 :is() 包裹逗号选择器组，确保 > 对每项生效，避免后代匹配过度隐藏
+                        const sel = `[href*="${esc}"], [src*="${esc}"], [data-src*="${esc}"]`;
+                        return `${domain}##${sel}\n${domain}#?#*:has(> :is(${sel}))`;
+                    }
+                    case 'complex': {
+                        if (!rule.conditions || rule.conditions.length === 0) return null;
+                        const andMode = rule.logic === 'AND';
+                        const simpleParts = [];
+                        const pseudoParts = [];
+                        let hasPositiveCondition = false; // 是否存在正向条件(contains/equals)，用于过滤纯 not_contains 规则(BUG-S5)
+                        rule.conditions.forEach(c => {
+                            if (c.type === 'class') {
+                                if (c.operator === 'contains' || c.operator === 'equals') { simpleParts.push(`[class*="${escapeCssValue(c.value)}"]`); hasPositiveCondition = true; }
+                                if (c.operator === 'not_contains') pseudoParts.push(`:not([class*="${escapeCssValue(c.value)}"])`);
+                            } else if (c.type === 'id') {
+                                if (c.operator === 'equals') { simpleParts.push(`[id="${escapeCssValue(c.value)}"]`); hasPositiveCondition = true; }
+                                else if (c.operator === 'contains') { simpleParts.push(`[id*="${escapeCssValue(c.value)}"]`); hasPositiveCondition = true; }
+                                else if (c.operator === 'not_contains') pseudoParts.push(`:not([id*="${escapeCssValue(c.value)}"])`);
+                            } else if (c.type === 'text') {
+                                if (c.operator === 'contains') { pseudoParts.push(`:has-text("${escapeCssValue(c.value)}")`); hasPositiveCondition = true; }
+                                if (c.operator === 'equals') { pseudoParts.push(`:has-text(/^\\s*${escapeRegexLiteral(c.value)}\\s*$/)`); hasPositiveCondition = true; }
+                                if (c.operator === 'not_contains') pseudoParts.push(`:not(:has-text("${escapeCssValue(c.value)}"))`);
+                            }
+                        });
+                        if (andMode) {
+                            // 纯 not_contains 条件无法限定范围：*:not(:has-text(...)) 会隐藏页面几乎所有元素(BUG-S5)
+                            if (!hasPositiveCondition) return null;
+                            if (!pseudoParts.length && !simpleParts.length) return null;
+                            const base = simpleParts.length ? `*${simpleParts.join('')}` : '*';
+                            const marker = pseudoParts.length > 0 ? '#?#' : '##';
+                            return `${domain}${marker}${base}${pseudoParts.join('')}`;
+                        } else {
+                            // OR 模式：not_contains 单独成行会匹配几乎所有元素，跳过 not_contains 条件(BUG-S5)
+                            return rule.conditions.filter(c => c.operator !== 'not_contains').map(c => {
+                                if (c.type === 'class') {
+                                    if (c.operator === 'contains') return `${domain}##*[class*="${escapeCssValue(c.value)}"]`;
+                                    if (c.operator === 'equals') return `${domain}##[class*="${escapeCssValue(c.value)}"]`;
+                                } else if (c.type === 'id') {
+                                    if (c.operator === 'equals') return `${domain}##[id="${escapeCssValue(c.value)}"]`;
+                                    if (c.operator === 'contains') return `${domain}##[id*="${escapeCssValue(c.value)}"]`;
+                                } else if (c.type === 'text') {
+                                    if (c.operator === 'contains') return `${domain}#?#*:has-text("${escapeCssValue(c.value)}")`;
+                                    if (c.operator === 'equals') return `${domain}#?#*:has-text(/^\\s*${escapeRegexLiteral(c.value)}\\s*$/)`;
+                                }
+                                return null;
+                            }).filter(Boolean).join('\n');
+                        }
+                    }
+                    default:
+                        return null;
+                }
+            };
+
+            allDomains.forEach(domain => {
+                // v2.0 用桶名（static/dynamic/...），v1.0 用存储键名（blocks/dynamicBlocks/...）
+                // 两种格式统一通过 Object.values 遍历所有桶，按域名提取规则
+                const rules = [];
+                for (const bucket in ruleBuckets) {
+                    const arr = ruleBuckets[bucket][domain];
+                    if (Array.isArray(arr)) rules.push(...arr);
+                }
+                if (rules.length === 0) return;
+                lines.push(`! ${domain}`);
+                rules.forEach(rule => {
+                    const converted = convertRule(rule, domain);
+                    if (converted) lines.push(converted);
+                });
+                lines.push('');
+            });
+
+            if (globalDomains.length) {
+                // 浏览器扩展版：$third-party 限定第三方请求，避免误杀同域资源
+                lines.push('! 全局域名拦截（AdGuard 浏览器扩展 / uBlock Origin）');
+                globalDomains.forEach(host => lines.push(`||${host}^$third-party`));
+                lines.push('');
+                // DNS 兼容版：AdGuard DNS 会忽略含未知修饰符的整条规则，故去掉 $third-party
+                lines.push('! 全局域名拦截（AdGuard DNS 兼容，无修饰符）');
+                globalDomains.forEach(host => lines.push(`||${host}^`));
+                lines.push('');
+            }
+
+            // ─── iframe 规则转换（§8.8 映射表） ───
+            const iframeRules = Array.isArray(raw.iframeRules) ? raw.iframeRules : [];
+            if (iframeRules.length > 0) {
+                lines.push('! iframe 拦截规则');
+                iframeRules.forEach(r => {
+                    if (!r || !r.matchType) return;
+                    if (r.matchType === 'srcDomain' && r.value) {
+                        // ||domain^$subdocument,third-party
+                        lines.push(`||${r.value}^$subdocument,third-party`);
+                    } else if (r.matchType === 'geometry' && r.value) {
+                        // 几何条件无法直接转 AdGuard，导出为注释说明
+                        lines.push(`! [iframe geometry] ${r.value}（AdGuard 不支持几何规则，需手动添加元素隐藏规则）`);
+                    } else if (r.matchType === 'srcdocKeyword' && r.value) {
+                        // AdGuard 不支持 srcdoc 匹配，导出为注释
+                        lines.push(`! [iframe srcdoc keyword] "${r.value}"（AdGuard 不支持 srcdoc 匹配）`);
+                    }
+                });
+                lines.push('');
+            }
+
+            return lines.join('\n');
         }
 
         return { evaluateRuleImpact, generateAdGuardRules, calcImpactScore, countMatches };
