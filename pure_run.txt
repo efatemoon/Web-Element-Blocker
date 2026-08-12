@@ -1,0 +1,3 @@
+BOOT_OK keys: VERSION, clamp, isVideoResource, isLive, isVisible, videoArea, getHost, VA_TUNING, VA_BUFFER, ConfigManager, ConfigSyncClass, SessionManager, CandidateArbiter, VideoSession, UIManager, RecoveryOrchestrator, Detector, Scheduler, Bus, FrameMesh, Logger, Storage, estimateBandwidth, tryPlay, scoreCandidate, normalizeConfig, mergeConfig, SessionState
+
+纯函数验证结果: 22/22 通过，全部通过 ✅

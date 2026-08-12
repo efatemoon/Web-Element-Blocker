@@ -119,6 +119,28 @@ function makeCandidate(over) {
     assert(arr.a === 1 && !Array.isArray(arr), `mergeConfig(数组) 被忽略`);
 })();
 
+// ── scoreCandidate 防御：tuning 缺失/不完整不得产出 NaN（隐藏脆弱性 P1）──
+(function () {
+    const T = VA.VA_TUNING;
+    const cand = makeCandidate({
+        context: {
+            area: 300000, visible: true, inViewport: true, hasSrc: true,
+            mediaUrl: true, blob: false, playing: true, duration: 600,
+            live: false, muted: false, loop: false, adLike: false
+        },
+        signals: { protoSrc: true, protoLoad: true, protoPlay: true, gesture: true }
+    });
+    // 空 tuning：曾返回 NaN（score += undefined），现应回退 VA_TUNING 得有限分
+    const empty = VA.scoreCandidate(cand, { minVideoArea: 0, profile: null, hasActiveSessions: false, tuning: {} });
+    assert(Number.isFinite(empty) && !Number.isNaN(empty), `空 tuning 不得返回 NaN (实得 ${empty})`);
+    // 部分 tuning（仅覆盖一个键）也应有限
+    const partial = VA.scoreCandidate(cand, { minVideoArea: 0, profile: null, hasActiveSessions: false, tuning: { GESTURE_BONUS: T.GESTURE_BONUS } });
+    assert(Number.isFinite(partial) && !Number.isNaN(partial), `部分 tuning 不得返回 NaN (实得 ${partial})`);
+    // 空 tuning 结果应与完整 tuning 一致（防御回退到 VA_TUNING 默认值）
+    const full = VA.scoreCandidate(cand, { minVideoArea: 0, profile: null, hasActiveSessions: false, tuning: T });
+    assert(empty === full, `空 tuning 应回退到 VA_TUNING 同分 (空 ${empty} vs 全 ${full})`);
+})();
+
 console.log(`\n纯函数验证结果: ${pass}/${pass + fail} 通过${fail ? '，失败 ' + fail + ' 项' : '，全部通过 ✅'}`);
 if (fail) {
     console.log('失败项:');

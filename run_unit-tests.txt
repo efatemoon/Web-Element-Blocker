@@ -1,0 +1,195 @@
+
+[1mclamp 工具函数[2m
+  [32m✓[0m clamp(5, 0, 10) === 5
+  [32m✓[0m 正常范围值
+  [32m✓[0m clamp(-5, 0, 10) === 0
+  [32m✓[0m 低于最小值
+  [32m✓[0m clamp(15, 0, 10) === 10
+  [32m✓[0m 高于最大值
+  [32m✓[0m clamp(NaN, 0, 10) === 0
+  [32m✓[0m NaN 输入返回下限
+  [32m✓[0m clamp(Infinity, 0, 10) === 10
+  [32m✓[0m clamp(-Infinity, 0, 10) === 0
+  [32m✓[0m Infinity 输入
+  [32m✓[0m clamp(0.1+0.2, 0, 1) ≈ 0.3
+  [32m✓[0m 浮点数精度
+  [32m✓[0m clamp(0, 0, 10) === 0
+  [32m✓[0m clamp(10, 0, 10) === 10
+  [32m✓[0m 相等边界
+
+[1misVideoResource[2m
+  [32m✓[0m mp4 URL 识别
+  [32m✓[0m mp4 文件
+  [32m✓[0m m3u8 URL 识别
+  [32m✓[0m m3u8 直播
+  [32m✓[0m mpd URL 识别
+  [32m✓[0m mpd DASH
+  [32m✓[0m TS 切片识别
+  [32m✓[0m TS 切片
+  [32m✓[0m webm URL 识别
+  [32m✓[0m webm 格式
+  [32m✓[0m 带查询参数识别
+  [32m✓[0m 带查询参数
+  [32m✓[0m PNG 不被识别
+  [32m✓[0m 非视频 URL
+  [32m✓[0m 空字符串不被识别
+  [32m✓[0m 空字符串
+  [32m✓[0m null 不被识别
+  [32m✓[0m null 输入
+  [32m✓[0m JS 不被识别
+  [32m✓[0m JS/CSS 文件
+  [32m✓[0m mp3 不应识别
+  [32m✓[0m 音频 mp3 不应被识别为视频
+  [32m✓[0m aac 不应识别
+  [32m✓[0m 音频 aac 不应被识别为视频
+
+[1misLive[2m
+  [32m✓[0m 直播识别
+  [32m✓[0m 直播视频 (Infinity)
+  [32m✓[0m 普通视频不识别
+  [32m✓[0m 普通视频
+  [32m✓[0m null 返回 false
+  [32m✓[0m null 输入
+  [32m✓[0m undefined 返回 false
+  [32m✓[0m undefined 输入
+  [32m✓[0m 空对象返回 false
+  [32m✓[0m 空对象
+  [32m✓[0m 异常 getter 返回 false
+  [32m✓[0m getter 抛异常
+
+[1mestimateBandwidth[2m
+  [32m✓[0m 返回正带宽: 4000000000
+  [32m✓[0m 正常情况返回正数
+  [32m✓[0m 空 entries 返回 0
+  [32m✓[0m 空 entries 返回 0
+  [32m✓[0m duration=0 返回 0
+  [32m✓[0m duration 为 0 时返回 0（除零保护）
+  [32m✓[0m null perf 返回 0
+  [32m✓[0m null perf 返回 0
+  [32m✓[0m 非视频资源被过滤
+  [32m✓[0m 非 video 资源被过滤
+
+[1mSessionState 字符串一致性[2m
+  [32m✓[0m SessionState.FAILED === "failed"
+  [32m✓[0m FAILED 常量与字符串一致
+  [32m✓[0m SessionState.RECOVERING === "recovering"
+  [32m✓[0m RECOVERING 常量与字符串一致
+  [32m✓[0m 所有 SessionState 值都是字符串
+  [32m✓[0m 所有状态值都是字符串
+
+[1m_healthScore[2m
+  [32m✓[0m 正常播放得分 >= 80: 85
+  [32m✓[0m 正常播放应得高分
+  [32m✓[0m 卡顿得分 < 70: 50
+  [32m✓[0m 卡顿时应扣分
+  [32m✓[0m 失败状态得分 <= 30: 0
+  [32m✓[0m 失败状态应扣分
+  [32m✓[0m 高分不超 100: 85
+  [32m✓[0m 低分不低于 0: 0
+  [32m✓[0m 极端情况不越界
+
+[1m_fmtTime[2m
+  [32m✓[0m fmtTime(125) === "2:05"
+  [32m✓[0m 正常时间
+  [32m✓[0m fmtTime(45) === "0:45"
+  [32m✓[0m 不足 60 秒
+  [32m✓[0m fmtTime(0) === "--:--"
+  [32m✓[0m 0 秒返回默认
+  [32m✓[0m fmtTime(-10) === "--:--"
+  [32m✓[0m 负数返回默认
+  [32m✓[0m fmtTime(NaN) === "--:--"
+  [32m✓[0m NaN 返回默认
+  [32m✓[0m fmtTime(3661) === "61:01"
+  [32m✓[0m 大时间
+
+[1mtryPlay[2m
+  [32m✓[0m null 输入不抛异常
+  [32m✓[0m null 输入不抛异常
+  [32m✓[0m undefined 输入不抛异常
+  [32m✓[0m undefined 输入不抛异常
+  [32m✓[0m 无 play 方法不抛异常
+  [32m✓[0m 无 play 方法的对象
+  [32m✓[0m play 返回 Promise 不阻塞
+  [32m✓[0m play 返回 Promise 不阻塞
+
+[1mConfigManager[2m
+  [32m✓[0m defaults 包含所有 26 个必需键
+  [32m✓[0m defaults 包含所有必需键
+  [32m✓[0m bufferTarget 默认值在范围内
+  [32m✓[0m seekTimeout 默认值在范围内
+  [32m✓[0m recoveryBudget 默认值在范围内
+  [32m✓[0m normalize 边界约束
+
+[1mCandidateArbiter score[2m
+  [32m✓[0m 手势+播放+可见 = 57 >= 50
+  [32m✓[0m 手势信号应获得高分
+  [32m✓[0m 广告视频得分 < 0: -80
+  [32m✓[0m 广告视频应被低分
+  [32m✓[0m 短 muted loop 视频得分 < 0: -18
+  [32m✓[0m 短 muted loop 视频应被低分
+
+[1mSessionManager _collectLocalState[2m
+  [32m✓[0m 空状态 statusKey 为 idle
+  [32m✓[0m 空状态 videos 为 0
+  [32m✓[0m 无会话时返回默认状态
+
+[1misVisible[2m
+  [32m✓[0m null 返回 false
+  [32m✓[0m null 输入
+  [32m✓[0m 空对象返回 false
+  [32m✓[0m 无 isConnected
+  [32m✓[0m display:none 返回 false
+  [32m✓[0m display:none
+  [32m✓[0m visibility:hidden 返回 false
+  [32m✓[0m visibility:hidden
+  [32m✓[0m opacity=0 返回 false
+  [32m✓[0m opacity=0
+
+[1mConfigManager _applyPatch[2m
+  [32m✓[0m _applyPatch(emit=true) 触发 CONFIG_CHANGE
+  [32m✓[0m _applyPatch(emit=false) 不触发 CONFIG_CHANGE
+  [32m✓[0m update 与 silentUpdate 应共享相同逻辑
+
+[1m_flushSettings 守卫[2m
+  [32m✓[0m _synced=false 时不 flush
+  [32m✓[0m _synced=true 时正常 flush
+  [32m✓[0m _synced=false 时 flush 应提前返回
+
+[1mtryPlay autoplay 阻止时设置 _playedOnce[2m
+  [32m✓[0m play throw 时 _playedOnce 应设为 true
+  [32m✓[0m play() throw 时 _playedOnce 应设为 true
+  [32m✓[0m play() Promise rejected 时 _playedOnce 应设为 true（微任务等待）
+  [32m✓[0m play throw 时 _playedOnce 应设为 true
+  [32m✓[0m play() throw 时 _playedOnce 应设为 true
+  [32m✓[0m _playedOnce=true 时不应再次自动播放
+  [32m✓[0m _playedOnce=true 后 _maybeAutoPlay 不应再尝试
+
+[1mcheckbox change vs input 事件[2m
+  [32m✓[0m input 事件读到旧值 false
+  [32m✓[0m checkbox input 事件在 checked 更新前触发
+  [32m✓[0m change 事件读到新值 true
+  [32m✓[0m checkbox change 事件读到新 checked 值
+
+[1mCandidateArbiter SessionManager 引用[2m
+  [32m✓[0m SessionManager 未定义时不降权
+  [32m✓[0m SessionManager 未定义时 score 不应抛错
+
+[1mVA_BUFFER 常量引用[2m
+  [32m✓[0m VA_BUFFER 包含 TIMELINE_RENDER_THROTTLE_MS
+  [32m✓[0m VA_TUNING 不包含 TIMELINE_RENDER_THROTTLE_MS
+  [32m✓[0m TIMELINE_RENDER_THROTTLE_MS 应定义在 VA_BUFFER 中
+  [32m✓[0m VA_BUFFER.LOG_LINE_LIMIT = 200
+  [32m✓[0m LOG_LINE_LIMIT 应定义在 VA_BUFFER 中
+
+============================================================
+[1mvideo-accelerator.user.js 单元测试套件[2m
+============================================================
+  [32m✓[0m clamp(NaN) 边界
+  [32m✓[0m mp4 URL
+  [32m✓[0m PNG not video
+  [32m✓[0m empty string
+
+============================================================
+[1m测试结果: 150/150 通过[2m
+============================================================
+

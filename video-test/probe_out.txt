@@ -1,0 +1,18 @@
+﻿BOOT_OK keys: VERSION, clamp, isVideoResource, isLive, isVisible, videoArea, getHost, VA_TUNING, VA_BUFFER, ConfigManager, ConfigSyncClass, SessionManager, CandidateArbiter, VideoSession, UIManager, RecoveryOrchestrator, Detector, Scheduler, Bus, FrameMesh, Logger, Storage, estimateBandwidth, tryPlay, scoreCandidate, normalizeConfig, mergeConfig, SessionState
+
+=== P1 scoreCandidate tuning missing keys ===
+empty tuning score = NaN isNaN? true
+full tuning score = 169 isNaN? false
+
+=== P2 scoreCandidate ctx partially undefined ===
+partial ctx score = 20 isNaN? false
+
+=== P3 normalizeConfig malicious / out-of-range ===
+bufferTarget= 10 recoveryBudget= 20 minVideoArea= 0 logLevel= info autoPlay= false watchdog= true extraKey= keep
+proto polluted? undefined
+
+=== P4 Recovery budget cap (decode) ===
+budget = 8 canAttempt at cap+1 = false
+
+=== P5 decode recovery while RECOVERING ===
+_canAttemptDecode while RECOVERING = true

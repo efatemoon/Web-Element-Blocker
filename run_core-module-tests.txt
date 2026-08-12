@@ -1,0 +1,78 @@
+
+[1mSessionState 常量一致性[2m
+  [32m✓[0m SessionState.FAILED === "failed"
+  [32m✓[0m FAILED 值应为 "failed"
+  [32m✓[0m SessionState.RECOVERING === "recovering"
+  [32m✓[0m RECOVERING 值应为 "recovering"
+  [32m✓[0m 所有 SessionState 值都是字符串
+  [32m✓[0m 所有值都是字符串类型
+
+[1mVideoSession 状态转换[2m
+  [32m✓[0m 初始状态为 ATTACHED
+  [32m✓[0m 初始状态应为 ATTACHED
+  [32m✓[0m 播放后状态为 ACTIVE
+  [32m✓[0m 播放中应转换为 ACTIVE
+  [32m✓[0m 卡顿时状态为 DEGRADED
+  [32m✓[0m 卡顿应转换为 DEGRADED
+  [32m✓[0m 恢复后状态为 ACTIVE
+  [32m✓[0m 恢复后应从 DEGRADED 回到 ACTIVE
+  [32m✓[0m 恢复超时后状态为 FAILED
+  [32m✓[0m 恢复超时应转换为 FAILED
+  [32m✓[0m 用户暂停后状态为 USER_PAUSED
+  [32m✓[0m 用户暂停应转换为 USER_PAUSED
+  [32m✓[0m 页面隐藏后状态为 DORMANT
+  [32m✓[0m 页面隐藏应从 ACTIVE 转换为 DORMANT
+  [32m✓[0m 重新可见后状态为 ACTIVE
+  [32m✓[0m DORMANT 重新可见应回到 ACTIVE
+  [32m✓[0m 销毁后状态为 DESTROYED
+  [32m✓[0m destroy 后状态应为 DESTROYED
+
+[1mRecoveryOrchestrator 预算逻辑[2m
+  [32m✓[0m 初始预算 count 为 0
+  [32m✓[0m 初始预算 count 应为 0
+  [32m✓[0m 记录后 count 为 1
+  [32m✓[0m 记录一次恢复后 count 应 +1
+  [32m✓[0m L1 冷却至少 2000ms
+  [32m✓[0m cooldownUntil 应设置为当前时间 + 冷却时长
+  [32m✓[0m 超过 60s 的 timestamp 被过滤
+  [32m✓[0m timestamp 超过 60s 应被过滤
+  [32m✓[0m timestamp 数量 >= 3 阻止恢复
+  [32m✓[0m timestamp 数量 >= 3 时应阻止恢复
+
+[1mSessionManager 会话管理[2m
+  [32m✓[0m 空 Set size 为 0
+  [32m✓[0m 空 sessions Set 的 size 应为 0
+  [32m✓[0m 空 Set hasActiveSessions 为 false
+  [32m✓[0m hasActiveSessions 在空 Set 时应返回 false
+  [32m✓[0m 有会话时 hasActiveSessions 为 true
+  [32m✓[0m 有会话时 hasActiveSessions 应返回 true
+
+[1mScheduler 可见性管理[2m
+  [32m✓[0m 初始 hidden 为 false
+  [32m✓[0m 初始 hidden 应为 false
+  [32m✓[0m 设置 hidden 后 isHidden 为 true
+  [32m✓[0m setHidden(true) 后 isHidden 应返回 true
+  [32m✓[0m 设置 visible 后 isHidden 为 false
+  [32m✓[0m setHidden(false) 后 isHidden 应返回 false
+
+[1mestimateBandwidth 缓存逻辑[2m
+  [32m✓[0m 首次调用返回正带宽
+  [32m✓[0m 首次调用应返回计算值
+  [32m✓[0m 5 秒内返回缓存值
+  [32m✓[0m 5 秒内重复调用应返回缓存值
+
+============================================================
+[1mvideo-accelerator.user.js 核心模块测试[2m
+============================================================
+
+测试结果: 50/50 通过
+============================================================
+
+
+[1m补充测试：_patrol DOC 空值保护 + error 事件 bubbling[2m
+  [32m✓[0m DOC 在 Node.js 环境中为 undefined（测试环境预期）
+  [32m✓[0m error 事件应使用 bubbling 阶段（非 capture）
+  [32m✓[0m visibleOnly 跳过时 video 应加入 seen
+
+补充测试: 3/3 通过
+  PASS tryPlay throw 设置 _playedOnce

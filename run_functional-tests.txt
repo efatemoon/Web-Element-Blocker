@@ -1,0 +1,106 @@
+BOOT_OK keys: VERSION, clamp, isVideoResource, isLive, isVisible, videoArea, getHost, VA_TUNING, VA_BUFFER, ConfigManager, ConfigSyncClass, SessionManager, CandidateArbiter, VideoSession, UIManager, RecoveryOrchestrator, Detector, Scheduler, Bus, FrameMesh, Logger, Storage, estimateBandwidth, tryPlay, scoreCandidate, normalizeConfig, mergeConfig, SessionState
+
+■ 1. 纯函数 clamp / isVideoResource / isLive / isVisible / videoArea / getHost
+  ✓ clamp 正常值
+  ✓ clamp 低于下限
+  ✓ clamp 高于上限
+  ✓ clamp NaN → 下限(安全)
+  ✓ clamp 非数字 → 下限
+  ✓ isVideoResource 命中 seg
+  ✓ isVideoResource 命中 .mp4
+  ✓ isVideoResource 非视频
+  ✓ isVideoResource 空串
+  ✓ isVideoResource null
+  ✓ isLive Infinity
+  ✓ isLive 有限时长
+  ✓ isLive null 安全
+  ✓ isVisible display:none → false
+  ✓ isVisible opacity:0 → false
+  ✓ isVisible 默认可见(已挂载, opacity:1) → true
+  ✓ videoArea 100×80 = 8000
+  ✓ getHost 解析
+  ✓ getHost 绝对非法 URL → 空串(安全)
+
+■ 2. ConfigManager._mergeConfig（原型污染防御 / null 处理）
+  ✓ _mergeConfig 合并普通键
+  ✓ __proto__ 注入被剥离，原型未被污染
+  ✓ constructor 注入被剥离
+  ✓ override=null 返回 base 副本
+  ✓ _mergeConfig null 不抛
+
+■ 3. ConfigManager._normalize（clamp / bool / 0 / minVideoArea / logLevel）
+  ✓ bufferTarget 超上限→300
+  ✓ minPreBuffer 低于下限→1
+  ✓ seekTimeout 低于下限→2000
+  ✓ recoveryBudget 超上限→20
+  ✓ minVideoArea=0 被保留（不被吞）
+  ✓ logLevel 非法→info 白名单回退
+  ✓ autoPlay 0 → false(!!0)
+  ✓ qualityManage "yes" → true
+
+■ 4. ConfigManager 导入导出（importJSON / applyRemote / set / save / load）
+  ✓ importJSON 合法对象→true
+  ✓ importJSON 后 minVideoArea=0 保留
+  ✓ importJSON 后 bufferTarget=120
+  ✓ importJSON 数组被拒绝
+  ✓ importJSON 非法 JSON 被拒绝(不抛)
+  ✓ importJSON 含 __proto__ 仍成功
+  ✓ importJSON 未污染原型
+  ✓ applyRemote 应用对象
+  ✓ applyRemote 数组被忽略(不修改)
+  ✓ set/get 往返
+  ✓ save 已持久化到 Storage
+
+■ 5. estimateBandwidth（无资源返回数字 / 不抛）
+  ✓ estimateBandwidth 返回有限数字(jsdom 下为 0)
+  ✓ estimateBandwidth 无资源条目→0
+
+■ 6. SessionManager.hasActiveSessions（C2 修复守卫）
+  ✓ 初始无活动会话→false
+  ✓ 加入会话后→true
+  ✓ 移除后→false
+
+■ 7. CandidateArbiter.score（评分算法 + 会话惩罚守卫）
+  ✓ 清晰视频候选评分 = 137（实得 137）
+  ✓ 对照：当前无活动会话
+  ✓ 无活动会话时不扣分
+  ✓ 有活动会话且无 gesture → 扣 25（C2 守卫生效，实得 112）
+  ✓ 会话移除后清空
+  ✓ 有活动会话但 gesture=true → 不扣分且加 gesture 奖励（实得 162）
+
+■ 8. CandidateArbiter._evaluate（评估 + 断连过滤）
+  ✓ 在线候选被评估(lastEvaluatedAt 已设)
+  ✓ 在线候选 score 为有限数字
+  ✓ 断连候选已从 queue 移除（防泄漏）
+
+■ 9. UIManager._flushSettings（minVideoArea=0 端到端保留，验证修复）
+  ✓ minVideoArea=0 经 _flushSettings 后保留（修复生效）
+  ✓ bufferTarget=120 正确写入
+  ✓ checkbox autoPlay 正确写入
+
+■ 10. Detector 扫描优化（浅扫跳过 shadowRoot 全量查询）
+  ✓ 深扫：直接 <video> 被发现
+  ✓ 深扫：shadowRoot 内 <video> 被发现（深扫生效）
+  ✓ 浅扫：直接 <video> 仍被发现（主功能不受影响）
+  ✓ 浅扫：shadowRoot 内 <video> 被正确跳过（优化生效，避免整页全量查询）
+  ✓ 巡逻节奏：第 1、6 次为深扫
+  ✓ 巡逻节奏：其余为浅扫
+
+■ 11. RecoveryOrchestrator 恢复预算/冷却门禁（关掉"双恢复路径"真 bug 入口的安全网）
+  ✓ 预算耗尽(count>=8) → _canAttempt 返回 false
+  ✓ 冷却中(cooldownUntil 未来) → _canAttempt 返回 false
+  ✓ 60s 内 3 次时间戳 → _canAttempt 返回 false（节流）
+  ✓ _userPaused → _canAttempt 返回 false
+  ✓ 健康会话(watchdog 开、无冷却、未暂停) → _canAttempt 返回 true
+  ✓ watchdog 关闭 → _canAttempt 返回 false
+
+■ 12. 解码错误恢复收敛（_onError → RecoveryOrchestrator 单一预算闸门）
+  ✓ 解码错误受预算约束(≤8次 emergencyLoad，防无限重试)
+  ✓ _userPaused → 解码错误不恢复
+  ✓ 解码错误 60s 内 3 次 → 节流阻止
+  ✓ 状态 FAILED → 放弃解码恢复
+  ✓ 健康解码错误会话 → 允许恢复（基线）
+
+═══════════════════════════════════════════
+功能验证结果: 77/77 通过，全部通过 ✅
+═══════════════════════════════════════════

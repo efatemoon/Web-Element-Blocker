@@ -286,3 +286,18 @@ class DOMObserver {
 **门禁**：语法 ✅ ｜ 单元 150/150 ｜ 核心 55/55 ｜ 功能 77/77（+5 组12）｜ 纯函数 19/19 ＝ **301 全绿**。
 
 **剩余（维持原策略，需真实浏览器验证）**：阶段 4 类级拆分、阶段 5 UI 拆分、阶段 6 DI 启动；jsdom 无法覆盖真实视频卡顿/解码恢复与 UI 渲染，盲改会引入测不出的回归，故未动。
+
+### 10.4 二次审查（架构符合性 + 隐藏脆弱性探针实测）
+按同纪律，对照本方案 §10 进度表做「架构符合性核查」+「隐藏问题探针实测」：
+
+**架构符合性**：阶段 1（纯函数）/ 2（ConfigSync）/ 3（MutationObserver）/ 4（双路径收敛）均已落地且满足契约；阶段 5/6 维持暂缓，与 §10 进度表一致，无偏离。
+
+**探针实测（jsdom 加载真实文件后直接驱动）发现的 1 项隐藏脆弱性（已修复）**
+- **`scoreCandidate` 在 `deps.tuning` 不完整时返回 NaN（P1）**：`score += T.GESTURE_BONUS` 等项在 `T` 缺失键时为 `score += undefined` → 整分变为 NaN，污染候选排序/激活。正常路径传完整 `VA_TUNING` 不触发，但属真实脆弱性（任何不完整 tuning 调用即失效）。修复：`const T = Object.assign({}, VA_TUNING, deps.tuning || {})`，缺失键回退默认值，行为对完整 tuning 完全等价；并新增纯函数测试验证「空 tuning / 部分 tuning 均不返回 NaN 且等于完整 tuning 同分」。
+
+**探针实测确认正确的点（未改）**
+- `normalizeConfig`：负数/超大值正确 clamp（bufferTarget -5→10、recoveryBudget 999→20、minVideoArea -100→0）、`logLevel` 非法回退 `info`、`boolKeys` 用 `!!` 归一、`__proto__`/`constructor` 注入被剥离（原型未污染）。
+- `RecoveryOrchestrator` 预算上界：`count >= recoveryBudget` 时 `_canAttemptDecode` 返回 false（实测 8→false），冷却与 60s 内 3 次节流生效。
+- 解码错误恢复在 `RECOVERING` 态仍允许属**有意设计**（解码错误比 stall 更严重，且共用预算+冷却限流），非 bug。
+
+**门禁**：语法 ✅ ｜ 单元 150/150 ｜ 核心 53/53 ｜ 功能 77/77 ｜ 纯函数 22/22 ＝ **302 全绿**（较 §10.3 的 301 增 1，因纯函数数值防御测试 +3、核心补充测试重计为 53）。

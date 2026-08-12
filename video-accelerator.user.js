@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.0.3
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -1828,7 +1828,9 @@
         const v = c.video;
         const ctx = c.context;
         const sig = c.signals;
-        const T = deps.tuning;
+        // 防御：tuning 缺失/不完整时回退到默认 VA_TUNING，避免 score += undefined 产生 NaN
+        // （NaN 会污染整分、破坏候选排序）。调用方传入部分覆盖键仍生效。
+        const T = Object.assign({}, VA_TUNING, deps.tuning || {});
 
         let score = 0;
 

@@ -1,0 +1,5 @@
+LOADER_OK keys=vaExports,win,store,dom
+win=object scoreCandidate=function makeCandidate-dep
+video_ok=true isConnected=true
+scoreCandidate(full)=150
+scoreCandidate(empty)=150 isNaN=false
