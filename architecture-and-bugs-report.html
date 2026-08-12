@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>web-element-blocker 架构分析与隐藏 Bug 修复报告</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#161c24; --panel2:#1c2430; --line:#2a3440;
+    --txt:#e6edf3; --mut:#9aa7b4; --acc:#4aa3ff; --ok:#3fbf6f; --warn:#e0a53a; --bad:#e2585b;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;padding:28px;}
+  h1{font-size:20px;margin:0 0 6px;font-weight:600;}
+  h2{font-size:16px;margin:30px 0 10px;font-weight:600;border-left:3px solid var(--acc);padding-left:10px;}
+  p{color:var(--txt);font-size:13.5px;}
+  .sub{color:var(--mut);font-size:13px;margin:2px 0 18px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0;overflow:auto;}
+  svg{display:block;max-width:100%;height:auto;margin:8px auto;}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin:8px 0;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:var(--panel2);color:var(--txt);font-weight:600;}
+  tr:nth-child(even){background:rgba(255,255,255,0.02);}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:6px;margin:1px 2px;font-weight:600;}
+  .t-high{background:rgba(226,88,91,.18);color:#ff8a8c;border:1px solid rgba(226,88,91,.4);}
+  .t-mid{background:rgba(224,165,58,.16);color:#f0c069;border:1px solid rgba(224,165,58,.4);}
+  .t-low{background:rgba(63,191,111,.14);color:#7fe0a0;border:1px solid rgba(63,191,111,.4);}
+  .t-fixed{background:rgba(74,163,255,.16);color:#8fc6ff;border:1px solid rgba(74,163,255,.4);}
+  code{background:var(--panel2);padding:1px 6px;border-radius:5px;font-size:12px;color:#cfe3ff;}
+  .legend{font-size:11.5px;color:var(--mut);margin-top:6px;}
+  .legend span{display:inline-block;margin-right:14px;}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px;vertical-align:middle;}
+</style>
+</head>
+<body>
+<h1>web-element-blocker.user.js — 架构分析与隐藏 Bug 修复报告</h1>
+<p class="sub">依据 9 个菜单项（MENU_ITEMS）梳理整体架构，结合架构定位交互 / 展示 / 隐藏逻辑 Bug，并逐个修复。</p>
+
+<div class="card">
+<p style="margin-top:0"><b>本次新增修复（结合架构审查发现）：</b></p>
+<table>
+<tr><th style="width:90px">编号</th><th style="width:90px">级别</th><th>问题</th><th style="width:90px">状态</th></tr>
+<tr><td>Bug-X1</td><td><span class="tag t-high">HIGH</span></td><td><b>iframe 选择监听泄漏</b>：选择模式进入同源 iframe 时，在 <code>iframe.contentDocument</code> 上注册的 9 个 capture 监听从未被 <code>stopSelection</code> 注销（原只注销主文档），导致离开选择模式后该 iframe 内点击被永久 <code>preventDefault</code> 拦截、且重复进入会累积监听。</td><td><span class="tag t-fixed">已修复</span></td></tr>
+<tr><td>Bug-X2</td><td><span class="tag t-mid">MED</span></td><td><b>覆盖层重扫清空勾选</b>：点击「重新扫描 / 深度扫描」后 <code>selectedSet</code> 被重置，用户已手动勾选的元素丢失，需重新勾选。</td><td><span class="tag t-fixed">已修复</span></td></tr>
+<tr><td>Bug-X3</td><td><span class="tag t-low">LOW</span></td><td><b>域名大小写漏过滤</b>：<code>GlobalDomainPanel</code> 读取已封杀域名未统一小写，存储域名含大写时会「已封杀域名」又出现在可选列表（误导）。</td><td><span class="tag t-fixed">已修复</span></td></tr>
+</table>
+<p style="margin-bottom:0;color:var(--mut)"><b>前序会话已修复：</b> 管理面板删除撤销 LIFO 错乱（manager undo）；iframe 元素级拦截未持久化（storage 引用缺失 + 刷新后未 reapply）。</p>
+</div>
+
+<h2>1. 整体分层架构</h2>
+<div class="card">
+<svg viewBox="0 0 680 760" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="分层架构图">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#4aa3ff" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <style>
+    .b{fill:#1c2430;stroke:#3a4654;stroke-width:1;}
+    .bt{fill:#e6edf3;font:500 12.5px sans-serif;text-anchor:middle;}
+    .bs{fill:#9aa7b4;font:400 11px sans-serif;text-anchor:middle;}
+    .grp{fill:#10161d;stroke:#2a3440;stroke-width:1;rx:14;}
+    .gt{fill:#7fb6ff;font:600 11px sans-serif;}
+    .ln{stroke:#4aa3ff;stroke-width:1.3;fill:none;}
+  </style>
+
+  <!-- L0 entry -->
+  <rect class="b" x="210" y="34" width="260" height="42" rx="9"/>
+  <text class="bt" x="340" y="52">用户脚本入口 (Tampermonkey)</text>
+  <text class="bs" x="340" y="68">GM 菜单 · 9 项 · 页面 DOM 监听</text>
+
+  <!-- L1 coordinator -->
+  <rect class="b" x="180" y="104" width="320" height="52" rx="10"/>
+  <text class="bt" x="340" y="126">UIManager 协调器</text>
+  <text class="bs" x="340" y="143">Shadow DOM 隔离 · 面板调度 · 预览/横幅 · clearPanel 清理</text>
+  <line class="ln" x1="340" y1="76" x2="340" y2="102" marker-end="url(#ar)"/>
+
+  <!-- L2 panels group: 3x3 = 9 面板 -->
+  <rect class="grp" x="40" y="186" width="600" height="138" rx="14"/>
+  <text class="gt" x="54" y="206">9 个面板函数（PanelRegistry 分派，OCP 接缝）</text>
+  <g font-size="11px">
+    <rect class="b" x="58" y="216" width="172" height="32" rx="7"/><text class="bs" x="144" y="236">选择模式 SelectionPanel</text>
+    <rect class="b" x="254" y="216" width="172" height="32" rx="7"/><text class="bs" x="340" y="236">规则面板 RegexPanel</text>
+    <rect class="b" x="450" y="216" width="172" height="32" rx="7"/><text class="bs" x="536" y="236">域名检索 GlobalDomainPanel</text>
+    <rect class="b" x="58" y="256" width="172" height="32" rx="7"/><text class="bs" x="144" y="276">覆盖层 OverlayScanPanel</text>
+    <rect class="b" x="254" y="256" width="172" height="32" rx="7"/><text class="bs" x="340" y="276">管理面板 ManagerPanel</text>
+    <rect class="b" x="450" y="256" width="172" height="32" rx="7"/><text class="bs" x="536" y="276">iframe 防线 IframePanel</text>
+    <rect class="b" x="58" y="296" width="172" height="32" rx="7"/><text class="bs" x="144" y="316">导出 ExportPanel</text>
+    <rect class="b" x="254" y="296" width="172" height="32" rx="7"/><text class="bs" x="340" y="316">AdGuard 导出 AdGuardExportPanel</text>
+    <rect class="b" x="450" y="296" width="172" height="32" rx="7"/><text class="bs" x="536" y="316">导入 ImportPanel</text>
+  </g>
+  <line class="ln" x1="340" y1="156" x2="340" y2="184" marker-end="url(#ar)"/>
+
+  <!-- L3 service ports -->
+  <rect class="grp" x="40" y="338" width="600" height="86" rx="14"/>
+  <text class="gt" x="54" y="358">服务端口层（DIP 接缝 · 不直接触达引擎/存储）</text>
+  <rect class="b" x="58" y="368" width="172" height="40" rx="7"/><text class="bs" x="144" y="389">StorageService（Proxy 写入端口）</text>
+  <rect class="b" x="254" y="368" width="172" height="40" rx="7"/><text class="bs" x="340" y="389">DomainBlockExecutor（域名封杀）</text>
+  <rect class="b" x="450" y="368" width="172" height="40" rx="7"/><text class="bs" x="536" y="389">RuleDomain / OverlayService / EventBus</text>
+
+  <!-- L4 engines -->
+  <rect class="grp" x="40" y="444" width="600" height="108" rx="14"/>
+  <text class="gt" x="54" y="464">引擎层（无状态计算 / 扫描 / 分类）</text>
+  <rect class="b" x="58" y="474" width="172" height="40" rx="7"/><text class="bs" x="144" y="495">BlockEngine（hide/selector/reapply）</text>
+  <rect class="b" x="254" y="474" width="172" height="40" rx="7"/><text class="bs" x="340" y="495">IframeGuard + FrameDetector</text>
+  <rect class="b" x="450" y="474" width="172" height="40" rx="7"/><text class="bs" x="536" y="495">OverlayScanEngine / GDS</text>
+  <rect class="b" x="450" y="522" width="172" height="22" rx="7"/><text class="bs" x="536" y="537">SelectorBuilder / GlobalDomainScanner</text>
+
+  <!-- L5 storage -->
+  <rect class="b" x="180" y="578" width="320" height="46" rx="10"/>
+  <text class="bt" x="340" y="600">StorageManager（GM_getValue/setValue）</text>
+  <text class="bs" x="340" y="616">规则 JSON · 域名黑名单 · iframe 规则 · 配置</text>
+
+  <!-- L6 page -->
+  <rect class="b" x="210" y="652" width="260" height="40" rx="9"/>
+  <text class="bt" x="340" y="676">目标页面 DOM / iframe 文档</text>
+
+  <!-- vertical connectors -->
+  <line class="ln" x1="340" y1="338" x2="340" y2="336" marker-end="url(#ar)"/>
+  <line class="ln" x1="200" y1="424" x2="200" y2="442" marker-end="url(#ar)"/>
+  <line class="ln" x1="540" y1="424" x2="540" y2="442" marker-end="url(#ar)"/>
+  <line class="ln" x1="144" y1="408" x2="144" y2="442" marker-end="url(#ar)"/>
+  <line class="ln" x1="340" y1="552" x2="340" y2="576" marker-end="url(#ar)"/>
+  <line class="ln" x1="340" y1="624" x2="340" y2="650" marker-end="url(#ar)"/>
+  <text class="bs" x="350" y="396" style="text-anchor:start;fill:#7fb6ff">面板 → 端口</text>
+  <text class="bs" x="350" y="502" style="text-anchor:start;fill:#7fb6ff">端口 → 引擎</text>
+  <text class="bs" x="350" y="600" style="text-anchor:start;fill:#7fb6ff">引擎 → 存储</text>
+</svg>
+<div class="legend">
+  <span><span class="dot" style="background:#1c2430;border:1px solid #3a4654"></span>组件</span>
+  <span><span class="dot" style="background:#10161d;border:1px solid #2a3440"></span>分层容器</span>
+  <span><span class="dot" style="background:#4aa3ff"></span>依赖/调用方向</span>
+</div>
+</div>
+
+<h2>2. 关键交互流程（结合架构）</h2>
+
+<h3 style="color:var(--txt);font-size:14px;margin:18px 0 4px">2.1 选择模式 → 拦截 → 持久化（修复点 Bug-X1）</h3>
+<div class="card">
+<svg viewBox="0 0 680 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="选择拦截流程">
+  <defs><marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#3fbf6f" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+  <style>.b2{fill:#1c2430;stroke:#3a4654;stroke-width:1;} .t2{fill:#e6edf3;font:500 11.5px sans-serif;text-anchor:middle;} .s2{fill:#9aa7b4;font:400 10.5px sans-serif;text-anchor:middle;} .ln2{stroke:#3fbf6f;stroke-width:1.3;fill:none;} .bad{fill:#e2585b;}</style>
+  <rect class="b2" x="20" y="30" width="150" height="44" rx="8"/><text class="t2" x="95" y="48">用户点击元素</text><text class="s2" x="95" y="64">_handleClick (capture)</text>
+  <rect class="b2" x="200" y="30" width="160" height="44" rx="8"/><text class="t2" x="280" y="48">showActionPanel</text><text class="s2" x="280" y="64">缩放/域名勾选/预览</text>
+  <rect class="b2" x="390" y="30" width="160" height="44" rx="8"/><text class="t2" x="470" y="48">btn-domain / btn-static</text><text class="s2" x="470" y="64">StorageService.addRule</text>
+  <rect class="b2" x="570" y="30" width="92" height="44" rx="8"/><text class="t2" x="616" y="48">持久化</text><text class="s2" x="616" y="64">GM 存储</text>
+  <line class="ln2" x1="170" y1="52" x2="198" y2="52" marker-end="url(#ar2)"/>
+  <line class="ln2" x1="360" y1="52" x2="388" y2="52" marker-end="url(#ar2)"/>
+  <line class="ln2" x1="550" y1="52" x2="568" y2="52" marker-end="url(#ar2)"/>
+  <!-- stopSelection cleanup row -->
+  <rect class="b2" x="200" y="150" width="300" height="48" rx="8" stroke="#3a4654"/>
+  <text class="t2" x="350" y="170" style="fill:#ff8a8c">clearPanel / stopSelection 清理</text>
+  <text class="s2" x="350" y="188">_untrackDocAll 注销主文档 + iframe 文档监听（X1 修复后）</text>
+  <line class="ln2" x1="280" y1="74" x2="300" y2="148" marker-end="url(#ar2)"/>
+  <line class="ln2" x1="616" y1="74" x2="616" y2="116" stroke-dasharray="4 3"/>
+  <text class="s2" x="640" y="100" style="text-anchor:start;fill:#7fe0a0">刷新后自动生效</text>
+  <text class="s2" x="300" y="138" style="text-anchor:end;fill:#ff8a8c">X1: 此前 iframe 文档监听泄漏</text>
+</svg>
+</div>
+
+<h3 style="color:var(--txt);font-size:14px;margin:18px 0 4px">2.2 覆盖层 / iframe 元素级拦截持久化（修复点 Bug-X2）</h3>
+<div class="card">
+<svg viewBox="0 0 680 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="覆盖层拦截流程">
+  <defs><marker id="ar3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#4aa3ff" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+  <style>.b3{fill:#1c2430;stroke:#3a4654;stroke-width:1;} .t3{fill:#e6edf3;font:500 11.5px sans-serif;text-anchor:middle;} .s3{fill:#9aa7b4;font:400 10.5px sans-serif;text-anchor:middle;} .ln3{stroke:#4aa3ff;stroke-width:1.3;fill:none;}</style>
+  <rect class="b3" x="20" y="28" width="170" height="44" rx="8"/><text class="t3" x="105" y="46">scanAndCollect</text><text class="s3" x="105" y="62">双引擎扫描</text>
+  <rect class="b3" x="222" y="28" width="150" height="44" rx="8"/><text class="t3" x="297" y="46">用户勾选元素</text><text class="s3" x="297" y="62">selectedSet</text>
+  <rect class="b3" x="404" y="28" width="170" height="44" rx="8"/><text class="t3" x="489" y="46">btn-block</text><text class="s3" x="489" y="62">生成 attribute/structural 规则</text>
+  <rect class="b3" x="596" y="28" width="74" height="44" rx="8"/><text class="t3" x="633" y="46">持久</text>
+  <line class="ln3" x1="190" y1="50" x2="220" y2="50" marker-end="url(#ar3)"/>
+  <line class="ln3" x1="372" y1="50" x2="402" y2="50" marker-end="url(#ar3)"/>
+  <line class="ln3" x1="574" y1="50" x2="594" y2="50" marker-end="url(#ar3)"/>
+  <rect class="b3" x="222" y="140" width="220" height="48" rx="8"/>
+  <text class="t3" x="332" y="160">重新扫描 / 深度扫描</text>
+  <text class="s3" x="332" y="178">X2: 现按元素引用回填勾选（不再清空）</text>
+  <line class="ln3" x1="297" y1="72" x2="320" y2="138" marker-end="url(#ar3)"/>
+  <line class="ln3" x1="633" y1="72" x2="633" y2="112" stroke-dasharray="4 3"/>
+  <text class="s3" x="650" y="96" style="text-anchor:start;fill:#7fe0a0">刷新 reapply 自动生效</text>
+</svg>
+</div>
+
+<h2>3. 九面板交互 / 展示 / 隐藏 Bug 审计</h2>
+<div class="card">
+<table>
+<tr><th style="width:130px">面板 (MENU key)</th><th style="width:120px">主要交互</th><th>审查结论（交互 / 展示 / 隐藏逻辑）</th><th style="width:80px">状态</th></tr>
+<tr><td>选择模式<br><code>selection</code></td><td>点击高亮→动作面板→拦截</td><td>导航冻结/解冻成对；<b>原 iframe 文档监听泄漏（X1）</b>，现已随 stopSelection 统一注销；缩放/域名 pill 切换实时刷新预览正确。</td><td><span class="tag t-fixed">已修 X1</span></td></tr>
+<tr><td>规则面板<br><code>regex</code></td><td>5 种模式 + 预览 + 保存</td><td>输入即重置预览避免叠加；ReDoS 预检；builder 至少 1 条件；保存前语法校验。无隐藏 Bug。</td><td><span class="tag t-low">健康</span></td></tr>
+<tr><td>域名检索<br><code>domain</code></td><td>双引擎采集→勾选→封杀</td><td>已封杀域名过滤；手动添加格式校验；<b>原大小写漏过滤（X3）</b>已修；深扫后 selectedHosts 重置为高风险（可接受）。</td><td><span class="tag t-fixed">已修 X3</span></td></tr>
+<tr><td>覆盖层扫描<br><code>overlay</code></td><td>异步扫描→勾选→拦截</td><td>加载态占位防误判；跨扫指纹保留 blocked；<b>原重扫清空勾选（X2）</b>已修；拦截生成 attribute/structural 持久规则，刷新生效。</td><td><span class="tag t-fixed">已修 X2</span></td></tr>
+<tr><td>管理面板<br><code>manager</code></td><td>删除/启用/禁用/批量</td><td>前序已修复撤销 LIFO 错乱，改为每条 Toast 绑定自身条目 + 幂等保护；confirm 期间 panel 失连防御完好。</td><td><span class="tag t-low">健康</span></td></tr>
+<tr><td>iframe 防线<br><code>iframe</code></td><td>帧级+元素级扫描→拦截</td><td>前序已修 storage 引用缺失 + 刷新 reapply；默认只勾选 element，不误勾整帧；「全选当前」批量元素；刷新后由 reapplyInFrames 自动生效。</td><td><span class="tag t-low">健康</span></td></tr>
+<tr><td>导出规则<br><code>export</code></td><td>复制/下载 JSON</td><td>剪贴板降级 execCommand；无交互 Bug。</td><td><span class="tag t-low">健康</span></td></tr>
+<tr><td>AdGuard 导出<br><code>adguard</code></td><td>转换+复制/下载</td><td>v1/v2 双格式兼容；正则转义防二次转义；无交互 Bug。</td><td><span class="tag t-low">健康</span></td></tr>
+<tr><td>导入规则<br><code>import</code></td><td>合并/覆盖导入+刷新</td><td>覆盖模式二次确认；导入失败捕获提示；无隐藏 Bug。</td><td><span class="tag t-low">健康</span></td></tr>
+</table>
+</div>
+
+<h2>4. 架构优化要点</h2>
+<div class="card">
+<p style="margin-top:0"><b>统一监听生命周期（X1 根因）。</b> 将原本分散在「主文档固定注册 / iframe 文档裸注册」的两套逻辑，收敛为单一 <code>_trackDocOn(doc, type, handler, opts)</code> + <code>_untrackDocAll()</code> 注册表，所有文档（含同源 iframe）的监听都在 <code>stopSelection</code> 中被统一注销。<code>addEventListener</code> 对相同函数+类型+capture 自动去重，重复进入同一 iframe 不会累积监听。</p>
+<p><b>选择状态按引用保留（X2）。</b> 覆盖层/iframe 重扫前记录用户已手动勾选的元素引用，扫描后用 <code>findIndex(r =&gt; r.el === el)</code> 回填，避免异步重扫丢失人工选择。</p>
+<p><b>大小写归一（X3）。</b> 已封杀域名比较统一 <code>.toLowerCase()</code>，消除大小写不一致导致的「已封杀又可选」展示误导。</p>
+<p style="margin-bottom:0;color:var(--mut)"><b>未改动架构边界：</b> PanelRegistry（OCP）、StorageService（Proxy 写入端口）、服务层 DIP 接缝均保持不变；仅修复生命周期与状态一致性，未拆分文件、未删除功能。</p>
+</div>
+
+<h2>5. 验证</h2>
+<div class="card">
+<table>
+<tr><th style="width:50%">检查项</th><th>结果</th></tr>
+<tr><td><code>node --check web-element-blocker.user.js</code></td><td><span class="tag t-fixed">SYNTAX_OK</span></td></tr>
+<tr><td><code>jest</code> 测试套件（20 套件 / 100 测试）</td><td><span class="tag t-fixed">全部通过</span></td></tr>
+<tr><td>9 面板分派（menu-wiring / panel-registry）</td><td><span class="tag t-fixed">通过</span></td></tr>
+</table>
+</div>
+
+<p class="sub" style="margin-top:18px">交付物：本报告（架构图 + 交互流程图 + 审计表）+ 已修复源文件 <code>web-element-blocker.user.js</code>。更新脚本后：选择模式进入 iframe 后退出不再破坏帧内交互；覆盖层重扫保留勾选；已封杀域名不再误显。</p>
+</body>
+</html>

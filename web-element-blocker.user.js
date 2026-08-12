@@ -4688,7 +4688,8 @@
         // 双引擎采集：BlockEngine.extractResourceDomains（DOM 资源来源）+ GlobalDomainScanner（6通道+12维+博彩色情）
         // 合并策略：按 hostname 合并，分数取较高者，附加 viceToken/adToken/level 标记
         // 过滤策略：已在域名黑名单中的域名不再展示（Bug3）
-        const blockedDomainSet = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+        // 统一小写：避免存储域名大小写不一致时漏过滤、已封杀域名又出现在可选列表(BUG-X3)
+        const blockedDomainSet = new Set(this.storage.getDomainBlocks().map(r => (r.domain || '').toLowerCase()));
         const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
         let gdsResult = { results: [], elapsed: '0', total: 0 };
         try { gdsResult = GlobalDomainScanner.scan(); } catch (e) { Log.warn(e.message || e); }
@@ -4853,7 +4854,7 @@
                 return;
             }
             // 拒绝添加已封杀域名：避免UI误导用户以为该域名未封杀（Bug1）
-            const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+            const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => (r.domain || '').toLowerCase()));
             if (currentBlocked.has(host)) {
                 this.showToast(`域名 ${host} 已在黑名单中，无需重复添加。`, 'info');
                 input.value = '';
@@ -4881,7 +4882,7 @@
             // 高开销探测包裹 requestIdleCallback，避免主线程卡死（方案六.2 性能保护）
             const runDeep = () => {
                 try {
-                    const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => r.domain));
+                    const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => (r.domain || '').toLowerCase()));
                     allDomains = allDomains.filter(d => !currentBlocked.has(d.host));
                     // BUG-4 修复：补齐双引擎——extractResourceDomains DOM 资源 + GDS.deepScan 真·深度
                     const { scoredDomains = [] } = BlockEngine.extractResourceDomains(document.documentElement, { deep: true });
@@ -5394,6 +5395,7 @@
                         <input type="checkbox" id="if-only-high" /> 只看高风险
                     </label>
                     <button class="btn-outline" id="if-select-high">选中高风险</button>
+                    <button class="btn-outline" id="if-select-all">全选当前</button>
                     <button class="btn-outline" id="if-select-none">清空</button>
                     <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#ddd;margin:0;">
                         <span>嵌套深度：</span>
@@ -5494,11 +5496,13 @@
             deepResults.forEach((elRec) => {
                 const cat = elRec.category || 'unknown';
                 const suspicion = elRec.suspicion || 0;
+                // 若元素已被规则隐藏（如刷新后 reapplyInFrames 已生效），显示为已拦截
+                const alreadyHidden = elRec.el && elRec.el.style.display === 'none';
                 out.push({
                     type: 'element',
                     elRec,
                     highRisk: suspicion >= 50,
-                    blocked: elRec.blocked || false,
+                    blocked: elRec.blocked || alreadyHidden,
                     suspicion,
                     category: cat
                 });
@@ -5516,7 +5520,8 @@
             try {
                 records = await collectAll();
                 selectedSet = new Set();
-                records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+                // 默认只自动勾选「帧内广告元素」的高风险项，不勾选 iframe 容器本身（用户要的是内部广告元素）
+                records.forEach((r, i) => { if (r.type === 'element' && r.highRisk && !r.blocked) selectedSet.add(i); });
                 scanning = false;
                 render();
                 return true;
@@ -5643,7 +5648,8 @@
                     }
                 } else {
                     const el = r.elRec?.el;
-                    if (el && document.contains(el) && el.style.display !== 'none') {
+                    // isConnected 可识别 iframe 内文档中的元素，document.contains 只对顶层文档有效
+                    if (el && el.isConnected && el.style.display !== 'none') {
                         BlockEngine.hideElement(el);
                         this._iframePreview.elements.push(el);
                     }
@@ -5665,6 +5671,11 @@
         panel.querySelector('#if-only-high').addEventListener('change', (e) => { onlyHigh = e.target.checked; render(); });
         panel.querySelector('#if-select-high').addEventListener('click', () => {
             records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+            updatePreview();
+            render();
+        });
+        panel.querySelector('#if-select-all').addEventListener('click', () => {
+            records.forEach((r, i) => { if (!r.blocked) selectedSet.add(i); });
             updatePreview();
             render();
         });
@@ -5730,7 +5741,10 @@
             selectedSet.clear();
             render();
             let msg = `已拦截 ${count} 个 iframe/元素`;
-            if (iframeRuleCount > 0) msg += `，其中 ${iframeRuleCount} 个 iframe 已写入持久规则（刷新后持续生效，可在「管理规则与防御策略」统一管理）`;
+            if (iframeRuleCount > 0) msg += `，其中 ${iframeRuleCount} 个 iframe 已写入持久规则`;
+            // 元素级拦截由 blockInFrameNode 写入 attribute 规则（按帧域名隔离），刷新后通过 reapplyInFrames 自动生效
+            const elementCount = count - iframeRuleCount;
+            if (elementCount > 0) msg += `，${elementCount} 个元素规则已保存（刷新后持续生效）`;
             if (domainsToBlock.size > 0) msg += `，并封杀 ${domainsToBlock.size} 个域名`;
             this.showToast(msg, 'success');
         });
@@ -6710,6 +6724,8 @@
         // opts.deep=true 开启真·深度扫描（肤色/伪元素/沙箱解码），false 仅基线扫描（不一致-3）
         const runScan = async (skipInitialRender = false, opts = {}) => {
             const deep = !!opts.deep;
+            // 重新扫描前记录用户已手动选中的元素引用，扫描后按引用回填选择(BUG-X2：避免"重新扫描"清空勾选)
+            const prevSelectedEls = new Set(Array.from(selectedSet).map(i => records[i] && records[i].el).filter(Boolean));
             if (!skipInitialRender) {
                 scanning = true;
                 render();
@@ -6726,6 +6742,11 @@
                 // 旧版 filter().map((r,i)=>i) 的 i 是过滤后数组索引，导致 selectedSet 指向错误元素
                 selectedSet = new Set();
                 records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+                // 保留用户在重新扫描前已手动勾选的元素（按元素引用匹配），避免扫描刷新丢失勾选(BUG-X2)
+                prevSelectedEls.forEach(el => {
+                    const idx = records.findIndex(r => r.el === el && !r.blocked);
+                    if (idx >= 0) selectedSet.add(idx);
+                });
                 scanning = false;
                 render();
                 return true; // 扫描成功(BUG-9)：供深度扫描回调判断是否显示完成 Toast
@@ -7953,13 +7974,19 @@
         // 面板内点击被拦截或内存泄漏。引用 Feathers《Working Effectively with Legacy Code》§3 接缝；
         // Fowler《重构》§12.2 消除重复
         _trackDoc(type, handler, opts) {
-            document.addEventListener(type, handler, opts);
-            (this._docListeners || (this._docListeners = [])).push({ type, handler, opts });
+            this._trackDocOn(document, type, handler, opts);
+        }
+        // 支持在任意文档（含同源 iframe 的 contentDocument）注册选择监听，
+        // stopSelection 才能通过 _untrackDocAll 统一注销，避免帧内监听泄漏(BUG-X1)
+        _trackDocOn(doc, type, handler, opts) {
+            if (!doc) return;
+            doc.addEventListener(type, handler, opts);
+            (this._docListeners || (this._docListeners = [])).push({ doc, type, handler, opts });
         }
         _untrackDocAll() {
             if (!this._docListeners) return;
-            this._docListeners.forEach(({ type, handler, opts }) => {
-                try { document.removeEventListener(type, handler, opts); } catch (e) { Log.warn(e.message || e); }
+            this._docListeners.forEach(({ doc, type, handler, opts }) => {
+                try { (doc || document).removeEventListener(type, handler, opts); } catch (e) { Log.warn(e.message || e); }
             });
             this._docListeners = [];
         }
@@ -8152,17 +8179,18 @@
                                 win: targetIframe.contentWindow
                             };
                             this.showToast(`已进入 iframe: ${iframeHost}`, 'info');
-                            // 重新绑定事件到 iframe 文档
+                            // 重新绑定事件到 iframe 文档（同源）。统一走 _trackDocOn 注册，
+                            // 确保 stopSelection 一并注销这些帧内监听，否则点击帧内元素会被永久拦截(BUG-X1)
                             const registerOnDoc = (doc) => {
-                                doc.addEventListener('pointerdown', this._handlePointerDown, { capture: true, passive: false });
-                                doc.addEventListener('mousedown', this._handleMouseDown, { capture: true, passive: false });
-                                doc.addEventListener('mouseover', this._handleMouseOver, { capture: true });
-                                doc.addEventListener('click', this._handleClick, { capture: true, passive: false });
-                                doc.addEventListener('contextmenu', this._contextmenuHandler, { capture: true });
-                                doc.addEventListener('touchstart', this._handleTouchStart, { capture: true, passive: false });
-                                doc.addEventListener('touchmove', this._handleTouchMove, { capture: true, passive: false });
-                                doc.addEventListener('touchend', this._handleTouchEnd, { capture: true, passive: false });
-                                doc.addEventListener('auxclick', this._handleAuxClick, { capture: true });
+                                this._trackDocOn(doc, 'pointerdown', this._handlePointerDown, { capture: true, passive: false });
+                                this._trackDocOn(doc, 'mousedown', this._handleMouseDown, { capture: true, passive: false });
+                                this._trackDocOn(doc, 'mouseover', this._handleMouseOver, { capture: true });
+                                this._trackDocOn(doc, 'click', this._handleClick, { capture: true, passive: false });
+                                this._trackDocOn(doc, 'contextmenu', this._contextmenuHandler, { capture: true });
+                                this._trackDocOn(doc, 'touchstart', this._handleTouchStart, { capture: true, passive: false });
+                                this._trackDocOn(doc, 'touchmove', this._handleTouchMove, { capture: true, passive: false });
+                                this._trackDocOn(doc, 'touchend', this._handleTouchEnd, { capture: true, passive: false });
+                                this._trackDocOn(doc, 'auxclick', this._handleAuxClick, { capture: true });
                             };
                             registerOnDoc(iframeDoc);
                             return;
@@ -9219,7 +9247,8 @@
                 try {
                     doc.querySelectorAll('iframe').forEach(inner => {
                         const innerChain = chain ? chain + ' > iframe' : 'iframe';
-                        const innerRecs = this.scanFrame(iframe, inner.contentDocument, frameHost, innerChain, depth + 1);
+                        // FIX: 递归扫描须传入当前内嵌 iframe，否则 record.iframe 指向父帧
+                        const innerRecs = this.scanFrame(inner, inner.contentDocument, frameHost, innerChain, depth + 1);
                         results.push(...innerRecs);
                         // 同时处理内嵌 iframe 自身的分类
                         IframeGuard._classifyAndAct(inner, depth + 1);
@@ -9296,17 +9325,26 @@
             const suspicion = oas.suspicion || 0;
             const reasons = oas.reasons || [];
             const category = oas.category || 'unknown';
+            let selector = oas.selector || '';
+            if (!selector && oasEl) {
+                try { selector = BlockEngine.generateOptimalSelector(oasEl); } catch (e) { Log.warn(e.message || e); }
+            }
             return {
                 el: oasEl, doc, iframe, frameHost, chain, depth, category,
                 suspicion, reasons,
                 rect: { w: Math.round(rect.width), h: Math.round(rect.height) },
-                selector: oas.selector || '',
+                selector,
                 adDomains: [], crossOrigin: false, blocked: false
             };
         },
 
         _buildSelector(el) {
             if (!el) return '';
+            // 优先使用精准选择器（H14），避免 tag+2class 过宽误伤
+            try {
+                const precise = BlockEngine.generateOptimalSelector(el);
+                if (precise) return precise;
+            } catch (e) { Log.warn(e.message || e); }
             if (el.id) return '#' + el.id;
             let s = el.tagName.toLowerCase();
             if (el.className && typeof el.className === 'string') {
@@ -9316,6 +9354,8 @@
             return s;
         }
     };
+    // 注入存储服务：避免 scanFrame / blockInFrameNode 中 this.storage undefined 导致持久化静默失败
+    IframeDeepScanner.storage = StorageService;
 
     // ─── IframeGuard：iframe 防线核心（§4 §5 §7） ───
     // 职责：发现 iframe → 分类 → 拦截纯广告 / 清理内容帧内部广告 / 保护白名单
@@ -9350,6 +9390,8 @@
             EventBus.on('frame:report', (payload) => { this._handleFrameReport(payload); });
             // 首次扫描（FrameDetector 已启动，触发全量 frame:new 事件）
             FrameDetector.scanAll();
+            // 页面加载时应用已持久化的帧内属性规则（刷新后自动恢复隐藏）
+            try { this.reapplyInFrames(); } catch (e) { Log.warn(e.message || e); }
         },
 
         // B1 修复：确保帧记录存在，冻结首次测量的几何值
@@ -9603,6 +9645,7 @@
             let doc = null;
             try { doc = iframe.contentDocument; } catch (e) { return; }
             if (!doc || !doc.documentElement) return;
+            const host = safeURLHostname(iframe.src);
             try {
                 // 应用域名封杀规则到 iframe 内部
                 const domainSet = BlockEngine.getDomainSet();
@@ -9615,6 +9658,10 @@
                             });
                         } catch (e) { Log.warn(e.message || e); }
                     });
+                }
+                // 应用此前通过 iframe 防线面板保存的 attribute 规则（刷新后持续生效）
+                if (host) {
+                    try { this._applyRulesToDoc(doc, host); } catch (e) { Log.warn(e.message || e); }
                 }
                 // 递归处理嵌套 iframe（§7.2 深度控制）
                 try {
@@ -9699,10 +9746,12 @@
             }
 
             // 2. H14 修复：用 generateOptimalSelector 生成精准选择器，避免 tag+2class 过宽误伤
-            let selector = rec.selector;
-            if (!selector && rec.el) {
+            // 优先重新生成精准选择器（_buildSelector 可能生成过宽的旧选择器）
+            let selector = '';
+            if (rec.el) {
                 try { selector = BlockEngine.generateOptimalSelector(rec.el); } catch (e) { Log.warn(e.message || e); }
             }
+            if (!selector) selector = rec.selector || '';
             if (selector && !rec.crossOrigin && rec.frameHost) {
                 try {
                     this.storage.addRuleForDomain(rec.frameHost, 'attribute', {
@@ -9730,28 +9779,33 @@
                     let doc = null;
                     try { doc = iframe.contentDocument; } catch (e) { return; }
                     if (!doc) return;
-                    // H5 修复：用 hostname 与 domain 比较，而非完整 URL
                     const host = safeURLHostname(iframe.src);
                     if (!host) return;
-                    // 1. 先恢复所有帧内 inline 隐藏（清除旧规则覆盖的 display:none）
-                    doc.querySelectorAll('*').forEach(el => {
-                        if (el.style.display === 'none') el.style.removeProperty('display');
-                        el.style.removeProperty('opacity');
-                        el.style.removeProperty('visibility');
-                    });
-                    // 2. 按未禁用规则重隐藏
-                    const rules = this.storage.getAllSiteRules().filter(r => r.domain === host && r.type === 'attribute');
-                    rules.forEach(r => {
-                        try {
-                            if (r.rule && r.rule.attrSelector && !r.rule._disabled) {
-                                doc.querySelectorAll(r.rule.attrSelector).forEach(el => {
-                                    if (!ProtectedCheck.isProtected(el)) BlockEngine.hideElement(el);
-                                });
-                            }
-                        } catch (e) { Log.warn(e.message || e); }
-                    });
+                    this._applyRulesToDoc(doc, host);
                 });
             } catch (e) { Log.warn(e.message || e); }
+        },
+
+        // 对指定帧内文档应用已保存的 attribute 规则（抽取复用，避免 reapplyInFrames 与 _scanContentIframe 重复）
+        _applyRulesToDoc(doc, host) {
+            if (!doc || !doc.documentElement || !host) return;
+            // 1. 先恢复所有帧内 inline 隐藏（清除旧规则覆盖的 display:none）
+            doc.querySelectorAll('*').forEach(el => {
+                if (el.style.display === 'none') el.style.removeProperty('display');
+                el.style.removeProperty('opacity');
+                el.style.removeProperty('visibility');
+            });
+            // 2. 按未禁用规则重隐藏
+            const rules = this.storage.getAllSiteRules().filter(r => r.domain === host && r.type === 'attribute');
+            rules.forEach(r => {
+                try {
+                    if (r.rule && r.rule.attrSelector && !r.rule._disabled) {
+                        doc.querySelectorAll(r.rule.attrSelector).forEach(el => {
+                            if (!ProtectedCheck.isProtected(el)) BlockEngine.hideElement(el);
+                        });
+                    }
+                } catch (e) { Log.warn(e.message || e); }
+            });
         },
 
         getStats() { return this._stats; },
@@ -9836,6 +9890,8 @@
             } catch (e) { Log.warn(e.message || e); }
         }
     };
+    // 注入存储服务：_getIframeBlockRules / blockInFrameNode / reapplyInFrames 均依赖 this.storage
+    IframeGuard.storage = StorageService;
 
     // ── GM 菜单注册表（抽离为纯函数，可被 jest 直接单测，关闭 TD-08 / T5 的 0% 覆盖缺口）──
     const MENU_ITEMS = [

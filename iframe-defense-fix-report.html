@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iframe 防线元素拦截修复报告</title>
+    <style>
+        :root {
+            --bg: #0f0f12;
+            --panel: #1a1a20;
+            --panel2: #22222a;
+            --text: #e8e8ef;
+            --muted: #a0a0b0;
+            --accent: #34c759;
+            --warn: #ff9500;
+            --danger: #ff3b30;
+            --info: #0a84ff;
+            --border: rgba(255,255,255,0.08);
+        }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.7;
+            margin: 0;
+            padding: 28px;
+        }
+        h1, h2, h3 { margin-top: 0; }
+        h1 { font-size: 24px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+        h2 { font-size: 18px; color: var(--accent); margin-top: 32px; }
+        h3 { font-size: 15px; color: var(--warn); margin-top: 24px; }
+        .subtitle { color: var(--muted); font-size: 14px; margin-top: -8px; }
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 18px 0;
+        }
+        .card img { max-width: 320px; border-radius: 8px; border: 1px solid var(--border); }
+        .flex { display: flex; gap: 16px; flex-wrap: wrap; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+        th { color: var(--muted); font-weight: 600; background: var(--panel2); }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+        code {
+            background: rgba(10,132,255,0.12);
+            color: #7ec8ff;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: "SF Mono", Monaco, Consolas, monospace;
+            font-size: 12px;
+        }
+        .tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 6px;
+        }
+        .tag.critical { background: rgba(255,59,48,0.18); color: #ff9f9a; }
+        .tag.important { background: rgba(255,149,0,0.18); color: #ffd599; }
+        .tag.fixed { background: rgba(52,199,89,0.18); color: #8fe598; }
+        .svg-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; overflow-x: auto; }
+        .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 12px; }
+        .legend span { display: flex; align-items: center; gap: 6px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; }
+    </style>
+</head>
+<body>
+    <h1>🖼️ iframe 防线元素拦截修复报告</h1>
+    <p class="subtitle">修复时间：2026-08-12 · 文件：web-element-blocker.user.js</p>
+
+    <div class="card">
+        <h3>📸 用户反馈（截图还原）</h3>
+        <div class="flex">
+            <div>
+                <p><strong>问题 1：</strong>面板默认勾选的是「未知 iframe」容器本身，而非帧内广告元素。</p>
+                <p><strong>问题 2：</strong>下方多个 <code>img</code> 广告元素无法批量全选。</p>
+                <p><strong>问题 3：</strong>点击拦截后元素即时消失，但刷新后重复出现——不确定是否真正拦截成功。</p>
+            </div>
+        </div>
+    </div>
+
+    <h2>🔍 根因定位</h2>
+    <div class="card">
+        <table>
+            <tr>
+                <th style="width:80px">优先级</th>
+                <th style="width:220px">Bug</th>
+                <th>根因</th>
+                <th>影响</th>
+            </tr>
+            <tr>
+                <td><span class="tag critical">P0</span></td>
+                <td>元素级规则未持久化</td>
+                <td><code>blockInFrameNode</code> 里使用 <code>this.storage</code>，但 <code>IframeGuard</code> 对象从未挂载 storage 引用，导致 <code>addRuleForDomain</code> 抛出异常被静默吞掉。</td>
+                <td>元素只被即时隐藏，刷新后必然复现；用户误以为没拦截成功。</td>
+            </tr>
+            <tr>
+                <td><span class="tag critical">P0</span></td>
+                <td>刷新后未自动应用已保存规则</td>
+                <td><code>reapplyInFrames()</code> 只在管理面板启用/禁用规则时被调用，<code>init()</code> 中没有在页面加载时应用帧内规则。</td>
+                <td>即使规则写入了，刷新后也不会自动隐藏帧内广告。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>深扫 pathPattern 分支失效</td>
+                <td><code>IframeDeepScanner.scanFrame</code> 访问 <code>this.storage.getData()</code>，同样因未注入 storage 而抛异常被 catch，pathPattern 类广告元素漏扫。</td>
+                <td>部分帧内广告元素无法被检测。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>选择器过宽/不够精准</td>
+                <td>深扫使用 <code>_buildSelector</code>（tag+前两个 class），对图片常为 <code>img</code>；blockInFrameNode 又因已有 selector 跳过了 <code>generateOptimalSelector</code>。</td>
+                <td>规则既容易误伤其他图片，也可能因过宽而无法精确复现。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>预览对内嵌元素无效</td>
+                <td><code>document.contains(el)</code> 只对顶层文档有效，iframe 内的元素返回 false，导致预览无法隐藏帧内元素。</td>
+                <td>用户点「预览效果」对内嵌广告无反馈。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>递归嵌套 iframe record 指向父帧</td>
+                <td><code>scanFrame</code> 递归调用时把父 iframe 当作第一个参数传入，导致嵌套帧内元素的 <code>record.iframe</code> 错误。</td>
+                <td>记录与元素实际归属帧不一致，影响后续定位与统计。</td>
+            </tr>
+            <tr>
+                <td><span class="tag fixed">UI</span></td>
+                <td>默认勾选 iframe 容器</td>
+                <td><code>runScan</code> 对 frame 类型也执行 <code>highRisk</code> 默认勾选；unknown iframe 得 50 分被勾选。</td>
+                <td>用户一打开面板就看到 iframe 被选中，与「要拦截内部广告」的意图冲突。</td>
+            </tr>
+            <tr>
+                <td><span class="tag fixed">UI</span></td>
+                <td>缺少全选广告元素按钮</td>
+                <td>工具栏只有「选中高风险/清空」，没有「全选当前列表」。</td>
+                <td>元素分数 35（中风险）时无法一键批量选中。</td>
+            </tr>
+        </table>
+    </div>
+
+    <h2>🏗️ 架构图：iframe 防线数据流</h2>
+    <div class="svg-wrap">
+        <svg viewBox="0 0 680 520" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                    <path d="M0,0 L0,6 L9,3 z" fill="#888"/>
+                </marker>
+                <linearGradient id="gradFrame" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#ff3b30" stop-opacity="0.25"/>
+                    <stop offset="100%" stop-color="#ff3b30" stop-opacity="0.05"/>
+                </linearGradient>
+                <linearGradient id="gradEng" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#0a84ff" stop-opacity="0.25"/>
+                    <stop offset="100%" stop-color="#0a84ff" stop-opacity="0.05"/>
+                </linearGradient>
+                <linearGradient id="gradStore" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#34c759" stop-opacity="0.25"/>
+                    <stop offset="100%" stop-color="#34c759" stop-opacity="0.05"/>
+                </linearGradient>
+            </defs>
+            <rect x="20" y="20" width="640" height="120" rx="10" fill="url(#gradFrame)" stroke="rgba(255,59,48,0.35)" stroke-width="1"/>
+            <text x="40" y="45" fill="#ff9f9a" font-size="13" font-weight="600">层 1：DOM / 页面</text>
+            <rect x="60" y="60" width="120" height="55" rx="8" fill="#1a1a20" stroke="#ff3b30" stroke-width="1"/>
+            <text x="120" y="85" text-anchor="middle" fill="#e8e8ef" font-size="12">顶层 iframe</text>
+            <text x="120" y="103" text-anchor="middle" fill="#a0a0b0" font-size="10">同域/跨域</text>
+            <rect x="220" y="60" width="120" height="55" rx="8" fill="#1a1a20" stroke="#ff9500" stroke-width="1"/>
+            <text x="280" y="85" text-anchor="middle" fill="#e8e8ef" font-size="12">嵌套 iframe</text>
+            <text x="280" y="103" text-anchor="middle" fill="#a0a0b0" font-size="10">深度 ≤ maxDepth</text>
+            <rect x="380" y="60" width="120" height="55" rx="8" fill="#1a1a20" stroke="#0a84ff" stroke-width="1"/>
+            <text x="440" y="85" text-anchor="middle" fill="#e8e8ef" font-size="12">帧内广告元素</text>
+            <text x="440" y="103" text-anchor="middle" fill="#a0a0b0" font-size="10">img / a / overlay</text>
+
+            <rect x="20" y="170" width="640" height="140" rx="10" fill="url(#gradEng)" stroke="rgba(10,132,255,0.35)" stroke-width="1"/>
+            <text x="40" y="195" fill="#7ec8ff" font-size="13" font-weight="600">层 2：引擎层</text>
+            <rect x="60" y="215" width="130" height="70" rx="8" fill="#1a1a20" stroke="#0a84ff" stroke-width="1"/>
+            <text x="125" y="242" text-anchor="middle" fill="#e8e8ef" font-size="12">FrameDetector</text>
+            <text x="125" y="260" text-anchor="middle" fill="#a0a0b0" font-size="10">发现 iframe → frame:new</text>
+            <rect x="230" y="215" width="130" height="70" rx="8" fill="#1a1a20" stroke="#0a84ff" stroke-width="1"/>
+            <text x="295" y="242" text-anchor="middle" fill="#e8e8ef" font-size="12">IframeGuard</text>
+            <text x="295" y="260" text-anchor="middle" fill="#a0a0b0" font-size="10">分类 + 整帧/内容帧处理</text>
+            <rect x="400" y="215" width="130" height="70" rx="8" fill="#1a1a20" stroke="#0a84ff" stroke-width="1"/>
+            <text x="465" y="242" text-anchor="middle" fill="#e8e8ef" font-size="12">IframeDeepScanner</text>
+            <text x="465" y="260" text-anchor="middle" fill="#a0a0b0" font-size="10">帧内元素级深扫</text>
+            <rect x="560" y="230" width="80" height="40" rx="8" fill="#1a1a20" stroke="#ff9500" stroke-width="1"/>
+            <text x="600" y="255" text-anchor="middle" fill="#e8e8ef" font-size="12">SelectorBuilder</text>
+
+            <rect x="20" y="340" width="640" height="120" rx="10" fill="url(#gradStore)" stroke="rgba(52,199,89,0.35)" stroke-width="1"/>
+            <text x="40" y="365" fill="#8fe598" font-size="13" font-weight="600">层 3：持久化 / UI</text>
+            <rect x="60" y="385" width="140" height="55" rx="8" fill="#1a1a20" stroke="#34c759" stroke-width="1"/>
+            <text x="130" y="410" text-anchor="middle" fill="#e8e8ef" font-size="12">StorageManager</text>
+            <text x="130" y="428" text-anchor="middle" fill="#a0a0b0" font-size="10">GM_setValue + 防抖落盘</text>
+            <rect x="240" y="385" width="140" height="55" rx="8" fill="#1a1a20" stroke="#34c759" stroke-width="1"/>
+            <text x="310" y="410" text-anchor="middle" fill="#e8e8ef" font-size="12">StorageService</text>
+            <text x="310" y="428" text-anchor="middle" fill="#a0a0b0" font-size="10">Proxy 绑定 + 缓存失效端口</text>
+            <rect x="420" y="385" width="140" height="55" rx="8" fill="#1a1a20" stroke="#ff3b30" stroke-width="1"/>
+            <text x="490" y="410" text-anchor="middle" fill="#e8e8ef" font-size="12">IframePanel</text>
+            <text x="490" y="428" text-anchor="middle" fill="#a0a0b0" font-size="10">选择 / 预览 / 拦截 / 反馈</text>
+
+            <line x1="120" y1="115" x2="125" y2="215" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="280" y1="115" x2="295" y2="215" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="440" y1="115" x2="465" y2="215" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="295" y1="285" x2="295" y2="340" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="360" y1="250" x2="400" y2="250" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="530" y1="250" x2="560" y2="250" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="490" y1="385" x2="490" y2="340" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="200" y1="413" x2="240" y2="413" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+            <line x1="380" y1="413" x2="420" y2="413" stroke="#888" stroke-width="1" marker-end="url(#arr)"/>
+        </svg>
+        <div class="legend">
+            <span><span class="dot" style="background:#ff3b30"></span>DOM / 待拦截目标</span>
+            <span><span class="dot" style="background:#0a84ff"></span>引擎层</span>
+            <span><span class="dot" style="background:#34c759"></span>持久化 / UI</span>
+        </div>
+    </div>
+
+    <h2>🔄 元素拦截持久化流程（修复后）</h2>
+    <div class="svg-wrap">
+        <svg viewBox="0 0 680 560" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                    <path d="M0,0 L0,6 L9,3 z" fill="#888"/>
+                </marker>
+            </defs>
+            <rect x="40" y="20" width="600" height="60" rx="8" fill="#1a1a20" stroke="#0a84ff" stroke-width="1"/>
+            <text x="340" y="55" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="600">1. IframeDeepScanner.scanAll() 发现帧内广告元素</text>
+
+            <rect x="40" y="110" width="600" height="60" rx="8" fill="#1a1a20" stroke="#0a84ff" stroke-width="1"/>
+            <text x="340" y="145" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="600">2. IframePanel 渲染元素列表，默认只勾选 element（不勾选 iframe 容器）</text>
+
+            <rect x="40" y="200" width="600" height="60" rx="8" fill="#1a1a20" stroke="#ff9500" stroke-width="1"/>
+            <text x="340" y="235" text-anchor="middle" fill="#e8e8ef" font-size="14" font-weight="600">3. 用户点击「拦截」→ blockInFrameNode(rec)</text>
+
+            <rect x="40" y="290" width="280" height="90" rx="8" fill="#1a1a20" stroke="#34c759" stroke-width="1"/>
+            <text x="180" y="320" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="600">4a. 生成精准选择器</text>
+            <text x="180" y="340" text-anchor="middle" fill="#a0a0b0" font-size="11">BlockEngine.generateOptimalSelector</text>
+            <text x="180" y="358" text-anchor="middle" fill="#a0a0b0" font-size="11">避免 tag/class 过宽</text>
+
+            <rect x="360" y="290" width="280" height="90" rx="8" fill="#1a1a20" stroke="#34c759" stroke-width="1"/>
+            <text x="500" y="320" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="600">4b. 持久化规则</text>
+            <text x="500" y="340" text-anchor="middle" fill="#a0a0b0" font-size="11">storage.addRuleForDomain(frameHost, 'attribute', {...})</text>
+            <text x="500" y="358" text-anchor="middle" fill="#a0a0b0" font-size="11">按帧域名隔离保存</text>
+
+            <rect x="40" y="410" width="280" height="70" rx="8" fill="#1a1a20" stroke="#ff3b30" stroke-width="1"/>
+            <text x="180" y="440" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="600">5a. 即时隐藏</text>
+            <text x="180" y="460" text-anchor="middle" fill="#a0a0b0" font-size="11">BlockEngine.hideElement(rec.el)</text>
+
+            <rect x="360" y="410" width="280" height="70" rx="8" fill="#1a1a20" stroke="#ff3b30" stroke-width="1"/>
+            <text x="500" y="440" text-anchor="middle" fill="#e8e8ef" font-size="13" font-weight="600">5b. 刷新后自动恢复隐藏</text>
+            <text x="500" y="460" text-anchor="middle" fill="#a0a0b0" font-size="11">init() → reapplyInFrames() → _applyRulesToDoc()</text>
+
+            <line x1="340" y1="80" x2="340" y2="110" stroke="#888" stroke-width="1" marker-end="url(#arr2)"/>
+            <line x1="340" y1="170" x2="340" y2="200" stroke="#888" stroke-width="1" marker-end="url(#arr2)"/>
+            <line x1="340" y1="260" x2="180" y2="290" stroke="#888" stroke-width="1" marker-end="url(#arr2)"/>
+            <line x1="340" y1="260" x2="500" y2="290" stroke="#888" stroke-width="1" marker-end="url(#arr2)"/>
+            <line x1="180" y1="380" x2="180" y2="410" stroke="#888" stroke-width="1" marker-end="url(#arr2)"/>
+            <line x1="500" y1="380" x2="500" y2="410" stroke="#888" stroke-width="1" marker-end="url(#arr2)"/>
+            <line x1="180" y1="480" x2="500" y2="480" stroke="#888" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arr2)"/>
+            <text x="340" y="505" text-anchor="middle" fill="#a0a0b0" font-size="11">页面刷新后持久规则自动生效</text>
+        </svg>
+    </div>
+
+    <h2>🛠️ 修复清单</h2>
+    <div class="card">
+        <table>
+            <tr>
+                <th style="width:70px">级别</th>
+                <th style="width:160px">位置</th>
+                <th>修复内容</th>
+            </tr>
+            <tr>
+                <td><span class="tag critical">P0</span></td>
+                <td>IframeGuard</td>
+                <td>在对象定义后注入 <code>IframeGuard.storage = StorageService</code>，修复 <code>this.storage</code> undefined 导致的规则静默写入失败。</td>
+            </tr>
+            <tr>
+                <td><span class="tag critical">P0</span></td>
+                <td>IframeGuard.init</td>
+                <td>首次扫描后调用 <code>this.reapplyInFrames()</code>，确保刷新后已保存规则自动生效。</td>
+            </tr>
+            <tr>
+                <td><span class="tag critical">P0</span></td>
+                <td>IframeGuard._scanContentIframe</td>
+                <td>域名封杀后调用 <code>this._applyRulesToDoc(doc, host)</code>，新加载的内容 iframe 也能即时应用历史规则。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>IframeDeepScanner</td>
+                <td>注入 <code>IframeDeepScanner.storage = StorageService</code>，修复 pathPattern 分支读取规则时抛异常。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>IframeDeepScanner._buildSelector</td>
+                <td>优先使用 <code>BlockEngine.generateOptimalSelector</code> 生成精准路径选择器，避免 <code>img</code> 这类过宽选择器。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>IframeGuard.blockInFrameNode</td>
+                <td>强制优先重新生成精准选择器，不再因 <code>rec.selector</code> 已存在而跳过。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>IframeGuard.reapplyInFrames</td>
+                <td>抽取 <code>_applyRulesToDoc(doc, host)</code> 公共方法，被 reapplyInFrames 与 _scanContentIframe 复用，消除重复。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>IframePanel.updatePreview</td>
+                <td>用 <code>el.isConnected</code> 替代 <code>document.contains(el)</code>，使 iframe 内元素预览也能正确隐藏。</td>
+            </tr>
+            <tr>
+                <td><span class="tag important">P1</span></td>
+                <td>IframeDeepScanner.scanFrame</td>
+                <td>递归扫描嵌套 iframe 时传入 <code>inner</code> 而非父 <code>iframe</code>，修正 record.iframe 归属。</td>
+            </tr>
+            <tr>
+                <td><span class="tag fixed">UI</span></td>
+                <td>IframePanel.runScan</td>
+                <td>默认勾选仅针对 <code>type === 'element'</code> 的高风险项，iframe 容器不再被默认选中。</td>
+            </tr>
+            <tr>
+                <td><span class="tag fixed">UI</span></td>
+                <td>IframePanel 工具栏</td>
+                <td>新增「全选当前」按钮，可一键选中列表中所有未拦截元素（含中低风险广告）。</td>
+            </tr>
+            <tr>
+                <td><span class="tag fixed">UI</span></td>
+                <td>IframePanel.collectAll</td>
+                <td>扫描时若元素已 <code>display:none</code>，显示「已拦截」标签，刷新后也能看到规则生效状态。</td>
+            </tr>
+            <tr>
+                <td><span class="tag fixed">UI</span></td>
+                <td>IframePanel 拦截 Toast</td>
+                <td>Toast 明确区分 iframe 规则与元素规则，并提示「刷新后持续生效」。</td>
+            </tr>
+        </table>
+    </div>
+
+    <h2>✅ 验证结果</h2>
+    <div class="card">
+        <ul>
+            <li><code>node --check web-element-blocker.user.js</code> → <strong style="color:var(--accent)">SYNTAX_OK</strong></li>
+            <li><code>jest</code> → <strong style="color:var(--accent)">20 套件 / 100 测试全部通过</strong></li>
+        </ul>
+    </div>
+
+    <h2>📌 用户操作说明</h2>
+    <div class="card">
+        <ol>
+            <li>打开「🖼️ iframe 防线管理」面板。</li>
+            <li>列表默认仅勾选帧内高风险广告元素；iframe 容器本身不再被默认勾选。</li>
+            <li>如需批量拦截所有列出的广告元素，点击「全选当前」按钮。</li>
+            <li>点击红色「🛡️ 拦截选中的 X 个 iframe/元素」按钮，元素会即时隐藏并写入持久规则。</li>
+            <li>Toast 会提示「X 个元素规则已保存（刷新后持续生效）」。</li>
+            <li>刷新页面后，已保存规则会通过 <code>init() → reapplyInFrames()</code> 自动重新隐藏这些元素。</li>
+        </ol>
+    </div>
+</body>
+</html>
