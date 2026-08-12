@@ -1,0 +1,6 @@
+# 统一以 LF 存储/检出，避免 Windows 下 autocrlf 把 LF 还原为 CRLF
+# 导致 $ 锚定正则测试误失败，以及 babel/提取类损坏（v8.4 教训）
+* text=auto eol=lf
+*.js text eol=lf
+*.md text eol=lf
+*.json text eol=lf
