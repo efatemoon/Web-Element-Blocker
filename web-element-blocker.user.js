@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.2.0
+// @version      3.3.0
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -705,13 +705,9 @@
             const flashDict = this._readKey('pro_blocker_flash_domains', {});
             const flashDomains = Object.keys(flashDict).filter(d => flashDict[d]);
 
-            // iframe 规则与白名单（§8.7 导出新增桶）
+            // iframe 规则（§8.7 导出新增桶）
             const iframeRules = this.getIframeBlocks().map(r => {
                 const { _ts, ...rest } = r;
-                return rest;
-            });
-            const iframeWhitelist = (WhitelistStore.getAll() || []).map(e => {
-                const { _ts, ...rest } = e;
                 return rest;
             });
             const iframeConfig = this.getIframeConfig();
@@ -726,7 +722,6 @@
                         siteRules: totalRules,
                         sites: Object.keys(sites).length,
                         iframeRules: iframeRules.length,
-                        iframeWhitelist: iframeWhitelist.length,
                     }
                 },
                 domains,
@@ -734,7 +729,6 @@
                 config,
                 flashDomains,
                 iframeRules,
-                iframeWhitelist,
                 iframeConfig,
             };
             return JSON.stringify(exportData, null, 2);
@@ -872,28 +866,6 @@
             } else if (!merge) {
                 this._markDirty('iframeBlocks', []);
             }
-            // iframe 白名单导入
-            if (Array.isArray(importData.iframeWhitelist)) {
-                const incoming = importData.iframeWhitelist.filter(e => e && (e.selector || e.domain));
-                if (merge) {
-                    const existing = WhitelistStore.getAll();
-                    const fp = (x) => (x.selector || '') + '|' + (x.domain || '');
-                    const existingSet = new Set(existing.map(fp));
-                    incoming.forEach(e => {
-                        if (!existingSet.has(fp(e))) {
-                            existingSet.add(fp(e));
-                            existing.push({ selector: e.selector || '', domain: e.domain || '', reason: e.reason || '', _ts: Date.now() });
-                        }
-                    });
-                    GM_setValue('iframeWhitelist', existing);
-                } else {
-                    GM_setValue('iframeWhitelist', incoming.map(e => ({ selector: e.selector || '', domain: e.domain || '', reason: e.reason || '', _ts: Date.now() })));
-                }
-                WhitelistStore.invalidate();
-            } else if (!merge) {
-                GM_setValue('iframeWhitelist', []);
-                WhitelistStore.invalidate();
-            }
             // iframe 配置导入（合并模式仅写入不存在的键）
             if (importData.iframeConfig && typeof importData.iframeConfig === 'object') {
                 const cur = this.getIframeConfig();
@@ -916,7 +888,6 @@
         // ─── iframe 规则存储（§13 新增规则类型） ───
         // iframeBlock：全局生效，数组结构 [{matchType, value, _ts, _disabled}]
         //   matchType: 'srcDomain' | 'srcdocKeyword' | 'geometry'
-        // iframeWhitelist 由 WhitelistStore 模块管理（GM_getValue('iframeWhitelist')），此处提供桥接
         getIframeBlocks() {
             const raw = this._readKey('iframeBlocks', []);
             if (!Array.isArray(raw)) return [];
@@ -5479,19 +5450,13 @@
                 <div class="section-divider"></div>
 
                 <div class="btn-group">
-                    <button class="btn-info" id="btn-deep-scan" title="清除缓存并重新执行帧内深扫">🤖 深度扫描</button>
+                    <button class="btn-info" id="btn-deep-scan" title="在「重新扫描」基础上：临时拉满嵌套深度并强制重跑帧内元素级深扫（递归嵌套帧、识别透明覆盖/赌博域名等元素），更彻底但更慢">🤖 深度扫描</button>
                     <button class="btn-warning" id="btn-preview-iframe">🔍 预览效果</button>
-                    <button class="btn-warning" id="btn-rescan-iframe">🔄 重新扫描</button>
+                    <button class="btn-warning" id="btn-rescan-iframe" title="重新检测页面所有 iframe 并重新分类、刷新列表（不拉满嵌套深度）">🔄 重新扫描</button>
                     <button class="btn-outline" id="btn-close-iframe">关闭</button>
                 </div>
 
                 <div class="section-divider"></div>
-
-                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                    <div style="font-size:12px;color:#4aa3ff;font-weight:bold;">🛡️ 白名单管理（已保护的内容帧）</div>
-                    <button class="btn-success" id="btn-protect-iframe" style="padding:3px 10px;font-size:11px;" disabled>✅ 保护选中的内容帧</button>
-                </div>
-                <div class="gd-scroll-area" id="iframe-wl-list" style="max-height:100px;"></div>
             `;
 
         this.makeDraggable(panel);
@@ -5606,9 +5571,7 @@
                 box.innerHTML = '<li class="empty-tip">⏳ 正在扫描 iframe...</li>';
                 if (stats) stats.textContent = '正在扫描...';
                 const btn = panel.querySelector('#btn-block-iframe');
-                const protectBtn = panel.querySelector('#btn-protect-iframe');
                 if (btn) btn.disabled = true;
-                if (protectBtn) protectBtn.disabled = true;
                 return;
             }
 
@@ -5626,8 +5589,6 @@
                 box.innerHTML = '<div class="empty-tip">当前页面未发现 iframe 或帧内可疑元素。可尝试取消"只看高风险"或使用"深度扫描"。</div>';
                 const btn = panel.querySelector('#btn-block-iframe');
                 if (btn) { btn.disabled = true; btn.textContent = '🛡️ 未选择 iframe'; }
-                const protectBtn = panel.querySelector('#btn-protect-iframe');
-                if (protectBtn) protectBtn.disabled = true;
                 return;
             }
 
@@ -5687,48 +5648,6 @@
                 btn.disabled = selectedSet.size === 0;
                 btn.textContent = selectedSet.size > 0 ? `🛡️ 拦截选中的 ${selectedSet.size} 个 iframe/元素` : '🛡️ 未选择 iframe';
             }
-
-            // 保护按钮：仅当选中项包含未拦截的内容帧时可用
-            const protectBtn = panel.querySelector('#btn-protect-iframe');
-            if (protectBtn) {
-                const hasProtectable = Array.from(selectedSet).some(idx => {
-                    const r = records[idx];
-                    return r && r.type === 'frame' && r.verdict === 'content' && !r.blocked;
-                });
-                protectBtn.disabled = !hasProtectable;
-            }
-        };
-
-        // ─── 白名单列表 ───
-        const renderWlList = () => {
-            const box = panel.querySelector('#iframe-wl-list');
-            if (!box) return;
-            const list = WhitelistStore.getAll();
-            if (list.length === 0) {
-                box.innerHTML = '<div class="empty-tip">暂无白名单条目（在上方列表选择内容帧后点击"保护选中的内容帧"可添加）</div>';
-                return;
-            }
-            box.innerHTML = list.map((e, i) => {
-                const parts = [];
-                if (e.selector) parts.push(`选择器: <code>${escapeHTML(e.selector)}</code>`);
-                if (e.domain) parts.push(`域名: <code>${escapeHTML(e.domain)}</code>`);
-                return `<div class="gd-domain-row">
-                        <div class="gd-left">
-                            <div class="gd-check" style="cursor:pointer; color:#ff6f00;" data-wl-del="${i}" title="删除">✕</div>
-                            <div><div class="gd-host">${parts.join(' · ') || '(空)'}</div></div>
-                        </div>
-                    </div>`;
-            }).join('');
-            box.querySelectorAll('[data-wl-del]').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const idx = parseInt(btn.getAttribute('data-wl-del'), 10);
-                    WhitelistStore.remove(idx);
-                    this.showToast('已从白名单移除', 'success');
-                    try { IframeGuard.rescanAll(); } catch (err) { Log.warn(err.message || err); }
-                    renderWlList();
-                });
-            });
         };
 
         // ─── 预览 ───
@@ -5791,6 +5710,7 @@
             if (selectedSet.size === 0) return;
             resetPreview();
             let count = 0;
+            let iframeRuleCount = 0;
             const blockDomainToo = panel.querySelector('#if-block-domain').checked;
             const domainsToBlock = new Set();
             Array.from(selectedSet).forEach(idx => {
@@ -5800,6 +5720,15 @@
                     const iframe = r.iframe;
                     if (!document.contains(iframe)) return;
                     if (ProtectedCheck.isProtected(iframe)) return;
+                    // 持久化 iframeBlock 规则（按 src 域名）：刷新后由 IframeGuard 自动拦截，并出现在「管理规则与防御策略」
+                    if (iframe.src) {
+                        try {
+                            const u = new URL(iframe.src, location.href);
+                            if (u.hostname && u.hostname !== window.location.hostname) {
+                                if (this.storage.addIframeRule({ matchType: 'srcDomain', value: u.hostname })) iframeRuleCount++;
+                            }
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
                     BlockEngine.hideElement(iframe);
                     r.rec.blocked = true; r.rec.verdict = 'ad';
                     blockedFingerprints.add(iframe);
@@ -5832,29 +5761,10 @@
             }
             selectedSet.clear();
             render();
-            this.showToast(`已拦截 ${count} 个 iframe/元素${domainsToBlock.size > 0 ? '，并封杀 ' + domainsToBlock.size + ' 个域名' : ''}`, 'success');
-        });
-
-        panel.querySelector('#btn-protect-iframe').addEventListener('click', () => {
-            let count = 0;
-            Array.from(selectedSet).forEach(idx => {
-                const r = records[idx];
-                if (!r || r.type !== 'frame' || r.verdict !== 'content' || r.blocked) return;
-                const iframe = r.iframe;
-                const rec = IframeGuard._ensureRecord(iframe);
-                if (rec.manual) return;
-                const frameHost = iframe.src ? safeURLHostname(iframe.src) : window.location.hostname;
-                const selector = iframe.id ? '#' + iframe.id : '';
-                WhitelistStore.add({ selector, domain: frameHost, reason: 'panel-pick' });
-                rec.manual = true;
-                EventBus.emit('iframe:protected', { record: { iframe, el: iframe, frameHost, selector }, reason: 'whitelist-pick' });
-                count++;
-            });
-            if (count > 0) {
-                this.showToast(`已保护 ${count} 个内容帧`, 'success');
-                render();
-                renderWlList();
-            }
+            let msg = `已拦截 ${count} 个 iframe/元素`;
+            if (iframeRuleCount > 0) msg += `，其中 ${iframeRuleCount} 个 iframe 已写入持久规则（刷新后持续生效，可在「管理规则与防御策略」统一管理）`;
+            if (domainsToBlock.size > 0) msg += `，并封杀 ${domainsToBlock.size} 个域名`;
+            this.showToast(msg, 'success');
         });
 
         previewBtn.addEventListener('click', (e) => {
@@ -5889,10 +5799,15 @@
             btn.disabled = true;
             _scanCache = null;
             selectedSet.clear();
+            // 深度：临时拉满嵌套深度，强制重跑帧内元素级深扫（递归嵌套帧、识别透明覆盖/赌博域名等元素）
+            const prevDepth = IframeDeepScanner.maxDepth;
+            IframeDeepScanner.maxDepth = IframeGuard.MAX_DEPTH;
+            try { IframeGuard.forceRescan(); } catch (er) { Log.warn(er.message || er); }
             const ok = await runScan(false);
+            IframeDeepScanner.maxDepth = prevDepth;
             btn.textContent = old;
             btn.disabled = false;
-            if (ok) this.showToast('深度扫描完成', 'success');
+            if (ok) this.showToast('深度扫描完成（已递归嵌套帧、重跑元素级深扫）', 'success');
         });
 
         panel.querySelector('#btn-rescan-iframe').addEventListener('click', async () => {
@@ -5900,7 +5815,7 @@
             selectedSet.clear();
             try { IframeGuard.forceRescan(); } catch (e) { this.showToast('重扫失败: ' + e.message, 'error'); return; }
             await runScan(false);
-            this.showToast('已重新扫描全部 iframe', 'success');
+            this.showToast('已重新扫描全部 iframe（帧级重新分类）', 'success');
         });
 
         panel.querySelector('#iframe-max-depth').addEventListener('change', (e) => {
@@ -5926,7 +5841,6 @@
 
         // 初始加载
         runScan(true);
-        renderWlList();
     }
 
     function ManagerPanel() {
@@ -8651,8 +8565,7 @@
 
             // ─── iframe 规则转换（§8.8 映射表） ───
             const iframeRules = Array.isArray(raw.iframeRules) ? raw.iframeRules : [];
-            const iframeWhitelist = Array.isArray(raw.iframeWhitelist) ? raw.iframeWhitelist : [];
-            if (iframeRules.length > 0 || iframeWhitelist.length > 0) {
+            if (iframeRules.length > 0) {
                 lines.push('! iframe 拦截规则');
                 iframeRules.forEach(r => {
                     if (!r || !r.matchType) return;
@@ -8665,19 +8578,6 @@
                     } else if (r.matchType === 'srcdocKeyword' && r.value) {
                         // AdGuard 不支持 srcdoc 匹配，导出为注释
                         lines.push(`! [iframe srcdoc keyword] "${r.value}"（AdGuard 不支持 srcdoc 匹配）`);
-                    }
-                });
-                lines.push('');
-            }
-            if (iframeWhitelist.length > 0) {
-                lines.push('! iframe 白名单（内容帧保护）');
-                iframeWhitelist.forEach(e => {
-                    if (!e) return;
-                    if (e.domain) {
-                        // @@||domain^$subdocument（白名单语法）
-                        lines.push(`@@||${e.domain}^$subdocument`);
-                    } else if (e.selector) {
-                        lines.push(`! [iframe whitelist selector] ${e.selector}（AdGuard 不支持选择器白名单，需手动添加 @@ 规则）`);
                     }
                 });
                 lines.push('');
@@ -8754,7 +8654,7 @@
     }
     // ================= iframe 防线模块（v2.0 动态 iframe 广告拦截） =================
     // 依据《动态 iframe 广告拦截完整重构方案 v2.0》实现：
-    //   FrameDetector · EventBus · WhitelistStore · ContentClassifier · FrameMessenger · MessageGuard · IframeGuard
+    //   FrameDetector · EventBus · ContentClassifier · FrameMessenger · MessageGuard · IframeGuard
     // 设计原则：正文保护铁律（§2.1）+ 帧内自治 + 顶层仲裁双层决策（§1.2③）
     // 模块依赖：FrameDetector（帧发现）→ IframeGuard（分类决策）
 
@@ -8915,63 +8815,6 @@
         }
     };
 
-    // ─── WhitelistStore：iframe 白名单（§2.1 铁律5 · §13 iframeWhitelist） ───
-    // 用户手动标记的「内容 iframe 白名单」优先级高于一切自动判定
-    // 存储格式：[{selector, domain, reason, _ts}]，全局生效（不按域名隔离）
-    const WhitelistStore = {
-        _cache: null,
-        _getAll() {
-            if (this._cache) return this._cache;
-            const raw = GM_getValue('iframeWhitelist', []);
-            this._cache = Array.isArray(raw) ? raw.filter(e => e && (e.selector || e.domain)) : [];
-            return this._cache;
-        },
-        // 铁律5：白名单命中 → 无条件保护（覆盖一切判定）
-        isWhitelisted(iframe) {
-            if (!iframe || iframe.nodeType !== 1) return false;
-            const list = this._getAll();
-            for (let i = 0; i < list.length; i++) {
-                const entry = list[i];
-                // 选择器匹配
-                if (entry.selector && iframe.matches) {
-                    try { if (iframe.matches(entry.selector)) return true; } catch (e) { Log.warn(e.message || e); }
-                }
-                // 域名精确匹配（含子域）
-                if (entry.domain && iframe.src) {
-                    try {
-                        const host = new URL(iframe.src).hostname;
-                        if (host === entry.domain || host.endsWith('.' + entry.domain)) return true;
-                    } catch (e) { Log.warn(e.message || e); }
-                }
-            }
-            return false;
-        },
-        add(entry) {
-            const list = this._getAll().slice();
-            // 去重：selector+domain 完全相同视为已存在
-            const exists = list.some(e =>
-                (e.selector || '') === (entry.selector || '') &&
-                (e.domain || '') === (entry.domain || ''));
-            if (exists) return false;
-            list.push({ selector: entry.selector || '', domain: entry.domain || '', reason: entry.reason || '', _ts: Date.now() });
-            this._cache = list;
-            GM_setValue('iframeWhitelist', list);
-            EventBus.emit('whitelist:changed', { action: 'add' });
-            return true;
-        },
-        remove(index) {
-            const list = this._getAll().slice();
-            if (index < 0 || index >= list.length) return false;
-            list.splice(index, 1);
-            this._cache = list;
-            GM_setValue('iframeWhitelist', list);
-            EventBus.emit('whitelist:changed', { action: 'remove' });
-            return true;
-        },
-        getAll() { return this._getAll(); },
-        invalidate() { this._cache = null; }
-    };
-
     // ─── ContentClassifier：内容/广告分类评分（§2.3 评分体系） ───
     // 纯函数模块，不持有状态，供 IframeGuard 与子帧自治上报复用
     // 判定公式：正文分>60 → 内容帧；广告分>70 且 正文分<20 → 纯广告帧；其余 → 未知
@@ -9125,10 +8968,6 @@
         // B1 修复：可选 frozen 参数——禁止使用 getBoundingClientRect/getComputedStyle 实时测量
         //          传递冻结值后几何维度使用首次测量值，保证两按钮分数一致
         classify(iframe, frozen) {
-            // 铁律5：白名单最高优先级
-            if (WhitelistStore.isWhitelisted(iframe)) {
-                return { contentScore: 100, adScore: 0, verdict: 'whitelist', reasons: ['whitelist'] };
-            }
             let doc = null;
             try { doc = iframe.contentDocument; } catch (e) { doc = null; }
             // B1 修复：冻结测量时传 frozen 跳过实时几何测量
@@ -9638,7 +9477,7 @@
 
             // B2 修复：粘性判定——blocked 或 manual 的帧永不自动复活
             // 此前：隐藏→重测分降→verdict 翻成 unknown/content→showElement→恢复可见→再测又 ad→再隐藏…振荡
-            if ((rec.blocked || rec.manual) && !WhitelistStore.isWhitelisted(iframe)) return;
+            if (rec.blocked || rec.manual) return;
 
             // 先检查 iframeBlock 规则（用户显式规则优先）
             if (this._matchesIframeBlockRules(iframe)) {
@@ -9658,12 +9497,6 @@
             }
             rec.verdict = result.verdict;
 
-            if (result.verdict === 'whitelist') {
-                // B1 修复：stats 首次计数，不重复累加
-                if (!rec.counted.p) { rec.counted.p = 1; this._incStat('protected'); }
-                EventBus.emit('iframe:protected', { iframe, reason: 'whitelist' });
-                return;
-            }
             if (result.verdict === 'ad') {
                 this._blockIframe(iframe, result.reasons.join(','));
                 return;
@@ -9904,21 +9737,6 @@
                     });
                 });
             } catch (e) { Log.warn(e.message || e); }
-        },
-
-        // B4 新增：白名单零输入——行内保护
-        protectInFrame(rec) {
-            if (!rec || !rec.el) return;
-            const frameHost = rec.frameHost || '';
-            const selector = rec.selector || (rec.el.id ? '#' + rec.el.id : '');
-            WhitelistStore.add({ selector, domain: frameHost, reason: 'scan-pick' });
-            // 恢复被隐藏的元素
-            try { BlockEngine.showElement(rec.el); } catch (e) { Log.warn(e.message || e); }
-            const r = IframeGuard._ensureRecord(rec.iframe || rec.el.closest('iframe'));
-            if (r) r.manual = true;
-            EventBus.emit('iframe:protected', { record: rec, reason: 'whitelist-pick' });
-            // H1 FIX: IframeGuard 无 showToast，由面板调用侧 showToast
-            return true;
         },
 
         getStats() { return this._stats; },

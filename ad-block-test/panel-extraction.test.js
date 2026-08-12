@@ -91,3 +91,48 @@ describe('Hidden-defect regression guards (v8.5)', () => {
         expect(codeRefs.length).toBe(0);
     });
 });
+
+/**
+ * v8.6 iframe 防线修复回归守卫
+ * 守卫不变量：
+ *  1) 无效的白名单功能已从 iframe 面板彻底删除（WhitelistStore 不再被引用）。
+ *  2) 面板「拦截选中」对 iframe 帧必须写入持久 iframeBlock 规则，刷新后自动拦截，
+ *     且能被「管理规则与防御策略」统一列出/删除/禁用。
+ *  3) 管理面板确实消费 getIframeBlocks() 并归类为 iframeBlock，证明 iframe 规则被集中管理。
+ */
+describe('iframe 防线修复回归守卫 (v8.6)', () => {
+    it('iframe 白名单已从 IframePanel 完全移除（无效功能删除）', () => {
+        // 用户反馈：白名单完全无效（ProtectedCheck 从不查白名单，面板手动拦截直穿）。
+        // 删除后应无任何白名单 UI / 逻辑残留于 iframe 面板。
+        const iframePanel = content.slice(content.indexOf('function IframePanel()'));
+        expect(iframePanel).not.toContain('btn-protect-iframe');
+        expect(iframePanel).not.toContain('iframe-wl-list');
+        expect(iframePanel).not.toContain('renderWlList');
+        // 已删除的 WhitelistStore 模块不得在 iframe 面板代码区域被引用
+        expect(iframePanel).not.toContain('WhitelistStore');
+    });
+
+    it('拦截选中 iframe 帧时写入持久 iframeBlock 规则（刷新持续生效 + 进入管理面板）', () => {
+        // 回归：旧实现仅 BlockEngine.hideElement(iframe) + rec.blocked=true（都在内存，刷新即丢失，
+        // 也不出现在「管理规则与防御策略」）。新实现对跨域 iframe 写入 srcDomain 持久规则。
+        const iframePanel = content.slice(content.indexOf('function IframePanel()'));
+        expect(iframePanel).toContain('storage.addIframeRule({ matchType: \'srcDomain\', value: u.hostname })');
+        // 不再依赖内存态 rec.blocked 作为唯一拦截手段（仍设置，但规则已持久）
+        expect(iframePanel).toContain('IframeGuard._incStat(\'blocked\')');
+        // 提示文案说明已写入持久规则、可在管理面板统一管理
+        expect(iframePanel).toContain('已写入持久规则');
+        expect(iframePanel).toContain('管理规则与防御策略');
+    });
+
+    it('管理面板（管理规则与防御策略）消费 iframeBlock 规则并集中管理', () => {
+        // 守卫：iframe 防线的拦截规则必须出现在「管理规则与防御策略」列表中（可读/删除/禁用），
+        // 否则用户无法统一管理。getIframeBlocks() 返回的规则需被 buildRecords 归类为 iframeBlock。
+        const managerPanel = content.slice(content.indexOf('function ManagerPanel()'));
+        expect(managerPanel).toContain('this.storage.getIframeBlocks().forEach');
+        expect(managerPanel).toContain("type: 'iframeBlock'");
+        // 删除/禁用按钮对 iframeBlock 走独立 API（rescanAll 即时生效），证明可管理
+        expect(content).toContain('this.storage.removeIframeRule(index)');
+        expect(content).toContain('this.storage.toggleIframeRuleDisabled(index)');
+    });
+});
+
