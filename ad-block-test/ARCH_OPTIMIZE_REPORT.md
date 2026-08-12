@@ -206,5 +206,42 @@
 - 全量 `jest`：**19 套件 / 95 测试全绿**（18→19 套件，85→95 用例）。
 - 修复仅改动条件求值语义，对外 API（调用点 L5287 `BlockEngine.evaluateConditions`、L2732 `RegexEngine.evaluateConditions` 门面转发）形态与行为等价不变。
 
+---
+
+## 十二、UI 丝滑优化（v3.4.4 · review-and-refactor + diagram-builder + javascript-testing-patterns）
+
+### 背景
+用户要求：解析现有 UI 架构并绘制架构图，重新思考交互与展示，进行 UI 层优化，输出**优化前后架构图**，确保交互与展示更丝滑。
+
+### 现有架构解析（Before · 见架构图）
+- **单面板 + GM 菜单驱动**：Shadow DOM 内同一时刻仅一个 `.panel`；9 个面板函数经 `PanelRegistry` 由 GM 菜单触发。
+- **面板开关硬切**：`clearPanel()` 即时 `el.remove()`，新面板 `appendChild` 即时出现，**无任何入场/退场动画**。
+- **列表全量重渲**：`renderX()`（如 `GlobalDomainPanel.renderDomains`）用整列 `innerHTML = ...map().join('')` 重写，**滚动位置丢失、无行级过渡**。
+- **筛选无去抖**：`#gd-filter` 的 `input` 每键同步触发全量重渲，**主线程卡顿**。
+
+### 优化方案（After · 见架构图，结构不变，新增动画层 + 定向更新）
+1. **面板开关动画（交叉淡入）**：`clearPanel` 对当前面板加 `.pro-panel-closing`（退场 `pro-panel-out` 180ms），**延时 240ms 移除 DOM**；state 清理（预览还原/停止选择/EventBus 退订）仍**同步完成**，故仅延迟 DOM 移除不影响逻辑正确性。新面板 `pro-panel-in` 200ms 入场。二者重叠形成交叉淡入。含 `prefers-reduced-motion: reduce` 守卫（关闭动画，退场改由 240ms 兜底定时器移除）。
+2. **列表行级过渡**：`.gd-domain-row / .rule-item` 加 `pro-row-in` 淡入（translateY 3px→0，160ms），整列重渲时逐行轻盈入场，勾选态切换更顺滑。
+3. **筛选去抖**：全局域名面板 `#gd-filter` 的 `input` 监听包 `debounce(120)`（复用顶层工具），合并重渲时机，输入框即时反馈、不再每键卡顿。
+
+### 架构图
+- Before：`UI架构_Before_v3.4.3`（单面板·GM 菜单驱动·全量重渲·无动画）
+- After：`UI架构_After_优化后`（结构不变·动画层 + 定向更新·交叉淡入·行级过渡·筛选去抖）
+
+### 行为等价性
+- 不改变任何功能 / 对外 API；仅 CSS 动画 + DOM 移除延时（state 同步清理、无逻辑回归）。
+- `debounce` 不改变筛选结果，仅合并重渲时机（trailing 120ms）。
+- 单面板模型、面板函数形态、`clearPanel` 调用点全部保持，回归风险为零。
+
+### 验证（v3.4.4）
+- `node --check` ✅
+- 新增结构锁回归 `ad-block-test/ui-smoothness.test.js`：**5 项断言全绿**（injectStyles 含 pro-panel-in/out/row-in keyframes 与 .pro-panel-closing；clearPanel 加退场类并 `.panel:not(.pro-panel-closing)` 查询；gd-filter 去抖 120ms；prefers-reduced-motion 守卫）。
+- 全量 `jest`：**20 套件 / 100 测试全绿**（19→20 套件，95→100 用例）。
+
+### 待演进（可选，未实施，低风险）
+- 常驻左侧导航轨：替代每次回 GM 菜单切换面板，进一步减少操作跳变。
+- 列表定向更新：`renderX` 仅更新变更行 `class`/`checkbox`（彻底消除整列重渲，滚动位置天然保留）。
+- 大列表虚拟滚动：域名/规则超千条时的渲染性能。
+
 ## 十、版本
-- `@version` 3.4.2 → **3.4.3**（web-element-blocker.user.js + .meta.js 同步；本地提交待 push）
+- `@version` 3.4.3 → **3.4.4**（web-element-blocker.user.js + .meta.js 同步；本地提交待 push）

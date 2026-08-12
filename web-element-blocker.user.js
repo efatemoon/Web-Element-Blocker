@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.3
+// @version      3.4.4
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -4882,7 +4882,7 @@
             renderDomains();
         });
 
-        panel.querySelector('#gd-filter').addEventListener('input', (e) => { filterText = e.target.value.trim().toLowerCase(); renderDomains(); });
+        panel.querySelector('#gd-filter').addEventListener('input', debounce((e) => { filterText = e.target.value.trim().toLowerCase(); renderDomains(); }, 120));
         panel.querySelector('#gd-only-ads').addEventListener('change', (e) => { onlyAds = e.target.checked; renderDomains(); });
         panel.querySelector('#gd-select-all').addEventListener('click', () => {
             allDomains.forEach(d => selectedHosts.add(d.host));
@@ -7443,6 +7443,17 @@
                     max-height: min(720px, 76vh); overflow-y: auto; color: #eee; text-shadow: 0 1px 2px rgba(0,0,0,0.8);
                     box-sizing: border-box; font-size: 14px; /* 切断宿主页面 font-size 继承，避免面板字体异常放大 */
                 }
+                /* 面板开关动画：入场（淡入+轻微放大）→ 退场（淡出+轻微缩小），与 clearPanel 的延时移除配合形成交叉淡入 */
+                .panel { animation: pro-panel-in 0.2s cubic-bezier(0.2, 0.8, 0.2, 1); }
+                @keyframes pro-panel-in { from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+                @keyframes pro-panel-out { from { opacity: 1; transform: translate(-50%, -50%) scale(1); } to { opacity: 0; transform: translate(-50%, -50%) scale(0.97); } }
+                .panel.pro-panel-closing { animation: pro-panel-out 0.18s cubic-bezier(0.4, 0, 0.2, 1) forwards; pointer-events: none; }
+                /* 列表行级过渡：整列重渲时逐行淡入，勾选态切换更顺滑 */
+                .gd-domain-row, .rule-item { animation: pro-row-in 0.16s ease; }
+                @keyframes pro-row-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+                @media (prefers-reduced-motion: reduce) {
+                    .panel, .panel.pro-panel-closing, .gd-domain-row, .rule-item { animation: none !important; }
+                }
                 @media (max-width: 600px) {
                     .panel { background: rgba(25, 25, 30, 0.52); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); max-width: calc(100vw - 64px); max-height: 70vh; padding: 16px; }
                 }
@@ -8683,12 +8694,21 @@
                 this._iframeUnsubs = null;
             }
 
-            const oldPanel = this.shadowRoot.querySelector('.panel');
-            if (oldPanel && typeof oldPanel._cleanupDrag === 'function') {
-                oldPanel._cleanupDrag();
+            // 退场动画：对当前面板（非正在退场的）加 .pro-panel-closing，延时移除 DOM；
+            // 上方 state 清理已同步完成，故仅延迟 DOM 移除即可形成交叉淡入，不影响逻辑正确性
+            const oldPanel = this.shadowRoot.querySelector('.panel:not(.pro-panel-closing)');
+            if (oldPanel) {
+                if (typeof oldPanel._cleanupDrag === 'function') oldPanel._cleanupDrag();
+                oldPanel.classList.add('pro-panel-closing');
+                if (!oldPanel._closingScheduled) {
+                    oldPanel._closingScheduled = true;
+                    const removePanel = () => { if (oldPanel.isConnected) oldPanel.remove(); };
+                    oldPanel.addEventListener('animationend', removePanel, { once: true });
+                    setTimeout(removePanel, 240); // 兜底：prefers-reduced-motion 下 animation:none 不触发 animationend
+                }
             }
-            // 保留 Toast/横幅等瞬时元素，仅移除面板与确认弹窗
-            this.shadowRoot.querySelectorAll('.panel, .pro-confirm-overlay').forEach(el => {
+            // 保留 Toast/横幅等瞬时元素，仅移除面板与确认弹窗（正在退场的面板由自身定时器移除）
+            this.shadowRoot.querySelectorAll('.panel:not(.pro-panel-closing), .pro-confirm-overlay').forEach(el => {
                 if (typeof el._cleanupDrag === 'function') el._cleanupDrag();
                 el.remove();
             });
