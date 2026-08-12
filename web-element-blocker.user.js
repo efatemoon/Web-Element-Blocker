@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.2
+// @version      3.4.3
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -1752,13 +1752,34 @@
         // 积木模式：对单个元素评估所有条件，按 logic(AND/OR) 聚合结果
         evaluateConditions(conditions, logic, el) {
             const results = conditions.map(c => {
-                let val = '';
-                if (c.type === 'text') val = el.textContent || '';
-                else if (c.type === 'class') val = el.className || '';
-                else if (c.type === 'id') val = el.id || '';
-                if (c.operator === 'contains') return val.includes(c.value);
-                if (c.operator === 'not_contains') return val !== '' && !val.includes(c.value);
-                if (c.operator === 'equals') return val.trim() === c.value.trim();
+                if (c.type === 'text') {
+                    const val = (el.textContent || '') + '';
+                    if (c.operator === 'contains') return val.includes(c.value);
+                    // FIX-A：not_contains 对空文本应返回 true（"不含 X"对空值恒真），
+                    // 原 `val !== '' && !val.includes(...)` 在空文本时误返回 false，导致 AND 规则漏匹配
+                    if (c.operator === 'not_contains') return !val.includes(c.value);
+                    if (c.operator === 'equals') return val.trim() === (c.value || '').trim();
+                    return false;
+                }
+                if (c.type === 'class') {
+                    // FIX-C：按独立 class 词元匹配，而非整串 className 字符串比较。
+                    // 原实现用 `"header nav" === "header"` 判断 equals → 多 class 元素永远不匹配；
+                    // contains/not_contains 改为逐词元子串，equals 改为词元精确命中，与 generateOptimalSelector 口径一致
+                    const cls = (el.className && typeof el.className === 'string') ? el.className.trim() : '';
+                    const tokens = cls ? cls.split(/\s+/) : [];
+                    if (c.operator === 'equals') return tokens.indexOf(c.value) !== -1;
+                    const hit = tokens.some(t => t.includes(c.value || ''));
+                    if (c.operator === 'contains') return hit;
+                    if (c.operator === 'not_contains') return !hit;
+                    return false;
+                }
+                if (c.type === 'id') {
+                    const val = (el.id || '') + '';
+                    if (c.operator === 'contains') return val.includes(c.value);
+                    if (c.operator === 'not_contains') return !val.includes(c.value);
+                    if (c.operator === 'equals') return val.trim() === (c.value || '').trim();
+                    return false;
+                }
                 return false;
             });
             return logic === 'AND' ? results.every(r => r) : results.some(r => r);

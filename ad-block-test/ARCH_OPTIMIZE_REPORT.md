@@ -167,5 +167,44 @@
 - `node --check` ✅
 - `jest`：**18 套件 / 85 测试全绿**（16→18 套件，81→85 用例；新增 debounce.test.js + navigation 结构锁）。
 
+---
+
+## 十一、隐藏 bug 复审（v3.4.3 · review-and-refactor + javascript-testing-patterns）
+
+延续第九节的复审方法，对 `RegexEngine.evaluateConditions`（积木/complex 规则的条件求值核心）做**字面语义级**审查，发现并修复 **2 个隐藏正确性 bug**（均非用户直接报告，会静默导致复杂规则漏匹配/误匹配）。两处均通过 `new Function` 抽取**真实源码**做回归测试（非复刻），并已做旧版本反向验证确认确为假阴性而非假阳性修复。
+
+### Bug A：class/id/text 的 `not_contains` 对空属性误判为 false（FIX-A）
+- **位置**：`RegexEngine.evaluateConditions`（user.js L1753）的 `text` 分支（及 `id` 分支同源问题）。
+- **根因（旧逻辑）**：`if (c.operator === 'not_contains') return val !== '' && !val.includes(c.value);`
+  当元素文本/属性为**空串**时，`val !== ''` 为 `false` → 整体短路返回 `false`。
+  但语义上「**不含 X**」对「空值」应恒为 `true`（空值不可能含有任何 X）。
+- **触发后果**：若一条 `AND` 复杂规则含一个 `not_contains`（如「文本不含『广告』」），而某元素恰好没有文本/属性为空，`not_contains` 返回 `false` → `results.every()` 整条 AND 规则判 `false` → **本应被隐藏的元素漏匹配、未被屏蔽**。
+- **修复**：`not_contains` 统一为 `return !val.includes(c.value);`（空值 `!''.includes(X)` → `true`，正确）。`text` 与 `id` 两分支均修正。
+- **回归测试**：`ad-block-test/complex-rule-logic.test.js` 新增 4 项断言覆盖 `text`/`class`/`id` 的 `not_contains` 空值返回 `true`。
+
+### Bug C：class 的 `equals` 用整串 className 比较，多 class 元素永远不匹配（FIX-C）
+- **位置**：`RegexEngine.evaluateConditions` 的 `class` 分支。
+- **根因（旧逻辑）**：`if (c.operator === 'equals') return val.trim() === c.value.trim();`
+  其中 `val` 是元素**整个 `className` 字符串**（如 `"header nav"`），而规则 `c.value` 往往是单个 class（如 `"header"`）。
+  字符串全等比较 → `"header nav" === "header"` 永远 `false` → **任何带多个 class 的元素，其 `class equals` 条件恒不成立**。
+- **触发后果**：积木规则若以「`class equals header`」作为定位条件，对真实页面中绝大多数列举多 class 的元素（`<div class="header nav">`、`<header class="site-header mobile">`）一律失效；`contains`/`not_contains` 同样受整串拼词影响（子串误命中/漏命中边界不确定）。
+- **修复**：按独立 class **词元**匹配，与 `SelectorBuilder.generateOptimalSelector` 口径一致：
+  ```js
+  const cls = (el.className && typeof el.className === 'string') ? el.className.trim() : '';
+  const tokens = cls ? cls.split(/\s+/) : [];
+  if (c.operator === 'equals') return tokens.indexOf(c.value) !== -1;          // 词元精确命中
+  const hit = tokens.some(t => t.includes(c.value || ''));
+  if (c.operator === 'contains') return hit;                                   // 逐词元子串
+  if (c.operator === 'not_contains') return !hit;
+  ```
+- **回归测试**：`complex-rule-logic.test.js` 新增 6 项断言——多 class `equals` 命中、单 class 基线、子串 `contains` 不误命中整串、子串 `not_contains` 语义保持、`AND`/`OR` 聚合。
+
+### 验证汇总（v3.4.3）
+- `node --check` ✅
+- **旧版本反向验证**：字面复现 v3.4.2 的 `evaluateConditions`，对 4 个关键用例（FIX-A 的 class/id/text 空值 `not_contains`、FIX-C 多 class `equals`）**全部返回错误结果**，确认 2 处确为历史 bug、本次修复非假阳性。
+- 新增回归套件 `ad-block-test/complex-rule-logic.test.js`：**10 项断言全绿**（用 `extractMethod` + `new Function` 抽取真实源码求值，非复刻）。
+- 全量 `jest`：**19 套件 / 95 测试全绿**（18→19 套件，85→95 用例）。
+- 修复仅改动条件求值语义，对外 API（调用点 L5287 `BlockEngine.evaluateConditions`、L2732 `RegexEngine.evaluateConditions` 门面转发）形态与行为等价不变。
+
 ## 十、版本
-- `@version` 3.4.1 → **3.4.2**（web-element-blocker.user.js + .meta.js 同步；本地提交待 push）
+- `@version` 3.4.2 → **3.4.3**（web-element-blocker.user.js + .meta.js 同步；本地提交待 push）
