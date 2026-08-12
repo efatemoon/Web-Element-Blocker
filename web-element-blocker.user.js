@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.0
+// @version      3.4.1
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -4202,6 +4202,13 @@
             document.addEventListener('click', function (e) {
                 // 统一保护：脚本自身 UI 宿主内的点击不处理，避免误删面板
                 if (ProtectedCheck.isProtected(e.target)) return;
+                // 仅当命中容器确为广告型覆盖层时才移除 DOM：防止"class 含 overlay 的正常页面弹窗
+                // （如 Element-Plus 的 .el-overlay/.el-drawer）被整块误删"——这是"正常元素点击后消失"的主因之一
+                const _isAdOverlayContainer = (node) => {
+                    if (!node || !node.className) return false;
+                    const cls = (typeof node.className === 'string' ? node.className : (node.className.baseVal || '')).toLowerCase();
+                    return VICE_CONTAINER_RE.test(cls) || VICE_CONTAINER_RE.test((node.id || '').toLowerCase());
+                };
                 // 先检查 <a href> 跳转
                 const link = e.target.closest && e.target.closest('a');
                 if (link) {
@@ -4211,8 +4218,9 @@
                         e.stopPropagation();
                         Log.warn('[OverlayScanEngine] 拦截链接:', href);
                         const container = link.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || link;
-                        // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
-                        if (!ProtectedCheck.isProtected(container)) container.remove();
+                        // 删除前再次校验保护，避免误删脚本自身 UI 的祖先；
+                        // 且仅当容器确为广告型覆盖层（含博彩/广告词类名）才移除，否则仅阻断跳转、保留页面 UI
+                        if (!ProtectedCheck.isProtected(container) && _isAdOverlayContainer(container)) container.remove();
                         return;
                     }
                 }
@@ -4232,8 +4240,8 @@
                                     e.stopImmediatePropagation && e.stopImmediatePropagation();
                                     Log.warn('拦截onclick跳转:', url[1]);
                                     const container = target.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || target;
-                                    // 删除前再次校验保护，避免误删脚本自身 UI 的祖先
-                                    if (!ProtectedCheck.isProtected(container)) container.remove();
+                                    // 仅当容器确为广告型覆盖层才移除，否则仅阻断跳转、保留页面 UI
+                                    if (!ProtectedCheck.isProtected(container) && _isAdOverlayContainer(container)) container.remove();
                                     return;
                                 }
                             }
@@ -4292,6 +4300,11 @@
                         }
                     }
                 }
+                // 自托管/内网站点常以 IPv4(LAN)或当前域名自身访问：导航到"当前站点自身"永不拦截。
+                // 否则全站链接/按钮会被裸 IP 判定误杀——表现为"链接点不动 + 点击元素被整块移除消失"
+                // （OpenList 等后台通常以 http://192.168.x.x:5244 访问，内部 SPA 链接 hostname 即该 IPv4）。
+                // 显式封禁当前站点的需求极罕见，且用户可在 blockedDomains 中精确添加，故此处对同源导航网开一面。
+                if (h === (location.hostname || '').toLowerCase()) return false;
                 const tokens = h.split(/[^a-z0-9-]/);
                 // B13 修复：短词(≤3字符)如 go/link/click 单独判定会误杀 go.microsoft.com、link.springer.com 等合法跳转
                 // 长词(≥4字符)如 casino/poker/baccarat 可单独判定
@@ -4301,7 +4314,10 @@
                     if (VICE_LONG_TOKENS.has(t)) return true;
                     if (VICE_SHORT_TOKENS_NAV.has(t) && GAMBLING_TLDS.has(tld)) return true;
                 }
-                if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return true;
+                // 移除「裸 IPv4 即拦截」的旧启发式：内网/自托管后台常以 IPv4 互链
+                // （如 OpenList 站内 SPA、NAS 管理页跳转），裸 IP 不是广告证据，
+                // 该规则会批量误杀正常元素（表现为「链接点不动 + 点击元素整块消失」）。
+                // 真实 IP 型广告服务器应由用户在 blockedDomains 中显式封禁。
                 if (/bit\.ly|t\.cn|tinyurl|goo\.gl|ow\.ly|cutt\.ly|rebrand\.ly/i.test(h)) return true;
                 return false;
             } catch (e) { return false; }
