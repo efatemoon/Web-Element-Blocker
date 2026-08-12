@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.1
+// @version      3.4.2
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -76,11 +76,14 @@
     'use strict';
 
     function debounce(func, wait, maxWait) {
-        let timeout, lastExec = 0;
+        let timeout, lastExec = null;
         return function (...args) {
             const now = Date.now();
             clearTimeout(timeout);
-            if (maxWait && now - lastExec >= maxWait) {
+            // 仅当函数曾经执行过（lastExec != null）且距上次执行已超过 maxWait 时才立即触发；
+            // 首次调用 lastExec 为 null，必须走尾沿 setTimeout(wait)，否则会在 MutationObserver
+            // 首帧同步执行重扫描，造成主线程卡顿并破坏去抖语义
+            if (maxWait && lastExec !== null && now - lastExec >= maxWait) {
                 lastExec = now;
                 func.apply(this, args);
             } else {
@@ -4202,13 +4205,10 @@
             document.addEventListener('click', function (e) {
                 // 统一保护：脚本自身 UI 宿主内的点击不处理，避免误删面板
                 if (ProtectedCheck.isProtected(e.target)) return;
-                // 仅当命中容器确为广告型覆盖层时才移除 DOM：防止"class 含 overlay 的正常页面弹窗
-                // （如 Element-Plus 的 .el-overlay/.el-drawer）被整块误删"——这是"正常元素点击后消失"的主因之一
-                const _isAdOverlayContainer = (node) => {
-                    if (!node || !node.className) return false;
-                    const cls = (typeof node.className === 'string' ? node.className : (node.className.baseVal || '')).toLowerCase();
-                    return VICE_CONTAINER_RE.test(cls) || VICE_CONTAINER_RE.test((node.id || '').toLowerCase());
-                };
+                // 点击拦截器只负责「阻断跳转到封禁域名」，绝不移除页面 DOM。
+                // DOM 隐藏交由覆盖层扫描引擎（透明门控 autoBlock）统一处理；否则
+                // class 含 overlay 的正常页面弹窗（如 Element-Plus 的 .el-overlay/.el-drawer）
+                // 会被整块误删——这是「正常元素点击后消失」的主因。
                 // 先检查 <a href> 跳转
                 const link = e.target.closest && e.target.closest('a');
                 if (link) {
@@ -4217,10 +4217,6 @@
                         e.preventDefault();
                         e.stopPropagation();
                         Log.warn('[OverlayScanEngine] 拦截链接:', href);
-                        const container = link.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || link;
-                        // 删除前再次校验保护，避免误删脚本自身 UI 的祖先；
-                        // 且仅当容器确为广告型覆盖层（含博彩/广告词类名）才移除，否则仅阻断跳转、保留页面 UI
-                        if (!ProtectedCheck.isProtected(container) && _isAdOverlayContainer(container)) container.remove();
                         return;
                     }
                 }
@@ -4239,9 +4235,6 @@
                                     e.stopPropagation();
                                     e.stopImmediatePropagation && e.stopImmediatePropagation();
                                     Log.warn('拦截onclick跳转:', url[1]);
-                                    const container = target.closest('[class*="ad"],[class*="popup"],[class*="banner"],[class*="overlay"]') || target;
-                                    // 仅当容器确为广告型覆盖层才移除，否则仅阻断跳转、保留页面 UI
-                                    if (!ProtectedCheck.isProtected(container) && _isAdOverlayContainer(container)) container.remove();
                                     return;
                                 }
                             }

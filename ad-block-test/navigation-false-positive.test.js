@@ -11,7 +11,9 @@
  * 修复：
  *   1) _isBlockedNav 对「导航到当前站点自身(hostname 相同)」网开一面 → return false
  *   2) 移除「裸 IPv4 即拦截」的旧启发式（内网/自托管常以 IPv4 互链，裸 IP 非广告证据）
- *   3) 全局 click 处理器的移除逻辑仅对「确有博彩/广告词类名的容器」(_isAdOverlayContainer)生效
+ *   3) v3.4.2：全局 click 处理器彻底移除破坏性 container.remove()，只保留跳转拦截
+ *      （之前的 _isAdOverlayContainer 护栏因 VICE_CONTAINER_RE 含 overlay|modal 等
+ *       词、对 Element-Plus .el-overlay/.el-drawer 仍判 true，护栏形同虚设）
  *
  * 本测试抽取产物内真实的 _isBlockedNav 函数源码做单元回归（行为等价、不重实现）。
  * 通过 new Function 将 location 与词集以局部变量形式注入，避免依赖全局且规避测试运行器差异。
@@ -109,5 +111,18 @@ describe('导航拦截误杀回归（_isBlockedNav）', () => {
         // go.microsoft.com / link.springer.com 不应误杀
         expect(_isBlockedNav('http://go.microsoft.com/', new Set())).toBe(false);
         expect(_isBlockedNav('http://link.springer.com/', new Set())).toBe(false);
+    });
+
+    test('点击拦截器已移除破坏性 DOM 移除（防止正常元素消失回归锁）', () => {
+        // v3.4.2 结构性锁：全局 click 监听器内不得出现 container.remove() / _isAdOverlayContainer。
+        // 之前的护栏因 VICE_CONTAINER_RE 含 overlay|modal|mask|cover|layer 等通用词，
+        // 对 Element-Plus .el-overlay/.el-drawer 仍判 true，护栏形同虚设；
+        // 现改为点击拦截器只阻断跳转、绝不改页面 DOM，从结构上杜绝误删。
+        expect(SOURCE).not.toMatch(/_isAdOverlayContainer/);
+        const clickIdx = SOURCE.indexOf("document.addEventListener('click'");
+        expect(clickIdx).toBeGreaterThan(-1);
+        const endIdx = SOURCE.indexOf('}, true);', clickIdx);
+        const clickRegion = SOURCE.slice(clickIdx, endIdx);
+        expect(clickRegion).not.toMatch(/\.remove\(\)/);
     });
 });
