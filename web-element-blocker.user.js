@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.6
+// @version      3.4.8
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -4697,13 +4697,16 @@
         for (const r of (gdsResult.results || [])) gdsMap.set(r.hostname, r);
 
         // 合并：existing scoredDomains 为基线，叠加 GDS 的 12 维评分与博彩色情标记，过滤已封杀域名
-        let allDomains = scoredDomains.filter(d => !blockedDomainSet.has(d.host)).map(d => {
+        // 统一小写 host：避免与 blockedDomainSet（已小写）过滤时漏过滤、与下方 selectedHosts
+        // （点击时 row.dataset.host.toLowerCase()）大小写不一致导致重复封杀/勾选错位(BUG-X3)
+        let allDomains = scoredDomains.filter(d => !blockedDomainSet.has((d.host || '').toLowerCase())).map(d => {
             const g = gdsMap.get(d.host);
-            if (!g) return d;
+            if (!g) return { ...d, host: (d.host || '').toLowerCase() };
             // 取较高分（GDS 12维更精细，但保留原有 sources/reasons）
             const mergedScore = Math.max(d.score, g.score);
             return {
                 ...d,
+                host: (d.host || '').toLowerCase(),
                 score: mergedScore,
                 viceToken: g.viceToken || null,
                 adToken: g.adToken || null,
@@ -4768,7 +4771,9 @@
                         : d.level === 'suspect' ? '<span class="tag" style="background:rgba(255,149,0,0.55);">可疑</span>'
                             : d.level === 'watch' ? '<span class="tag" style="background:rgba(120,144,156,0.5);">关注</span>' : '';
                     const reasons = (d.gdsReasons && d.gdsReasons.length) ? d.gdsReasons.slice(0, 3).join(', ')
-                        : (d.reasons.length ? d.reasons.slice(0, 3).join(', ') : '');
+                        // reasons 可能缺失（如 extractResourceDomains 未返回该字段），必须做存在性守护，
+                        // 否则 d.reasons.length 抛 TypeError 导致整个面板渲染中断(BUG-C1)
+                        : ((d.reasons && d.reasons.length) ? d.reasons.slice(0, 3).join(', ') : '');
                     const sources = d.sources.map(sourceLabel).join('、');
                     return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-host="${escapeHTML(d.host)}">
                             <div class="gd-left">
@@ -4835,7 +4840,14 @@
         panel.querySelector('#gd-filter').addEventListener('input', debounce((e) => { filterText = e.target.value.trim().toLowerCase(); renderDomains(); }, 120));
         panel.querySelector('#gd-only-ads').addEventListener('change', (e) => { onlyAds = e.target.checked; renderDomains(); });
         panel.querySelector('#gd-select-all').addEventListener('click', () => {
-            allDomains.forEach(d => selectedHosts.add(d.host));
+            // 仅选中当前可见（通过过滤）的域名，避免"全选"勾选被 onlyAds/关键字过滤隐藏的项，
+            // 导致选中数虚高、用户却看不到被选中项(BUG-DISPLAY)
+            const visible = allDomains.filter(d => {
+                if (filterText && !d.host.includes(filterText)) return false;
+                if (onlyAds && !isAdLike(d)) return false;
+                return true;
+            });
+            visible.forEach(d => selectedHosts.add(d.host));
             updateGlobalPreview();
             renderDomains();
         });
@@ -4898,7 +4910,7 @@
                             exist.score = Math.max(exist.score, sd.score);
                             if (!exist.sources.includes('dom-resource')) exist.sources.push('dom-resource');
                         } else {
-                            const newD = { host: sd.host, score: sd.score, count: sd.count || 1, sources: sd.sources || ['dom-resource'], reasons: sd.reasons || [], viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 };
+                            const newD = { host: (sd.host || '').toLowerCase(), score: sd.score, count: sd.count || 1, sources: sd.sources || ['dom-resource'], reasons: sd.reasons || [], viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 };
                             existingMap.set(sd.host, newD);
                             allDomains.push(newD);
                         }
@@ -5821,8 +5833,9 @@
         if (!this._iframeUnsubs) this._iframeUnsubs = [];
         this._iframeUnsubs.push(EventBus.on('iframe:stats', () => render()));
 
-        // 初始加载
-        runScan(true);
+        // 初始加载：runScan(false) 先渲染"正在扫描"占位，待 collectAll 完成后用真实结果重绘，
+        // 避免异步扫描期间列表空白、用户误以为无 iframe(BUG-SCAN)
+        runScan(false);
     }
 
     function ManagerPanel() {
@@ -6029,7 +6042,8 @@
             const list = panel.querySelector('#mgr-list');
             const stats = panel.querySelector('#mgr-stats');
             const countEl = panel.querySelector('#mgr-domain-count');
-            if (countEl) countEl.textContent = records.filter(r => r.scope === 'global').length;
+            // 仅统计域名黑名单(domainBlock)，排除 iframeBlock 规则，否则"全局域名黑名单"计数被虚高(BUG-COUNT)
+            if (countEl) countEl.textContent = records.filter(r => r.scope === 'global' && r.type === 'domainBlock').length;
             if (!list) return;
             // 影响度模式下按 impactScore 降序，让高风险（疑似误杀）规则置顶
             const displayRecords = impactMode
@@ -6949,7 +6963,9 @@
                 btn.textContent = '🤖 深度扫描';
                 if (ok) {
                     const ex = lastDeepExtras;
-                    const note = ex ? `（深度新增：🎨肤色图 ${ex.viceImages.length} · 🔐混淆跳转 ${ex.obfuscatedUrls.length} · ::伪元素 ${ex.pseudoInjects.length} · 🔤自定义字体 ${ex.customFontEls.length}）` : '';
+                    // 防御：deepExtras 各字段可能缺失（不同 OverlayService 版本返回结构不同），
+                    // 直接访问 .length 会抛 TypeError 导致 Toast 渲染崩溃(BUG-DEEPEX)
+                    const note = ex ? `（深度新增：🎨肤色图 ${(ex.viceImages || []).length} · 🔐混淆跳转 ${(ex.obfuscatedUrls || []).length} · ::伪元素 ${(ex.pseudoInjects || []).length} · 🔤自定义字体 ${(ex.customFontEls || []).length}）` : '';
                     this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。${note}`, 'success', 6000);
                 }
             });
@@ -7565,6 +7581,8 @@
                     color: #fff; font-size: 13px; display: flex; align-items: center; gap: 8px;
                     transform: translateX(120%); transition: transform 0.3s cubic-bezier(0.4,0,0.2,1);
                     box-shadow: 0 8px 32px rgba(0,0,0,0.3); max-width: 360px; word-break: break-all;
+                    /* 容器 pointer-events:none 让点击穿透，但 Toast 自身需恢复交互，否则撤销按钮不可点击(BUG-Y1) */
+                    pointer-events: auto;
                 }
                 .pro-toast.pro-toast-show { transform: translateX(0); }
                 .pro-toast.pro-toast-hide { transform: translateX(120%); opacity: 0; }
@@ -8367,6 +8385,10 @@
             // 域名选择状态：默认全选检测到的域名，用户可在面板内逐个取消（解决问题1：原版只能全量封杀）
             this._actionHosts = null;
             this._actionHostsEl = null;
+            // BUG-Y2 修复：若当前选中元素位于同源 iframe 内，规则必须写在该 iframe 的 host 下，
+            // 否则 addRule 会落到外层页面 host，刷新后 iframe 内容（不同 host）不再命中该规则，导致"拦截无效/复活"。
+            // ctxHost 非空时，静态/动态/结构规则改走 addRuleForDomain(ctxHost, ...) 并即时隐藏 live 元素。
+            const ctxHost = this._selectionIframeContext ? safeURLHostname(this._selectionIframeContext.iframe.src) : null;
 
             const panel = document.createElement('div');
             panel.className = 'panel';
@@ -8464,7 +8486,12 @@
             // 静态路径拦截
             panel.querySelector('#btn-static').addEventListener('click', () => {
                 const sel = BlockEngine.generateOptimalSelector(this.currentSelectedEl);
-                this.storage.addRule('static', { selector: sel, type: 'static' });
+                if (ctxHost) {
+                    this.storage.addRuleForDomain(ctxHost, 'static', { selector: sel, type: 'static' });
+                    BlockEngine.hideElement(this.currentSelectedEl); // BUG-Y2：跨站规则不经 applyCSSRules，需即时隐藏 live 元素
+                } else {
+                    this.storage.addRule('static', { selector: sel, type: 'static' });
+                }
                 this.clearPanel();
             });
 
@@ -8473,7 +8500,12 @@
                 const el = this.currentSelectedEl;
                 const primaryClass = (el.className || '').split(/\s+/)[0];
                 if (!primaryClass) { this.showToast('当前元素无有效类名，请选择其他拦截方式。', 'warning'); return; }
-                this.storage.addRule('dynamic', { className: primaryClass, type: 'dynamic' });
+                if (ctxHost) {
+                    this.storage.addRuleForDomain(ctxHost, 'dynamic', { className: primaryClass, type: 'dynamic' });
+                    BlockEngine.hideElement(this.currentSelectedEl); // BUG-Y2：同上
+                } else {
+                    this.storage.addRule('dynamic', { className: primaryClass, type: 'dynamic' });
+                }
                 this.clearPanel();
             });
 
@@ -8481,7 +8513,12 @@
             panel.querySelector('#btn-struct').addEventListener('click', () => {
                 const el = this.currentSelectedEl;
                 const sel = BlockEngine.generateStructuralSelector(el);
-                this.storage.addRule('structural', { structSelector: sel, type: 'structural' });
+                if (ctxHost) {
+                    this.storage.addRuleForDomain(ctxHost, 'structural', { structSelector: sel, type: 'structural' });
+                    BlockEngine.hideElement(this.currentSelectedEl); // BUG-Y2：同上
+                } else {
+                    this.storage.addRule('structural', { structSelector: sel, type: 'structural' });
+                }
                 this.clearPanel();
             });
 
@@ -8527,7 +8564,9 @@
                     //         内部的 applyCSSRules 统一重建（会同时应用 pathPattern + domainBlock），无需此处再调一次
                     const pathCandidates = BlockEngine.extractPathCandidates(result);
                     pathCandidates.forEach(p => {
-                        this.storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' }, true);
+                        // BUG-Y2：iframe 上下文下的路径模式须落到 iframe host，否则刷新后不命中
+                        if (ctxHost) this.storage.addRuleForDomain(ctxHost, 'pathPattern', { pattern: p, type: 'pathPattern' });
+                        else this.storage.addRule('pathPattern', { pattern: p, type: 'pathPattern' }, true);
                     });
 
                     // 立即隐藏当前框选的整个广告容器（向上找单子链容器）
