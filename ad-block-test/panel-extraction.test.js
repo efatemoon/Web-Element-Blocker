@@ -68,11 +68,13 @@ describe('Phase B Panel Extraction (god-module slice)', () => {
  * 守卫不变量：抽取/端口化过程引入或遗留的运行时缺陷不得回潮。
  */
 describe('Hidden-defect regression guards (v8.5)', () => {
-    it('IframePanel.renderScanList binds the list click listener ONLY ONCE (guards listener leak)', () => {
-        // 回归：renderScanList 每次重渲染都对复用节点 list 重新 addEventListener，
-        // 会导致监听器指数级累积、面板卡死。修复后必须用 guard 仅绑定一次。
-        expect(content).toContain('if (!list._scanClickBound)');
-        expect(content).toContain('list._scanClickBound = true');
+    it('IframePanel binds the list click listener ONCE outside render() (guards listener leak)', () => {
+        // 旧实现：renderScanList() 每次重渲染都对复用节点 list 重新 addEventListener，
+        // 导致监听器指数级累积、面板卡死。
+        // 新实现（与 OverlayScanPanel 一致）：面板创建时一次性绑定在 #iframe-list 容器上，
+        // 渲染只替换子节点，不存在重复绑定。
+        expect(content).toContain("panel.querySelector('#iframe-list').addEventListener('click'");
+        expect(content).not.toContain('if (!list._scanClickBound)');
     });
 
     it('OverlayScanEngine.scan honors root scope (no silent full-document scan)', () => {

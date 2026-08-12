@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.1.3
+// @version      3.2.0
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -5444,133 +5444,91 @@
         const panel = document.createElement('div');
         panel.className = 'panel';
 
-        const stats = IframeGuard.getStats();
         const config = this.storage.getIframeConfig();
 
         panel.innerHTML = `
                 <h3 title="按住可拖动窗口">🖼️ iframe 防线管理</h3>
-                <p>动态 iframe 广告拦截完整防线：创建拦截 + 递归分类扫描 + 正文保护铁律 + 跨域帧间通信。下方可查看每个 iframe 的分类详情、管理白名单。</p>
+                <p>动态 iframe 广告拦截：扫描页面所有 iframe 及帧内可疑元素，按嫌疑分和分类展示，勾选后统一拦截。</p>
 
-                <div class="status-bar">
-                    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px;">
-                        <div>🖼️ <strong>已拦截：</strong><span style="color:#ff6f00;" id="ifs-blocked">0</span> 个</div>
-                        <div>🛡️ <strong>已保护：</strong><span style="color:#34c759;" id="ifs-protected">0</span> 个</div>
-                        <div>🔍 <strong>已扫描：</strong><span style="color:#4aa3ff;" id="ifs-scanned">0</span> 个</div>
-                        <div>🧹 <strong>内部清理：</strong><span style="color:#9c27b0;" id="ifs-cleaned">0</span> 个</div>
-                    </div>
-                    <div style="font-size:10px; color:#888; margin-top:4px;">统计为本页本次会话累计，刷新后归零</div>
-                </div>
-
-                <div class="section-divider"></div>
-
-                <div style="font-size:13px; color:#4aa3ff; font-weight:bold; margin-bottom:8px;">🔍 iframe 深扫（帧内元素级）</div>
                 <div class="gd-toolbar">
-                    <button class="btn-info" id="btn-iframe-scan" style="flex:none; padding:6px 12px; font-size:12px;">🔄 立即扫描</button>
-                    <button class="btn-warning" id="btn-iframe-rescan" style="flex:none; padding:6px 12px; font-size:12px;">⚡ 重扫全部</button>
-                    <button class="btn-outline" id="btn-iframe-preview" style="flex:none; padding:6px 12px; font-size:12px;" title="预览：勾选后点击预览">🔍 预览效果</button>
-                    <button class="btn-danger" id="btn-iframe-batch-info" style="flex:none; padding:6px 12px; font-size:12px; display:none;">🛡 拦截选中(0)</button>
-                    <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:#ddd; margin:0;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#ddd;cursor:pointer;">
+                        <input type="checkbox" id="if-only-high" /> 只看高风险
+                    </label>
+                    <button class="btn-outline" id="if-select-high">选中高风险</button>
+                    <button class="btn-outline" id="if-select-none">清空</button>
+                    <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#ddd;margin:0;">
                         <span>嵌套深度：</span>
                         <input type="number" id="iframe-max-depth" min="1" max="5" value="${config.maxDepth || 3}"
-                               style="width:50px; padding:4px 6px; background:rgba(0,0,0,0.25); color:#eee; border:1px solid rgba(255,255,255,0.2); border-radius:6px;" />
-                        <span style="font-size:10px; color:#888;">1-5</span>
+                               style="width:50px;padding:4px 6px;background:rgba(0,0,0,0.25);color:#eee;border:1px solid rgba(255,255,255,0.2);border-radius:6px;" />
+                        <span style="font-size:10px;color:#888;">1-5</span>
                     </label>
                 </div>
-                <div class="gd-stats" id="iframe-scan-stats"></div>
-                <div class="gd-scroll-area" id="iframe-scan-list" style="max-height:280px;"></div>
+
+                <div class="gd-stats" id="iframe-stats"></div>
+                <div class="gd-scroll-area" id="iframe-list" style="max-height:320px;"></div>
+
+                <label style="display:flex;align-items:center;gap:6px;margin:8px 0;font-size:12px;color:#ddd;cursor:pointer;">
+                    <input type="checkbox" id="if-block-domain" checked style="cursor:pointer;" />
+                    <span>同时封杀 iframe 源域名（加入全局黑名单，并预览/拦截全页该域资源）</span>
+                </label>
+
+                <div class="btn-group">
+                    <button class="btn-danger" id="btn-block-iframe" style="flex:100%;font-weight:bold;">🛡️ 未选择 iframe</button>
+                </div>
 
                 <div class="section-divider"></div>
 
-                <div style="font-size:13px; color:#4aa3ff; font-weight:bold; margin-bottom:8px;">🛡️ 白名单管理（永不拦截的内容帧）</div>
-                <div class="gd-scroll-area" id="iframe-wl-list" style="max-height:100px;"></div>
-
-                <div class="btn-group" style="margin-top:10px;">
-                    <button class="btn-primary" id="btn-close-iframe">完成</button>
+                <div class="btn-group">
+                    <button class="btn-info" id="btn-deep-scan" title="清除缓存并重新执行帧内深扫">🤖 深度扫描</button>
+                    <button class="btn-warning" id="btn-preview-iframe">🔍 预览效果</button>
+                    <button class="btn-warning" id="btn-rescan-iframe">🔄 重新扫描</button>
+                    <button class="btn-outline" id="btn-close-iframe">关闭</button>
                 </div>
+
+                <div class="section-divider"></div>
+
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                    <div style="font-size:12px;color:#4aa3ff;font-weight:bold;">🛡️ 白名单管理（已保护的内容帧）</div>
+                    <button class="btn-success" id="btn-protect-iframe" style="padding:3px 10px;font-size:11px;" disabled>✅ 保护选中的内容帧</button>
+                </div>
+                <div class="gd-scroll-area" id="iframe-wl-list" style="max-height:100px;"></div>
             `;
 
         this.makeDraggable(panel);
         this.shadowRoot.appendChild(panel);
 
-        // ─── 分类标签与颜色 ───
-        const verdictLabel = (v) => ({
-            'ad': '纯广告', 'content': '内容帧', 'whitelist': '白名单', 'unknown': '未知'
-        }[v] || '未知');
-        const verdictColor = (v) => ({
-            'ad': 'rgba(255,59,48,0.7)', 'content': 'rgba(52,199,89,0.6)',
-            'whitelist': 'rgba(0,122,255,0.6)', 'unknown': 'rgba(120,144,156,0.5)'
-        }[v] || 'rgba(120,144,156,0.5)');
-
-        // ─── B7: iframe:stats 事件订阅 ───
-        if (!this._iframeUnsubs) this._iframeUnsubs = [];
-        this._iframeUnsubs.push(EventBus.on('iframe:stats', (s) => {
-            const set = (id, v) => { const el = panel.querySelector('#' + id); if (el) el.textContent = v; };
-            set('ifs-blocked', s.blocked || 0);
-            set('ifs-protected', s.protected || 0);
-            set('ifs-scanned', s.scanned || 0);
-            set('ifs-cleaned', s.cleaned || 0);
-        }));
-
-        // ─── B8: 已拦截指纹（跨扫描保留） ───
-        const blockedFingerprints = new WeakSet();
-        // WeakMap 不可枚举，以 DOM 存活帧为真实来源反查记录
-        IframeGuard._liveFrames().forEach((iframe) => {
-            const rec = IframeGuard._frameRecords.get(iframe);
-            if (rec && (rec.blocked || rec.manual)) blockedFingerprints.add(iframe);
-        });
-        const isBlocked = (iframe) => blockedFingerprints.has(iframe);
-
-        // ─── B6: 行内零输入生成按钮 ───
-        const mkBlockBtn = (idx) =>
-            `<button class="btn-danger" style="flex:none; padding:3px 8px; font-size:11px; margin-left:6px;" data-action="block" data-idx="${idx}">🛡拦截</button>`;
-        const mkProtectBtn = (idx) =>
-            `<button class="btn-success" style="flex:none; padding:3px 8px; font-size:11px; margin-left:4px;" data-action="protect" data-idx="${idx}">✅保护</button>`;
-
-        // ─── B6/B9/H8/H9/H12: 扫描列表渲染（异步 + 勾选 + 预览 + 批量）───
-        // state 在闭包中保留，跨渲染周期共享
-        let _deepResults = [];
-        let _iframeRecs = [];
-        let _selectedSet = new Set();
-        let _scanning = false;
-        // 扫描缓存：5s 内复用结果，避免每次打开面板都全量深扫
+        // ─── 状态 ───
+        let records = [];
+        let selectedSet = new Set();
+        let onlyHigh = false;
+        let scanning = true;
         let _scanCache = null;
         let _scanCacheTime = 0;
         const SCAN_CACHE_TTL = 5000;
 
-        // 首绘 stats（H9）
-        (() => {
-            const s = IframeGuard.getStats();
-            const set = (id, v) => { const el = panel.querySelector('#' + id); if (el) el.textContent = v; };
-            set('ifs-blocked', s.blocked || 0);
-            set('ifs-protected', s.protected || 0);
-            set('ifs-scanned', s.scanned || 0);
-            set('ifs-cleaned', s.cleaned || 0);
-        })();
+        // 已拦截指纹：跨扫描保留 blocked 状态
+        const blockedFingerprints = new WeakSet();
+        IframeGuard._liveFrames().forEach((iframe) => {
+            const rec = IframeGuard._frameRecords.get(iframe);
+            if (rec && (rec.blocked || rec.manual)) blockedFingerprints.add(iframe);
+        });
 
-        const paintScanStats = (deepResults, iframeRecs) => {
-            const statsBox = panel.querySelector('#iframe-scan-stats');
-            if (!statsBox) return;
-            const deepAd = deepResults.filter(r => r.category && r.category.endsWith('-ad')).length;
-            const deepOk = deepResults.filter(r => r.category && !r.category.endsWith('-ad')).length;
-            statsBox.textContent = `共 ${iframeRecs.length} 个帧 · 帧内 ${deepResults.length} 个可疑元素（广告 ${deepAd} · 内容 ${deepOk}）`;
+        // ─── 标签与颜色 ───
+        const verdictLabel = (v) => ({ 'ad': '广告帧', 'content': '内容帧', 'whitelist': '白名单', 'unknown': '未知' }[v] || '未知');
+        const verdictColor = (v) => ({ 'ad': 'rgba(255,59,48,0.7)', 'content': 'rgba(52,199,89,0.6)', 'whitelist': 'rgba(0,122,255,0.6)', 'unknown': 'rgba(120,144,156,0.5)' }[v] || 'rgba(120,144,156,0.5)');
+        const elementReasonLabel = { 'domain-ad': '域名封杀', 'path-ad': '路径匹配', 'overlay': '透明覆盖', 'vice': '赌博域名', 'skin': '肤色特征' };
+        const getScoreClass = (s) => s >= 50 ? 'high' : s >= 25 ? 'mid' : 'low';
+
+        // 帧级风险分：广告帧最高，未知次之
+        const frameScore = (rec) => {
+            if (rec.blocked || rec.manual) return 0;
+            if (rec.verdict === 'ad') return 100;
+            if (rec.verdict === 'unknown') return 50;
+            return 10;
         };
 
-        const renderScanList = async () => {
-            const list = panel.querySelector('#iframe-scan-list');
-            const statsBox = panel.querySelector('#iframe-scan-stats');
-            if (!list) return;
-
-            // H12: 加载态
-            if (!_scanning) {
-                _scanning = true;
-                list.innerHTML = '<div class="empty-tip" style="text-align:center; padding:16px;">⏳ 扫描中...</div>';
-                if (statsBox) statsBox.textContent = '扫描中...';
-            }
-
-            // 异步深扫，避免同步阻塞 UI
-            await new Promise(r => setTimeout(r, TIMING.MICRO_DELAY_MS));
-
-            // 缓存命中：5s 内复用结果，避免每次打开面板都全量深扫
+        // ─── 采集：合并帧级 + 帧内元素级为统一 records ───
+        const collectAll = async () => {
             const now = Date.now();
             let deepResults;
             if (_scanCache && (now - _scanCacheTime) < SCAN_CACHE_TTL) {
@@ -5578,167 +5536,176 @@
             } else {
                 deepResults = IframeDeepScanner.scanAll();
                 _scanCache = { results: deepResults, time: now };
+                _scanCacheTime = now;
             }
             const iframeRecs = [];
             document.querySelectorAll('iframe').forEach(iframe => {
                 if (ProtectedCheck.isProtected(iframe)) return;
                 const rec = IframeGuard._ensureRecord(iframe);
-                iframeRecs.push({ iframe, rec, _idx: iframeRecs.length });
+                iframeRecs.push({ iframe, rec });
             });
 
-            _deepResults = deepResults;
-            _iframeRecs = iframeRecs;
-            _scanning = false;
+            const out = [];
+            iframeRecs.forEach(({ iframe, rec }) => {
+                const score = frameScore(rec);
+                out.push({
+                    type: 'frame',
+                    iframe,
+                    rec,
+                    highRisk: score >= 50,
+                    blocked: rec.blocked || rec.manual,
+                    suspicion: score,
+                    verdict: rec.verdict
+                });
+            });
+            deepResults.forEach((elRec) => {
+                const cat = elRec.category || 'unknown';
+                const suspicion = elRec.suspicion || 0;
+                out.push({
+                    type: 'element',
+                    elRec,
+                    highRisk: suspicion >= 50,
+                    blocked: elRec.blocked || false,
+                    suspicion,
+                    category: cat
+                });
+            });
+            out.sort((a, b) => b.suspicion - a.suspicion);
+            return out;
+        };
 
-            paintScanStats(deepResults, iframeRecs);
+        // ─── 扫描执行器 ───
+        const runScan = async (skipInitialRender = false) => {
+            if (!skipInitialRender) {
+                scanning = true;
+                render();
+            }
+            try {
+                records = await collectAll();
+                selectedSet = new Set();
+                records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+                scanning = false;
+                render();
+                return true;
+            } catch (e) {
+                scanning = false;
+                Log.error('iframe 扫描失败:', e);
+                this.showToast('扫描失败：' + e.message, 'error');
+                render();
+                return false;
+            }
+        };
 
-            if (deepResults.length === 0 && iframeRecs.length === 0) {
-                list.innerHTML = '<div class="empty-tip">当前页面未发现 iframe 元素。</div>';
+        // ─── 列表渲染 ───
+        const render = () => {
+            const box = panel.querySelector('#iframe-list');
+            const stats = panel.querySelector('#iframe-stats');
+            if (!box) return;
+
+            if (scanning) {
+                box.innerHTML = '<li class="empty-tip">⏳ 正在扫描 iframe...</li>';
+                if (stats) stats.textContent = '正在扫描...';
+                const btn = panel.querySelector('#btn-block-iframe');
+                const protectBtn = panel.querySelector('#btn-protect-iframe');
+                if (btn) btn.disabled = true;
+                if (protectBtn) protectBtn.disabled = true;
                 return;
             }
 
-            const batchInfoBtn = panel.querySelector('#btn-iframe-batch-info');
-            if (batchInfoBtn) batchInfoBtn.textContent = `🛡 拦截选中(${_selectedSet.size})`;
+            const filtered = onlyHigh ? records.map((r, i) => ({ r, i })).filter(({ r }) => r.highRisk) : records.map((r, i) => ({ r, i }));
 
-            const rows = [];
-            // 帧级行：带 checkbox（H8：行 click = 勾选，动作走按钮）
-            iframeRecs.forEach(({ iframe, rec, _idx }) => {
-                const vBadge = `<span class="tag" style="background:${verdictColor(rec.verdict)};">${verdictLabel(rec.verdict)}</span>`;
-                const crossBadge = (rec.frozen && rec.frozen.w > 0) ? '' : '<span class="tag" style="background:rgba(255,149,0,0.5);">跨域</span>';
-                const locked = rec.blocked || rec.manual;
-                const lockBadge = locked
-                    ? `<span class="tag" style="background:${rec.blocked ? 'rgba(255,59,48,0.7)' : 'rgba(0,122,255,0.7)'};">${rec.blocked ? '🔒已拦截' : '🛡已保护'}</span>`
-                    : '';
-                const srcDisplay = (iframe.src || '').length > 50
-                    ? escapeHTML(iframe.src.slice(0, 50)) + '...'
-                    : escapeHTML(iframe.src || '(空)');
-                const frozenInfo = rec.frozen && rec.frozen.w > 0
-                    ? `<div class="gd-meta">尺寸: ${rec.frozen.w}×${rec.frozen.h}px · op=${rec.frozen.opacity} · z=${rec.frozen.zi}</div>` : '';
-                const btns = locked
-                    ? `<span style="font-size:11px; color:#888; margin-left:4px;">锁定</span>`
-                    : mkBlockBtn(_idx) + mkProtectBtn(_idx);
-                const checked = _selectedSet.has(_idx);
-                rows.push(`<div class="gd-domain-row" data-idx="${_idx}" data-type="frame" ${locked ? 'style="opacity:0.7;"' : ''}>
-                        <div class="gd-left">
-                            <input type="checkbox" class="iframe-row-cb" data-idx="${_idx}" ${checked ? 'checked' : ''} style="flex:none; margin-right:6px; cursor:pointer; accent-color:#007AFF;" />
-                            <div>
-                                <div class="gd-host">${vBadge}${crossBadge}${lockBadge} ${iframe.id ? '#' + escapeHTML(iframe.id) : ''} ${iframe.className ? '· ' + escapeHTML(String(iframe.className).slice(0, 40)) : ''}</div>
-                                <div class="gd-meta" title="${escapeHTML(iframe.src || '')}">src: ${srcDisplay}</div>
-                                ${frozenInfo}
-                            </div>
-                        </div>
-                        <div style="display:flex; align-items:center;">${btns}</div>
-                    </div>`);
-            });
-
-            // 帧内元素级行：带 checkbox（H8）
-            deepResults.forEach((elRec, i) => {
-                const cat = elRec.category || 'unknown';
-                const suspicion = elRec.suspicion || 0;
-                const reasonLabel = { 'domain-ad': '域名封杀', 'path-ad': '路径匹配', 'overlay': '透明覆盖', 'vice': '赌博域名', 'skin': '肤色特征' }[cat] || cat;
-                const color = cat.endsWith('ad') ? 'rgba(255,59,48,0.7)' : 'rgba(255,159,10,0.6)';
-                const lockClass = isBlocked(elRec.el) ? 'style="opacity:0.5;"' : '';
-                const tagName = elRec.el?.tagName ? escapeHTML(elRec.el.tagName.toLowerCase()) : '(unknown)';
-                const elId = elRec.el?.id ? '#' + escapeHTML(elRec.el.id) : '';
-                const elClass = elRec.el?.className ? '.' + escapeHTML(String(elRec.el.className).split(' ')[0]) : '';
-                const blocked = elRec.blocked;
-                const checked = _selectedSet.has('_e_' + i);
-                const actionBtns = blocked
-                    ? `<span style="font-size:11px; color:#888;">已拦截</span>`
-                    : `<button class="btn-danger" style="flex:none; padding:2px 8px; font-size:11px;" data-el-idx="${i}">🛡拦截</button>`;
-                rows.push(`<div class="gd-domain-row" data-el-idx="${i}" data-type="element" ${lockClass}>
-                        <div class="gd-left">
-                            <input type="checkbox" class="iframe-row-cb" data-el-idx="${i}" ${checked ? 'checked' : ''} style="flex:none; margin-right:6px; cursor:pointer; accent-color:#007AFF;" />
-                            <div>
-                                <div class="gd-host"><span class="tag" style="background:${color};">⚠${reasonLabel}</span> 嫌疑分 ${suspicion} · <code>${tagName}${elId}${elClass}</code></div>
-                                ${elRec.selector ? `<div class="gd-meta">selector: <code>${escapeHTML(elRec.selector.slice(0, 80))}</code></div>` : ''}
-                                ${elRec.frameHost ? `<div class="gd-meta">帧域名: ${escapeHTML(elRec.frameHost)}</div>` : ''}
-                            </div>
-                        </div>
-                        <div style="display:flex; align-items:center;">${actionBtns}</div>
-                    </div>`);
-            });
-
-            list.innerHTML = rows.join('');
-
-            // 行 click = 切换勾选（H8），仅按钮触发动作。
-            // 仅绑定一次：list.innerHTML 只替换子节点，绑定在 list 上的监听器不会随重渲染移除，
-            // 每次 renderScanList 都 addEventListener 会导致监听器指数级累积（面板卡死）。
-            if (!list._scanClickBound) {
-                list.addEventListener('click', (e) => {
-                    const row = e.target.closest('.gd-domain-row');
-                    if (!row) return;
-                    // 忽略 checkbox 自身和按钮
-                    if (e.target.classList.contains('iframe-row-cb') || e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
-                    const idx = row.dataset.idx;
-                    const elIdx = row.dataset.elIdx;
-                    if (idx !== undefined) {
-                        if (_selectedSet.has(Number(idx))) _selectedSet.delete(Number(idx));
-                        else _selectedSet.add(Number(idx));
-                    } else if (elIdx !== undefined) {
-                        const key = '_e_' + Number(elIdx);
-                        if (_selectedSet.has(key)) _selectedSet.delete(key);
-                        else _selectedSet.add(key);
-                    }
-                    renderScanList();
-                });
-                list._scanClickBound = true;
+            if (stats) {
+                const blockedCount = records.filter(r => r.blocked).length;
+                const adFrameCount = records.filter(r => r.type === 'frame' && r.verdict === 'ad').length;
+                const contentFrameCount = records.filter(r => r.type === 'frame' && r.verdict === 'content').length;
+                const elementCount = records.filter(r => r.type === 'element').length;
+                stats.textContent = `共 ${records.length} 项 · 广告帧 ${adFrameCount} · 内容帧 ${contentFrameCount} · 可疑元素 ${elementCount} · 已拦截 ${blockedCount} · 选中 ${selectedSet.size}`;
             }
 
-            // 绑定帧级 block/protect 按钮
-            list.querySelectorAll('[data-action="block"]').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const idx = parseInt(btn.dataset.idx, 10);
-                    const iframe = iframeRecs[idx]?.iframe;
-                    if (!iframe) return;
-                    const rec = IframeGuard._ensureRecord(iframe);
-                    if (rec.blocked || rec.manual) return;
-                    BlockEngine.hideElement(iframe);
-                    rec.blocked = true; rec.verdict = 'ad';
-                    blockedFingerprints.add(iframe);
-                    IframeGuard._incStat('blocked');
-                    EventBus.emit('iframe:blocked', { iframe, reason: 'panel-click' });
-                    this.showToast('已拦截该 iframe', 'success');
-                    renderScanList();
+            if (filtered.length === 0) {
+                box.innerHTML = '<div class="empty-tip">当前页面未发现 iframe 或帧内可疑元素。可尝试取消"只看高风险"或使用"深度扫描"。</div>';
+                const btn = panel.querySelector('#btn-block-iframe');
+                if (btn) { btn.disabled = true; btn.textContent = '🛡️ 未选择 iframe'; }
+                const protectBtn = panel.querySelector('#btn-protect-iframe');
+                if (protectBtn) protectBtn.disabled = true;
+                return;
+            }
+
+            box.innerHTML = filtered.map(({ r, i }) => {
+                const checked = selectedSet.has(i);
+                const scoreClass = getScoreClass(r.suspicion);
+                let badgeHtml = '';
+                let titleHtml = '';
+                const metaLines = [];
+
+                if (r.type === 'frame') {
+                    const rec = r.rec;
+                    const iframe = r.iframe;
+                    badgeHtml = `<span class="tag" style="background:${verdictColor(rec.verdict)};">${verdictLabel(rec.verdict)}</span>`;
+                    if (rec.frozen && !(rec.frozen.w > 0)) badgeHtml += '<span class="tag" style="background:rgba(255,149,0,0.5);">跨域</span>';
+                    if (r.blocked) badgeHtml += '<span class="tag" style="background:rgba(52,199,89,0.6);">已拦截</span>';
+
+                    const idPart = iframe.id ? '#' + escapeHTML(iframe.id) : '';
+                    const clsPart = iframe.className ? ' · ' + escapeHTML(String(iframe.className).slice(0, 40)) : '';
+                    titleHtml = `${escapeHTML(iframe.tagName.toLowerCase())}${idPart}${clsPart}`;
+                    const src = iframe.src || '(空)';
+                    metaLines.push(`src: ${(src.length > 50) ? escapeHTML(src.slice(0, 50)) + '...' : escapeHTML(src)}`);
+                    if (rec.frozen && rec.frozen.w > 0) {
+                        metaLines.push(`尺寸: ${rec.frozen.w}×${rec.frozen.h}px · op=${rec.frozen.opacity} · z=${rec.frozen.zi}`);
+                    }
+                } else {
+                    const elRec = r.elRec;
+                    const cat = r.category;
+                    const color = cat.endsWith('-ad') ? 'rgba(255,59,48,0.7)' : 'rgba(255,159,10,0.6)';
+                    const label = elementReasonLabel[cat] || cat;
+                    badgeHtml = `<span class="tag" style="background:${color};">⚠${label}</span>`;
+                    if (r.blocked) badgeHtml += '<span class="tag" style="background:rgba(52,199,89,0.6);">已拦截</span>';
+
+                    const el = elRec.el;
+                    const tagName = el?.tagName ? escapeHTML(el.tagName.toLowerCase()) : '(unknown)';
+                    const idPart = el?.id ? '#' + escapeHTML(el.id) : '';
+                    const clsPart = el?.className ? '.' + escapeHTML(String(el.className).split(' ')[0]) : '';
+                    titleHtml = `<code>${tagName}${idPart}${clsPart}</code>`;
+                    if (elRec.selector) metaLines.push(`选择器：${escapeHTML(elRec.selector)}`);
+                    if (elRec.frameHost) metaLines.push(`帧域名：${escapeHTML(elRec.frameHost)}`);
+                }
+
+                return `<div class="gd-domain-row ${checked ? 'selected' : ''}" data-idx="${i}">
+                        <div class="gd-left">
+                            <div class="gd-check">${checked ? '✓' : ''}</div>
+                            <div>
+                                <div class="gd-host">${badgeHtml} ${titleHtml}</div>
+                                ${metaLines.map(line => `<div class="gd-meta">${line}</div>`).join('')}
+                            </div>
+                        </div>
+                        <div class="gd-score ${scoreClass}">${r.suspicion}</div>
+                    </div>`;
+            }).join('');
+
+            const btn = panel.querySelector('#btn-block-iframe');
+            if (btn) {
+                btn.disabled = selectedSet.size === 0;
+                btn.textContent = selectedSet.size > 0 ? `🛡️ 拦截选中的 ${selectedSet.size} 个 iframe/元素` : '🛡️ 未选择 iframe';
+            }
+
+            // 保护按钮：仅当选中项包含未拦截的内容帧时可用
+            const protectBtn = panel.querySelector('#btn-protect-iframe');
+            if (protectBtn) {
+                const hasProtectable = Array.from(selectedSet).some(idx => {
+                    const r = records[idx];
+                    return r && r.type === 'frame' && r.verdict === 'content' && !r.blocked;
                 });
-            });
-            list.querySelectorAll('[data-action="protect"]').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const idx = parseInt(btn.dataset.idx, 10);
-                    const iframe = iframeRecs[idx]?.iframe;
-                    if (!iframe) return;
-                    IframeGuard.protectInFrame({ iframe, el: iframe });
-                    blockedFingerprints.add(iframe);
-                    this.showToast('已保护该帧（零输入白名单）', 'success');
-                    renderScanList();
-                });
-            });
-            // 绑定帧内元素级拦截（H8：仅按钮触发，不走行 click）
-            list.querySelectorAll('[data-el-idx]').forEach(btn => {
-                if (btn.dataset.action) return;
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const elIdx = parseInt(btn.dataset.elIdx, 10);
-                    const elRec = deepResults[elIdx];
-                    if (!elRec || elRec.blocked) return;
-                    IframeGuard.blockInFrameNode(elRec);
-                    const targetIframe = elRec.el?.closest('iframe');
-                    if (targetIframe) blockedFingerprints.add(targetIframe);
-                    this.showToast('已拦截帧内元素', 'success');
-                    renderScanList();
-                });
-            });
+                protectBtn.disabled = !hasProtectable;
+            }
         };
 
-        // ─── 白名单列表渲染 ───
+        // ─── 白名单列表 ───
         const renderWlList = () => {
             const box = panel.querySelector('#iframe-wl-list');
             if (!box) return;
             const list = WhitelistStore.getAll();
             if (list.length === 0) {
-                box.innerHTML = '<div class="empty-tip">暂无白名单条目（扫描时点击 ✅保护 按钮可零输入添加）</div>';
+                box.innerHTML = '<div class="empty-tip">暂无白名单条目（在上方列表选择内容帧后点击"保护选中的内容帧"可添加）</div>';
                 return;
             }
             box.innerHTML = list.map((e, i) => {
@@ -5764,81 +5731,178 @@
             });
         };
 
-        // ─── 初始渲染 ───
-        renderScanList();
-        renderWlList();
-
-        // ─── 事件绑定 ───
-        panel.querySelector('#btn-iframe-scan').addEventListener('click', () => {
-            _selectedSet.clear();
-            _scanCache = null; // 清除缓存，强制重新扫描
-            renderScanList();
-        });
-        panel.querySelector('#btn-iframe-rescan').addEventListener('click', () => {
-            _selectedSet.clear();
-            try {
-                IframeGuard.forceRescan();
-                renderScanList();
-                this.showToast('已重新扫描全部 iframe', 'success');
-            } catch (e) { this.showToast('重扫失败: ' + e.message, 'error'); }
-        });
-
-        // 预览横幅
-        let _previewBanner = null;
-        const showPreviewBanner = (fnReset) => {
+        // ─── 预览 ───
+        this._iframePreview = { active: false, elements: [] };
+        const previewBtn = panel.querySelector('#btn-preview-iframe');
+        const resetPreview = () => {
+            if (!this._iframePreview.active) return;
+            this._iframePreview.elements.forEach(el => BlockEngine.showElement(el));
+            this._iframePreview = { active: false, elements: [] };
             this._hidePreviewBanner();
-            const banner = document.createElement('div');
-            banner.className = 'preview-banner';
-            banner.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483646;background:rgba(0,122,255,0.85);color:#fff;padding:8px 20px;border-radius:0 0 10px 10px;font-size:13px;font-weight:600;box-shadow:0 2px 12px rgba(0,0,0,0.3);';
-            banner.textContent = '🔍 预览模式：勾选元素后预览效果，完成后点"完成"退出预览';
-            banner.addEventListener('click', () => { fnReset(); this._hidePreviewBanner(); });
-            document.documentElement.appendChild(banner);
-            _previewBanner = banner;
+            previewBtn.textContent = '🔍 预览效果';
         };
-        // 预览按钮
-        panel.querySelector('#btn-iframe-preview').addEventListener('click', () => {
-            if (!this._iframePreview.active) {
-                this._iframePreview = { active: true, elements: [] };
-                showPreviewBanner(() => {
-                    this._iframePreview = { active: false, elements: [] };
-                });
-            } else {
-                this._iframePreview.active = false;
-                this._iframePreview.elements.forEach(el => BlockEngine.showElement(el));
-                this._iframePreview.elements = [];
-                this._hidePreviewBanner();
-            }
-            this.showToast(this._iframePreview.active ? '预览已激活' : '预览已退出', 'info');
-        });
-        // 批量拦截选中
-        panel.querySelector('#btn-iframe-batch-info').addEventListener('click', () => {
-            if (_selectedSet.size === 0) { this.showToast('未选中任何元素', 'warning'); return; }
-            let count = 0;
-            _selectedSet.forEach(key => {
-                if (key.startsWith('_e_')) {
-                    const i = parseInt(key.slice(3), 10);
-                    const elRec = _deepResults[i];
-                    if (elRec && !elRec.blocked) {
-                        IframeGuard.blockInFrameNode(elRec);
-                        count++;
+        const updatePreview = () => {
+            if (!this._iframePreview.active) return;
+            this._iframePreview.elements.forEach(el => BlockEngine.showElement(el));
+            this._iframePreview.elements = [];
+            Array.from(selectedSet).forEach(idx => {
+                const r = records[idx];
+                if (!r || r.blocked) return;
+                if (r.type === 'frame') {
+                    const iframe = r.iframe;
+                    if (document.contains(iframe) && iframe.style.display !== 'none') {
+                        BlockEngine.hideElement(iframe);
+                        this._iframePreview.elements.push(iframe);
                     }
                 } else {
-                    const idx = parseInt(key, 10);
-                    const iframe = _iframeRecs[idx]?.iframe;
-                    if (iframe) {
-                        const rec = IframeGuard._ensureRecord(iframe);
-                        if (!rec.blocked && !rec.manual) {
-                            BlockEngine.hideElement(iframe);
-                            rec.blocked = true; rec.verdict = 'ad';
-                            count++;
-                        }
+                    const el = r.elRec?.el;
+                    if (el && document.contains(el) && el.style.display !== 'none') {
+                        BlockEngine.hideElement(el);
+                        this._iframePreview.elements.push(el);
                     }
                 }
             });
-            _selectedSet.clear();
-            renderScanList();
-            this.showToast(`已批量拦截 ${count} 个元素`, 'success');
+        };
+
+        // ─── 事件绑定 ───
+        panel.querySelector('#iframe-list').addEventListener('click', (e) => {
+            const row = e.target.closest('.gd-domain-row');
+            if (!row) return;
+            const idx = parseInt(row.dataset.idx, 10);
+            if (selectedSet.has(idx)) selectedSet.delete(idx);
+            else selectedSet.add(idx);
+            updatePreview();
+            render();
         });
+
+        panel.querySelector('#if-only-high').addEventListener('change', (e) => { onlyHigh = e.target.checked; render(); });
+        panel.querySelector('#if-select-high').addEventListener('click', () => {
+            records.forEach((r, i) => { if (r.highRisk && !r.blocked) selectedSet.add(i); });
+            updatePreview();
+            render();
+        });
+        panel.querySelector('#if-select-none').addEventListener('click', () => {
+            selectedSet.clear();
+            updatePreview();
+            render();
+        });
+
+        panel.querySelector('#btn-block-iframe').addEventListener('click', () => {
+            if (selectedSet.size === 0) return;
+            resetPreview();
+            let count = 0;
+            const blockDomainToo = panel.querySelector('#if-block-domain').checked;
+            const domainsToBlock = new Set();
+            Array.from(selectedSet).forEach(idx => {
+                const r = records[idx];
+                if (!r || r.blocked) return;
+                if (r.type === 'frame') {
+                    const iframe = r.iframe;
+                    if (!document.contains(iframe)) return;
+                    if (ProtectedCheck.isProtected(iframe)) return;
+                    BlockEngine.hideElement(iframe);
+                    r.rec.blocked = true; r.rec.verdict = 'ad';
+                    blockedFingerprints.add(iframe);
+                    IframeGuard._incStat('blocked');
+                    EventBus.emit('iframe:blocked', { iframe, reason: 'panel-click' });
+                    if (blockDomainToo && iframe.src) {
+                        try {
+                            const u = new URL(iframe.src, location.href);
+                            if (u.hostname !== window.location.hostname) domainsToBlock.add(u.hostname);
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                    count++;
+                } else {
+                    const elRec = r.elRec;
+                    if (!elRec || elRec.blocked) return;
+                    IframeGuard.blockInFrameNode(elRec);
+                    const targetIframe = elRec.el?.closest('iframe');
+                    if (targetIframe) blockedFingerprints.add(targetIframe);
+                    if (blockDomainToo && elRec.frameHost) {
+                        try {
+                            const u = new URL('//' + elRec.frameHost, location.href);
+                            if (u.hostname !== window.location.hostname) domainsToBlock.add(u.hostname);
+                        } catch (e) { Log.warn(e.message || e); }
+                    }
+                    count++;
+                }
+            });
+            if (domainsToBlock.size > 0) {
+                DomainBlockExecutor.execute(Array.from(domainsToBlock), { hideMode: 'none' });
+            }
+            selectedSet.clear();
+            render();
+            this.showToast(`已拦截 ${count} 个 iframe/元素${domainsToBlock.size > 0 ? '，并封杀 ' + domainsToBlock.size + ' 个域名' : ''}`, 'success');
+        });
+
+        panel.querySelector('#btn-protect-iframe').addEventListener('click', () => {
+            let count = 0;
+            Array.from(selectedSet).forEach(idx => {
+                const r = records[idx];
+                if (!r || r.type !== 'frame' || r.verdict !== 'content' || r.blocked) return;
+                const iframe = r.iframe;
+                const rec = IframeGuard._ensureRecord(iframe);
+                if (rec.manual) return;
+                const frameHost = iframe.src ? safeURLHostname(iframe.src) : window.location.hostname;
+                const selector = iframe.id ? '#' + iframe.id : '';
+                WhitelistStore.add({ selector, domain: frameHost, reason: 'panel-pick' });
+                rec.manual = true;
+                EventBus.emit('iframe:protected', { record: { iframe, el: iframe, frameHost, selector }, reason: 'whitelist-pick' });
+                count++;
+            });
+            if (count > 0) {
+                this.showToast(`已保护 ${count} 个内容帧`, 'success');
+                render();
+                renderWlList();
+            }
+        });
+
+        previewBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (this._iframePreview.active) {
+                resetPreview();
+                return;
+            }
+            if (selectedSet.size === 0) {
+                this.showToast('请先选择需要预览的 iframe/元素。', 'warning');
+                return;
+            }
+            this._iframePreview = { active: true, elements: [] };
+            try {
+                updatePreview();
+            } catch (err) {
+                Log.error('iframe 预览失败:', err);
+                this._iframePreview.active = false;
+                this.showToast('预览失败：' + err.message, 'error');
+                return;
+            }
+            this._showPreviewBanner(() => resetPreview());
+            previewBtn.textContent = '👁 恢复显示';
+        });
+
+        panel.querySelector('#if-block-domain').addEventListener('change', () => updatePreview());
+
+        panel.querySelector('#btn-deep-scan').addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            const old = btn.textContent;
+            btn.textContent = '⏳ 扫描中...';
+            btn.disabled = true;
+            _scanCache = null;
+            selectedSet.clear();
+            const ok = await runScan(false);
+            btn.textContent = old;
+            btn.disabled = false;
+            if (ok) this.showToast('深度扫描完成', 'success');
+        });
+
+        panel.querySelector('#btn-rescan-iframe').addEventListener('click', async () => {
+            _scanCache = null;
+            selectedSet.clear();
+            try { IframeGuard.forceRescan(); } catch (e) { this.showToast('重扫失败: ' + e.message, 'error'); return; }
+            await runScan(false);
+            this.showToast('已重新扫描全部 iframe', 'success');
+        });
+
         panel.querySelector('#iframe-max-depth').addEventListener('change', (e) => {
             const d = parseInt(e.target.value, 10);
             if (d >= IframeGuard.MIN_DEPTH && d <= IframeGuard.MAX_DEPTH) {
@@ -5850,7 +5914,19 @@
                 e.target.value = this.storage.getIframeConfig().maxDepth || 3;
             }
         });
-        panel.querySelector('#btn-close-iframe').addEventListener('click', () => this.clearPanel());
+
+        panel.querySelector('#btn-close-iframe').addEventListener('click', () => {
+            resetPreview();
+            this.clearPanel();
+        });
+
+        // 订阅统计更新
+        if (!this._iframeUnsubs) this._iframeUnsubs = [];
+        this._iframeUnsubs.push(EventBus.on('iframe:stats', () => render()));
+
+        // 初始加载
+        runScan(true);
+        renderWlList();
     }
 
     function ManagerPanel() {
