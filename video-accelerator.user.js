@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.3
+// @version      3.2.0
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -2942,7 +2942,10 @@
                     if (video.ownerDocument === DOC && Detector._viewportObs) {
                         Detector.watchViewport(video);
                     }
-                    this.seen.add(video);
+                    // 注意：延迟接管（当前不可见）【不要】加入 seen。seen 的语义是
+                    // "已处理过该视频"，一旦加入会令下方 early-return（seen.has）永久拦截，
+                    // 导致视频后续变可见时 watchViewport 重新触发也无法接管（真 bug）。
+                    // 仅当真正创建会话时才在 line ~2950 加入 seen。
                     return;
                 }
             }

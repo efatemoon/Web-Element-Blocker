@@ -1,0 +1,9 @@
+=== 调用前 ===
+isVisible(v)= false  area= 0
+seen.has(v)= false  sessions= 0
+=== 第一次(不可见)后 ===
+sessions= 0  seen.has(v)= false  __vaSession= false
+=== 设为可见后 ===
+isVisible(v)= true
+=== 第二次(可见)后 ===
+sessions= 1  seen.has(v)= true  __vaSession= true
