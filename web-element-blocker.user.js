@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.8
+// @version      3.4.9
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -1136,9 +1136,24 @@
             // 确保任何用户规则都不会隐藏脚本自身的面板宿主（否则所有面板都会消失）
             // 跨脚本保护：同时排除 #va-ui-host（视频加速脚本 UI），防止广告拦截误伤视频控制 FAB
             const SELF_PROTECT = ':not(#pro-blocker-ui-host):not(#pro-blocker-ui-host *):not(#va-ui-host):not(#va-ui-host *)';
+            // 括号感知的顶层逗号拆分：避免把 :is()/:has() 内部的逗号误判为选择器分隔符，
+            // 否则 split(',') 会破坏伪类括号层级，使整条父级隐藏规则 insertRule 抛错被静默吞掉，
+            // 导致横幅广告仅隐藏 iframe 后父级容器残留空白占位（与 L1083 注释目标相悖）
+            const splitTopLevelCommas = (s) => {
+                const out = []; let depth = 0, buf = '';
+                for (let i = 0; i < s.length; i++) {
+                    const ch = s[i];
+                    if (ch === '(') depth++;
+                    else if (ch === ')') depth--;
+                    if (ch === ',' && depth === 0) { out.push(buf); buf = ''; }
+                    else buf += ch;
+                }
+                if (buf) out.push(buf);
+                return out;
+            };
             const protectedSelectors = selectors.map(s => {
-                // 复合选择器（含逗号）拆分后逐个保护再合并
-                return s.split(',').map(part => part.trim() + SELF_PROTECT).join(', ');
+                // 仅在顶层逗号处分割，逐个追加 SELF_PROTECT 后合并，保持 :is()/:has() 括号层级完整
+                return splitTopLevelCommas(s).map(part => part.trim() + SELF_PROTECT).join(', ');
             });
 
             // 指纹比对：内容未变则跳过，避免无谓的 CSSOM 重建（Style Recalculation）
@@ -4917,8 +4932,8 @@
                     }
                     // 合并 GDS.deepScan 结果（含真·深度新增的隐藏域名）
                     for (const g of deepResult.results) {
-                        if (currentBlocked.has(g.hostname)) continue;
-                        const exist = existingMap.get(g.hostname);
+                        if (currentBlocked.has((g.hostname || '').toLowerCase())) continue;
+                        const exist = existingMap.get((g.hostname || '').toLowerCase());
                         if (exist) {
                             exist.score = Math.max(exist.score, g.score);
                             exist.viceToken = g.viceToken || exist.viceToken;
@@ -4927,7 +4942,7 @@
                             exist.gdsReasons = g.reasons || exist.gdsReasons;
                             exist.signals = Math.max(exist.signals, g.signals || 0);
                         } else {
-                            const newD = { host: g.hostname, score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals };
+                            const newD = { host: (g.hostname || '').toLowerCase(), score: g.score, count: g.freq || 1, sources: ['performance-api'], reasons: g.reasons || [], viceToken: g.viceToken, adToken: g.adToken, level: g.level, gdsReasons: g.reasons, signals: g.signals };
                             existingMap.set(g.hostname, newD);
                             allDomains.push(newD);
                         }
@@ -5239,21 +5254,26 @@
                 const baseSelector = BlockEngine._buildComplexBaseSelector(conditions, logic);
 
                 const root = document.body;
-                const elements = baseSelector === '*'
-                    ? root.querySelectorAll('div, span, a, p, img, li, ul, iframe, section, article, aside')
-                    : root.querySelectorAll(baseSelector);
+                try {
+                    const elements = baseSelector === '*'
+                        ? root.querySelectorAll('div, span, a, p, img, li, ul, iframe, section, article, aside')
+                        : root.querySelectorAll(baseSelector);
 
-                elements.forEach(el => {
-                    if (baseSelector === '*' && (el.textContent || '').length > 3000) return;
+                    elements.forEach(el => {
+                        if (baseSelector === '*' && (el.textContent || '').length > 3000) return;
 
-                    if (BlockEngine.evaluateConditions(conditions, logic, el)) {
-                        const target = BlockEngine.findLevelAncestor(el, level);
-                        if (target.style.display !== 'none') {
-                            this._previewAffectedElements.push({ el: target });
-                            BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
+                        if (BlockEngine.evaluateConditions(conditions, logic, el)) {
+                            const target = BlockEngine.findLevelAncestor(el, level);
+                            if (target && target.style.display !== 'none') {
+                                this._previewAffectedElements.push({ el: target });
+                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
+                            }
                         }
-                    }
-                });
+                    });
+                } catch (err) {
+                    this.showToast('校验失败：积木选择器无效。', 'error');
+                    return;
+                }
 
             } else {
                 const text = panel.querySelector('#regex-input').value.trim();
@@ -5280,17 +5300,22 @@
                 // 与 applyRegexRules 保持一致：跳过 SCRIPT/STYLE/NOSCRIPT 内的文本，
                 // 否则预览会误隐藏 <script> 父级导致页面功能损坏，且与实际执行结果不一致
                 const lowerText = isContains ? text.toLowerCase() : null;
-                BlockEngine.walkTextNodes(document.body, (node) => {
-                    const content = node.textContent || '';
-                    const hit = isContains ? content.toLowerCase().includes(lowerText) : regex.test(content);
-                    if (hit) {
-                        const target = BlockEngine.findLevelAncestor(node.parentElement, level);
-                        if (target && target.style.display !== 'none') {
-                            this._previewAffectedElements.push({ el: target });
-                            BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
+                try {
+                    BlockEngine.walkTextNodes(document.body, (node) => {
+                        const content = node.textContent || '';
+                        const hit = isContains ? content.toLowerCase().includes(lowerText) : regex.test(content);
+                        if (hit) {
+                            const target = BlockEngine.findLevelAncestor(node.parentElement, level);
+                            if (target && target.style.display !== 'none') {
+                                this._previewAffectedElements.push({ el: target });
+                                BlockEngine.hideElement(target); // 统一 4 属性口径(冗余-5)
+                            }
                         }
-                    }
-                });
+                    });
+                } catch (err) {
+                    this.showToast('校验失败：文本节点遍历异常。', 'error');
+                    return;
+                }
             }
 
             isPreviewing = true;
@@ -7153,16 +7178,25 @@
                     }
                 }
             } else {
-                // v1.0 兼容：直接用平铺字典
-                ruleBuckets = {
-                    blocks: raw.blocks || {},
-                    dynamicBlocks: raw.dynamicBlocks || {},
-                    regexBlocks: raw.regexBlocks || {},
-                    attrBlocks: raw.attrBlocks || {},
-                    structBlocks: raw.structBlocks || {},
-                    complexBlocks: raw.complexBlocks || {},
-                    pathPatternBlocks: raw.pathPatternBlocks || {}
+                // v1.0 兼容：平铺字典 + 补全 type 字段（与 v2.0 分支一致），
+                // 否则 convertRule 因 rule.type 缺失返回 null，导致全部站点规则在导出时丢失
+                const V1_BUCKET_TO_TYPE = {
+                    blocks: 'static', dynamicBlocks: 'dynamic', regexBlocks: 'regex',
+                    attrBlocks: 'attribute', structBlocks: 'structural',
+                    complexBlocks: 'complex', pathPatternBlocks: 'pathPattern'
                 };
+                ruleBuckets = {};
+                for (const bucket in V1_BUCKET_TO_TYPE) {
+                    const src = raw[bucket];
+                    if (!src || typeof src !== 'object') continue;
+                    ruleBuckets[bucket] = {};
+                    for (const domain in src) {
+                        const list = src[domain];
+                        if (Array.isArray(list) && list.length) {
+                            ruleBuckets[bucket][domain] = list.map(r => ({ ...r, type: V1_BUCKET_TO_TYPE[bucket] }));
+                        }
+                    }
+                }
                 Object.keys(ruleBuckets).forEach(k => {
                     Object.keys(ruleBuckets[k]).forEach(d => allDomains.add(d));
                 });
@@ -7858,6 +7892,11 @@
         // 错误兜底面板：面板渲染异常时显示，避免整个 UI 崩溃
         // onRetry 为可选重试回调，传入时点击"重试"重新执行失败的面板入口
         _showErrorPanel(title, detail, onRetry) {
+            // 回收当前面板注册的 document 级拖拽监听，避免 innerHTML 直接清空导致监听永久泄漏(BUG)
+            const _curPanel = this.shadowRoot.querySelector('.panel');
+            if (_curPanel && typeof _curPanel._cleanupDrag === 'function') {
+                try { _curPanel._cleanupDrag(); } catch (e) { Log.warn(e.message || e); }
+            }
             this.shadowRoot.innerHTML = '';
             this.injectStyles();
             const panel = document.createElement('div');
