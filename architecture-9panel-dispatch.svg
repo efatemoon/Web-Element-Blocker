@@ -1,0 +1,124 @@
+<svg viewBox="0 0 680 669" width="100%" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>web-element-blocker 分层架构（按 MENU_ITEMS 9 菜单项）</title>
+<desc>入口分发 到 面板层 9 面板 到 服务端口层 到 引擎层 到 存储层</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<g class="node c-blue">
+<rect x="195" y="48" width="290" height="46" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="340" y="68" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="13" font-weight="500">GM_registerMenuCommand</text>
+<text x="340" y="84" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4" font-size="11">注册 9 条菜单命令</text>
+</g>
+<g class="node c-blue">
+<rect x="195" y="104" width="290" height="40" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="340" y="124" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="13" font-weight="500">→ _buildMenu() → PanelRegistry[key]</text>
+</g>
+<polyline points="340,94 340,104" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="160" width="600" height="215" rx="16" fill="none" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="60" y="180" fill="#EDEAF8" font-size="13" font-weight="500">面板层 · UIManager（9 菜单项 → PanelRegistry 分发，OCP 扩展点）</text>
+
+<g class="c-purple">
+<rect x="58" y="200" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="150" y="216" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">选择模式</text>
+<text x="150" y="232" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">SelectionPanel</text>
+</g>
+<g class="c-purple">
+<rect x="250" y="200" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="342" y="216" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">规则面板</text>
+<text x="342" y="232" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">RegexPanel</text>
+</g>
+<g class="c-purple">
+<rect x="442" y="200" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="534" y="216" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">域名检索</text>
+<text x="534" y="232" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">GlobalDomainPanel</text>
+</g>
+<g class="c-purple">
+<rect x="58" y="252" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="150" y="268" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">覆盖层扫描</text>
+<text x="150" y="284" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">OverlayScanPanel</text>
+</g>
+<g class="c-purple">
+<rect x="250" y="252" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="342" y="268" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">管理面板</text>
+<text x="342" y="284" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">ManagerPanel</text>
+</g>
+<g class="c-purple">
+<rect x="442" y="252" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="534" y="268" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">iframe 面板</text>
+<text x="534" y="284" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">IframePanel</text>
+</g>
+<g class="c-purple">
+<rect x="58" y="304" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="150" y="320" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">导出面板</text>
+<text x="150" y="336" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">ExportPanel</text>
+</g>
+<g class="c-purple">
+<rect x="250" y="304" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="342" y="320" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">AdGuard 导出</text>
+<text x="342" y="336" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">AdGuardExportPanel</text>
+</g>
+<g class="c-purple">
+<rect x="442" y="304" width="184" height="42" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="534" y="320" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="13" font-weight="500">导入面板</text>
+<text x="534" y="336" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">ImportPanel</text>
+</g>
+
+<polyline points="340,144 340,160" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow)"/>
+<polyline points="340,375 340,395" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="395" width="600" height="85" rx="16" fill="none" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="60" y="415" fill="#E1F5EE" font-size="13" font-weight="500">服务端口层（依赖倒置 DIP · 解耦 UI 与引擎）</text>
+<g class="c-teal">
+<rect x="58" y="435" width="184" height="34" rx="8" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="150" y="452" text-anchor="middle" dominant-baseline="central" fill="#E1F5EE" font-size="12" font-weight="500">OverlayService</text>
+</g>
+<g class="c-teal">
+<rect x="250" y="435" width="184" height="34" rx="8" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="342" y="452" text-anchor="middle" dominant-baseline="central" fill="#E1F5EE" font-size="12" font-weight="500">StorageService(Proxy)</text>
+</g>
+<g class="c-teal">
+<rect x="442" y="435" width="184" height="34" rx="8" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="534" y="452" text-anchor="middle" dominant-baseline="central" fill="#E1F5EE" font-size="12" font-weight="500">RuleDomain</text>
+</g>
+
+<polyline points="340,480 340,495" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<rect x="40" y="495" width="600" height="95" rx="16" fill="none" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="60" y="515" fill="#FAEEDA" font-size="13" font-weight="500">引擎层（规则匹配 / 防御 / 扫描）</text>
+<g class="c-amber">
+<rect x="42" y="535" width="108" height="42" rx="8" fill="#633806" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="96" y="551" text-anchor="middle" dominant-baseline="central" fill="#FAEEDA" font-size="12" font-weight="500">BlockEngine</text>
+<text x="96" y="567" text-anchor="middle" dominant-baseline="central" fill="#FAC775" font-size="11">匹配隐藏</text>
+</g>
+<g class="c-amber">
+<rect x="161" y="535" width="108" height="42" rx="8" fill="#633806" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="215" y="551" text-anchor="middle" dominant-baseline="central" fill="#FAEEDA" font-size="12" font-weight="500">IframeGuard</text>
+<text x="215" y="567" text-anchor="middle" dominant-baseline="central" fill="#FAC775" font-size="11">同源帧守卫</text>
+</g>
+<g class="c-amber">
+<rect x="280" y="535" width="108" height="42" rx="8" fill="#633806" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="334" y="551" text-anchor="middle" dominant-baseline="central" fill="#FAEEDA" font-size="12" font-weight="500">OverlayScan</text>
+<text x="334" y="567" text-anchor="middle" dominant-baseline="central" fill="#FAC775" font-size="11">覆盖层扫描</text>
+</g>
+<g class="c-amber">
+<rect x="399" y="535" width="108" height="42" rx="8" fill="#633806" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="453" y="551" text-anchor="middle" dominant-baseline="central" fill="#FAEEDA" font-size="12" font-weight="500">GlobalDomain</text>
+<text x="453" y="567" text-anchor="middle" dominant-baseline="central" fill="#FAC775" font-size="11">域名检索</text>
+</g>
+<g class="c-amber">
+<rect x="518" y="535" width="108" height="42" rx="8" fill="#633806" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="572" y="551" text-anchor="middle" dominant-baseline="central" fill="#FAEEDA" font-size="12" font-weight="500">IframeDeep</text>
+<text x="572" y="567" text-anchor="middle" dominant-baseline="central" fill="#FAC775" font-size="11">帧内深扫</text>
+</g>
+
+<polyline points="340,590 340,605" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<g class="node c-green">
+<rect x="200" y="605" width="280" height="44" rx="8" fill="#27500A" stroke="#97C459" stroke-width="0.5"/>
+<text x="340" y="627" text-anchor="middle" dominant-baseline="central" fill="#EAF3DE" font-size="13" font-weight="500">StorageManager · 浏览器/GM 存储</text>
+</g>
+</svg>

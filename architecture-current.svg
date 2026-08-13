@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 860" font-family="sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#15171c;}
+      .layer{fill:rgba(255,255,255,0.025);stroke:rgba(255,255,255,0.16);stroke-dasharray:5 4;}
+      .layerTtl{fill:#9fd0ff;font-size:12px;font-weight:700;}
+      .node{fill:#232733;stroke:#3a4252;stroke-width:1.2;}
+      .nodeLabel{fill:#e8eaf0;font-size:11px;}
+      .title{fill:#fff;font-size:16px;font-weight:700;}
+      .sub{fill:#9aa3b2;font-size:11px;}
+      .arrow{stroke:#7c8493;stroke-width:1.6;fill:none;}
+      .ah{fill:#7c8493;}
+      .warnNode{fill:#3a1c1f;stroke:#ff453a;stroke-width:1.6;}
+      .warnTxt{fill:#ff7b72;font-size:10.5px;font-weight:600;}
+      .warnLine{stroke:#ff453a;stroke-width:1.6;stroke-dasharray:5 3;fill:none;}
+      .legend{fill:#cdd3df;font-size:10px;}
+      .ok{fill:#34c759;}
+    </style>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 Z" class="ah"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="680" height="860"/>
+  <text class="title" x="24" y="30">web-element-blocker · 当前架构（优化前）</text>
+  <text class="sub" x="24" y="48">9 菜单 → PanelRegistry → UIManager 协调器 → 9 面板函数 → 服务层</text>
+
+  <!-- Layer 0: Dispatch -->
+  <rect class="layer" x="20" y="62" width="640" height="86" rx="14"/>
+  <text class="layerTtl" x="34" y="82">① 菜单调度层</text>
+  <rect class="node" x="34" y="92" width="180" height="40" rx="8"/>
+  <text class="nodeLabel" x="44" y="109">MENU_ITEMS（9 项 [label,title,key]）</text>
+  <rect class="node" x="250" y="92" width="180" height="40" rx="8"/>
+  <text class="nodeLabel" x="260" y="109">_buildMenu 纯函数</text>
+  <rect class="node" x="466" y="92" width="170" height="40" rx="8"/>
+  <text class="nodeLabel" x="476" y="109">PanelRegistry key→方法</text>
+  <path class="arrow" d="M214,112 H246" marker-end="url(#ah)"/>
+  <path class="arrow" d="M430,112 H462" marker-end="url(#ah)"/>
+
+  <!-- Arrow dispatch -> coordinator -->
+  <path class="arrow" d="M340,148 V176" marker-end="url(#ah)"/>
+
+  <!-- Layer 1: Coordinator -->
+  <rect class="layer" x="20" y="178" width="640" height="150" rx="14"/>
+  <text class="layerTtl" x="34" y="198">② UIManager 协调器（共享状态 + 清理）</text>
+  <rect class="node" x="34" y="206" width="200" height="34" rx="8"/>
+  <text class="nodeLabel" x="44" y="227">clearPanel() [单一清理入口]</text>
+  <rect class="node" x="250" y="206" width="180" height="34" rx="8"/>
+  <text class="nodeLabel" x="260" y="227">showToast / _safeCall</text>
+  <rect class="node" x="446" y="206" width="190" height="34" rx="8"/>
+  <text class="nodeLabel" x="456" y="227">stopSelection / _freezeNav</text>
+  <rect class="node" x="34" y="250" width="602" height="62" rx="8"/>
+  <text class="nodeLabel" x="44" y="270" style="font-size:10px;fill:#cdd3df;">共享实例状态：_actionPreview · _globalPreview · _overlayPreview · _iframePreview · _selectionBanner · _previewBanner · _undoStack</text>
+  <text class="nodeLabel" x="44" y="290" style="font-size:10px;fill:#cdd3df;">_handleClick / _handleTouchEnd · showActionPanel · Shadow DOM 宿主(#pro-blocker-ui-host)</text>
+
+  <!-- Arrow coordinator -> panels -->
+  <path class="arrow" d="M340,328 V356" marker-end="url(#ah)"/>
+
+  <!-- Layer 2: 9 Panels -->
+  <rect class="layer" x="20" y="358" width="640" height="234" rx="14"/>
+  <text class="layerTtl" x="34" y="378">③ 9 个面板函数（经 XxxPanel.call(this) 注入 UIManager 为 this）</text>
+  <!-- row1 -->
+  <rect class="warnNode" x="34" y="388" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="44" y="405">SelectionPanel ⚠</text>
+  <text class="nodeLabel" x="44" y="421" style="font-size:9.5px;fill:#ffb0a8;">入口仅调 stopSelection()</text>
+  <rect class="node" x="245" y="388" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="255" y="405">RegexPanel</text>
+  <text class="nodeLabel" x="255" y="421" style="font-size:9.5px;fill:#cdd3df;">文本/正则/积木/属性/路径</text>
+  <rect class="node" x="456" y="388" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="466" y="405">GlobalDomainPanel</text>
+  <text class="nodeLabel" x="466" y="421" style="font-size:9.5px;fill:#cdd3df;">全局域名检索</text>
+  <!-- row2 -->
+  <rect class="node" x="34" y="444" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="44" y="461">OverlayScanPanel</text>
+  <text class="nodeLabel" x="44" y="477" style="font-size:9.5px;fill:#cdd3df;">不可见覆盖层扫描</text>
+  <rect class="node" x="245" y="444" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="255" y="461">ManagerPanel</text>
+  <text class="nodeLabel" x="255" y="477" style="font-size:9.5px;fill:#cdd3df;">规则与防御管理</text>
+  <rect class="node" x="456" y="444" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="466" y="461">IframePanel</text>
+  <text class="nodeLabel" x="466" y="477" style="font-size:9.5px;fill:#cdd3df;">iframe 防线</text>
+  <!-- row3 -->
+  <rect class="node" x="34" y="500" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="44" y="517">ExportPanel</text>
+  <text class="nodeLabel" x="44" y="533" style="font-size:9.5px;fill:#cdd3df;">导出规则</text>
+  <rect class="node" x="245" y="500" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="255" y="517">AdGuardExportPanel</text>
+  <text class="nodeLabel" x="255" y="533" style="font-size:9.5px;fill:#cdd3df;">导出 AdGuard 规则</text>
+  <rect class="node" x="456" y="500" width="190" height="46" rx="8"/>
+  <text class="nodeLabel" x="466" y="517">ImportPanel</text>
+  <text class="nodeLabel" x="466" y="533" style="font-size:9.5px;fill:#cdd3df;">导入规则</text>
+
+  <!-- Warning callout for SelectionPanel leak -->
+  <path class="warnLine" d="M224,411 C300,470 300,520 360,560" marker-end="url(#ah)"/>
+  <rect class="warnNode" x="360" y="556" width="290" height="34" rx="8"/>
+  <text class="warnTxt" x="370" y="573">绕过 clearPanel → 预览元素永久隐藏</text>
+  <text class="warnTxt" x="370" y="585" style="font-size:9px;fill:#ff9a92;">+ 孤儿面板 DOM / 拖拽监听 / 横幅残留</text>
+
+  <!-- Arrow panels -> services -->
+  <path class="arrow" d="M340,592 V620" marker-end="url(#ah)"/>
+
+  <!-- Layer 3: Services -->
+  <rect class="layer" x="20" y="622" width="640" height="216" rx="14"/>
+  <text class="layerTtl" x="34" y="642">④ 服务层（引擎 / 存储 / 事件总线 / 帧 / 分类）</text>
+  <rect class="node" x="34" y="652" width="190" height="40" rx="8"/><text class="nodeLabel" x="44" y="677">BlockEngine（CSS/正则/结构隐藏）</text>
+  <rect class="node" x="245" y="652" width="190" height="40" rx="8"/><text class="nodeLabel" x="255" y="677">StorageService（GM 持久化）</text>
+  <rect class="node" x="456" y="652" width="190" height="40" rx="8"/><text class="nodeLabel" x="466" y="677">EventBus（横切解耦缝）</text>
+  <rect class="node" x="34" y="702" width="190" height="40" rx="8"/><text class="nodeLabel" x="44" y="727">OverlayService</text>
+  <rect class="node" x="245" y="702" width="190" height="40" rx="8"/><text class="nodeLabel" x="255" y="727">IframeGuard / Frame*</text>
+  <rect class="node" x="456" y="702" width="190" height="40" rx="8"/><text class="nodeLabel" x="466" y="727">ContentClassifier</text>
+  <rect class="node" x="34" y="752" width="190" height="40" rx="8"/><text class="nodeLabel" x="44" y="777">ProtectedCheck（UI 保护）</text>
+  <rect class="node" x="245" y="752" width="190" height="40" rx="8"/><text class="nodeLabel" x="255" y="777">RuleDomain（影响度/AdGuard）</text>
+  <rect class="node" x="456" y="752" width="190" height="40" rx="8"/><text class="nodeLabel" x="466" y="777">MessageGuard</text>
+
+  <!-- Legend -->
+  <text class="legend" x="34" y="838">图例：</text>
+  <rect class="warnNode" x="74" y="828" width="14" height="14" rx="3"/><text class="legend" x="94" y="840">隐藏 bug 入口</text>
+  <rect class="node" x="220" y="828" width="14" height="14" rx="3"/><text class="legend" x="240" y="840">正常模块</text>
+  <path class="warnLine" d="M360,835 H378" marker-end="url(#ah)"/><text class="legend" x="384" y="840">缺陷链路</text>
+</svg>

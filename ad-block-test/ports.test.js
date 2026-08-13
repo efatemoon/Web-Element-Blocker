@@ -10,7 +10,10 @@
  * Test Double，可后续将端口改为工厂注入（Phase F）。本测试覆盖端口契约与核心失效路径。
  * 参考：Martin《整洁架构》Ch.5 DIP；Feathers《Working Effectively with Legacy Code》§3 接缝。
  */
+const fs = require('fs');
+const path = require('path');
 const { OverlayService, StorageService } = require('../web-element-blocker.user.js');
+const SRC = fs.readFileSync(path.join(__dirname, '..', 'web-element-blocker.user.js'), 'utf8');
 
 describe('服务层端口（DIP 接缝）', () => {
     test('OverlayService 暴露 4 个覆盖层用例端口方法（消除 UIManager→OverlayScanEngine 跨层直调）', () => {
@@ -21,8 +24,7 @@ describe('服务层端口（DIP 接缝）', () => {
 
     test('StorageService.invalidateIframeRules 是集中缓存失效端口且可安全调用', () => {
         expect(typeof StorageService.invalidateIframeRules).toBe('function');
-        // 该端口将 iframe 规则缓存失效内聚到 IframeGuard.invalidateBlockRules，
-        // 消除散落直写（TD-01/R3 残留）
+        // C4 解耦后该端口改经 EventBus.emit('iframe:rules-changed')，不再直连 IframeGuard
         expect(() => StorageService.invalidateIframeRules()).not.toThrow();
     });
 
@@ -30,5 +32,53 @@ describe('服务层端口（DIP 接缝）', () => {
         // 端口在 node 环境不持有真实 storage，转发目标为空对象，故未定义方法返回 undefined；
         // 浏览器中 storage 已实例化，同类访问返回 bind(storage) 后的函数（行为等价）。
         expect(StorageService.getDomainBlocks).toBeUndefined();
+    });
+});
+
+// ─── C2/C4 解耦契约（端口化 iframeConfig + EventBus 失效缝） ───
+describe('C2 端口化 iframeConfig 读写', () => {
+    test('StorageManager 暴露 setIframeConfig 端口（经 _markDirty + EventBus 失效）', () => {
+        expect(SRC).toContain('setIframeConfig(obj) {');
+        // 端口写入统一经 StorageManager：标记 iframeConfig 脏 + 发射失效事件
+        expect(SRC).toMatch(/setIframeConfig\(obj\)\s*\{[\s\S]*?_markDirty\('iframeConfig'/);
+        expect(SRC).toMatch(/setIframeConfig\(obj\)\s*\{[\s\S]*?EventBus\.emit\('iframe:rules-changed'\)/);
+    });
+
+    test('IframeGuard 经 StorageService 端口读写（this.storage），不再裸调 GM', () => {
+        // 端口优先：_loadConfig/setMaxDepth 经 this.storage 端口
+        expect(SRC).toContain('this.storage.getIframeConfig');
+        expect(SRC).toContain('this.storage.setIframeConfig');
+        // 端口方法缺失时回退 GM（兼容注入未就绪环境，如 node 测试）——保留但不走主路径
+        expect(SRC).toContain("GM_getValue('iframeConfig', {})");
+        expect(SRC).toContain("GM_setValue('iframeConfig', obj)");
+        // _loadConfig / setMaxDepth 经端口助手（_cfgGet/_cfgSet），消除原 9573/9584 裸写缺陷
+        expect(SRC).toMatch(/_loadConfig\(\)\s*\{[\s\S]*?this\._cfgGet\(\)/);
+        expect(SRC).toMatch(/setMaxDepth\(depth\)\s*\{[\s\S]*?this\._cfgSet\(config\)/);
+    });
+});
+
+describe('C4 解耦 StorageManager/StorageService → IframeGuard（EventBus 缝）', () => {
+    test('IframeGuard.invalidateBlockRules 仅剩 2 处引用（内部调用 + EventBus 订阅），StorageManager 已不直连', () => {
+        const refs = SRC.match(/IframeGuard\.invalidateBlockRules\(\)/g) || [];
+        expect(refs).toHaveLength(2);
+    });
+
+    test('存储层经 EventBus.emit 通知失效，模块级订阅统一接线 IframeGuard', () => {
+        expect(SRC).toContain("EventBus.emit('iframe:rules-changed')");
+        expect(SRC).toContain("EventBus.on('iframe:rules-changed'");
+        // StorageService 端口不再直连 IframeGuard，改发 EventBus
+        expect(SRC).toMatch(/invalidateIframeRules[\s\S]*?return \(\) => EventBus\.emit\('iframe:rules-changed'\)/);
+    });
+
+    test('EventBus 失效缝可端到端触发（emit → 订阅 handler 执行，退订即停）', () => {
+        const m = SRC.match(/const EventBus = \{[\s\S]*?\n    \};/);
+        expect(m).not.toBeNull();
+        const EventBus = new Function(m[0] + '; return EventBus;')();
+        let called = 0;
+        const off = EventBus.on('iframe:rules-changed', () => { called++; });
+        EventBus.emit('iframe:rules-changed');
+        off();
+        EventBus.emit('iframe:rules-changed'); // 退订后不再触发
+        expect(called).toBe(1);
     });
 });

@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 470" width="100%" role="img">
+  <title>iframe 选择上下文 BUG-Y2 修复前后流程</title>
+  <desc>左：修复前 stopSelection 先清空上下文导致规则落到外层 host 或弹“已失效”；右：修复后先捕获 iframeCtx 再 stopSelection，规则正确命中 iframe host。</desc>
+  <defs>
+    <marker id="aG" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#5DCAA5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="aR" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#ff6b5e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <text x="340" y="26" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="500" font-family="sans-serif">iframe 选择上下文 · 修复前后流程</text>
+  <text x="190" y="52" text-anchor="middle" fill="#ffb3a8" font-size="13" font-family="sans-serif">修复前 (BUG-Y2)</text>
+  <text x="490" y="52" text-anchor="middle" fill="#bff0dd" font-size="13" font-family="sans-serif">修复后</text>
+
+  <!-- before lane -->
+  <g>
+    <rect x="60" y="70" width="260" height="44" rx="9" fill="#2a1f22" stroke="#ff6b5e" stroke-width="1"/>
+    <text x="190" y="97" text-anchor="middle" fill="#ffd9d2" font-size="13" font-family="sans-serif">点击 iframe 内元素</text>
+    <rect x="60" y="142" width="260" height="44" rx="9" fill="#2a1f22" stroke="#ff6b5e" stroke-width="1"/>
+    <text x="190" y="169" text-anchor="middle" fill="#ffd9d2" font-size="13" font-family="sans-serif">stopSelection() 清空上下文</text>
+    <rect x="60" y="214" width="260" height="44" rx="9" fill="#2a1f22" stroke="#ff6b5e" stroke-width="1"/>
+    <text x="190" y="241" text-anchor="middle" fill="#ffd9d2" font-size="13" font-family="sans-serif">showActionPanel 读 ctxHost=null</text>
+    <rect x="60" y="286" width="260" height="44" rx="9" fill="#2a1f22" stroke="#ff6b5e" stroke-width="1"/>
+    <text x="190" y="305" text-anchor="middle" fill="#ffd9d2" font-size="12" font-family="sans-serif">规则落外层 host / 弹“已失效”</text>
+    <path d="M190,114 L190,142" fill="none" stroke="#ff6b5e" stroke-width="1.5" marker-end="url(#aR)"/>
+    <path d="M190,186 L190,214" fill="none" stroke="#ff6b5e" stroke-width="1.5" marker-end="url(#aR)"/>
+    <path d="M190,258 L190,286" fill="none" stroke="#ff6b5e" stroke-width="1.5" marker-end="url(#aR)"/>
+  </g>
+
+  <!-- after lane -->
+  <g>
+    <rect x="360" y="70" width="260" height="44" rx="9" fill="#1c2a1f" stroke="#5DCAA5" stroke-width="1"/>
+    <text x="490" y="97" text-anchor="middle" fill="#bff0dd" font-size="13" font-family="sans-serif">点击 iframe 内元素</text>
+    <rect x="360" y="142" width="260" height="44" rx="9" fill="#1c2a1f" stroke="#5DCAA5" stroke-width="1"/>
+    <text x="490" y="169" text-anchor="middle" fill="#bff0dd" font-size="13" font-family="sans-serif">先捕获 iframeCtx (host 解析)</text>
+    <rect x="360" y="214" width="260" height="44" rx="9" fill="#1c2a1f" stroke="#5DCAA5" stroke-width="1"/>
+    <text x="490" y="241" text-anchor="middle" fill="#bff0dd" font-size="13" font-family="sans-serif">再 stopSelection()</text>
+    <rect x="360" y="286" width="260" height="44" rx="9" fill="#1c2a1f" stroke="#5DCAA5" stroke-width="1"/>
+    <text x="490" y="305" text-anchor="middle" fill="#bff0dd" font-size="12" font-family="sans-serif">规则命中 iframe host (正确)</text>
+    <path d="M490,114 L490,142" fill="none" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#aG)"/>
+    <path d="M490,186 L490,214" fill="none" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#aG)"/>
+    <path d="M490,258 L490,286" fill="none" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#aG)"/>
+  </g>
+
+  <text x="340" y="372" text-anchor="middle" fill="#9aa7b4" font-size="12" font-family="sans-serif">根因：stopSelection() 在读取 _selectionIframeContext 之前执行</text>
+  <text x="340" y="392" text-anchor="middle" fill="#9aa7b4" font-size="12" font-family="sans-serif">修复：进入选择模式前捕获并透传 iframeCtx（含已解析 host，srcdoc 回退父页）</text>
+
+  <g font-family="sans-serif" font-size="11">
+    <line x1="60" y1="430" x2="92" y2="430" stroke="#ff6b5e" stroke-width="1.5" marker-end="url(#aR)"/>
+    <text x="100" y="434" fill="#ffb3a8">BUG-Y2 失效路径</text>
+    <line x1="360" y1="430" x2="392" y2="430" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#aG)"/>
+    <text x="400" y="434" fill="#bff0dd">修复后正确路径</text>
+  </g>
+</svg>

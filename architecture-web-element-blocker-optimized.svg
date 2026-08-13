@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 724" width="100%" role="img">
+  <title>web-element-blocker 优化后目标架构（低耦合）</title>
+  <desc>入口 MENU_ITEMS/PanelRegistry 经 UIManager 协调器与共享 PanelHelper 驱动 9 个独立面板模块；面板仅依赖服务端口层（OverlayService/StorageService/RuleDomain/EventBus），端口单向依赖引擎层，引擎依赖 StorageManager。依赖方向全部向下、无环。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <style>
+    .b8{fill:#042C53;stroke:#85B7EB;stroke-width:0.5}
+    .bT{fill:#04342C;stroke:#5DCAA5;stroke-width:0.5}
+    .th{font-family:sans-serif;font-size:14px;fill:#B5D4F4;font-weight:500}
+    .ts{font-family:sans-serif;font-size:12px;fill:#85B7EB}
+    .tT{font-family:sans-serif;font-size:14px;fill:#9FE1CB;font-weight:500}
+    .tsT{font-family:sans-serif;font-size:12px;fill:#5DCAA5}
+    .arr{stroke:#85B7EB;stroke-width:1.5;fill:none}
+    .arrT{stroke:#5DCAA5;stroke-width:1.5;fill:none}
+    .ld{stroke:#85B7EB;stroke-width:1;stroke-dasharray:4 3;fill:none}
+    .lg{font-family:sans-serif;font-size:12px;fill:#B5D4F4}
+  </style>
+
+  <!-- Tier A: entry / dispatch -->
+  <g>
+    <rect x="120" y="44" width="200" height="52" rx="10" class="b8"/>
+    <text class="th" x="220" y="64" text-anchor="middle" dominant-baseline="central">MENU_ITEMS (9)</text>
+    <text class="ts" x="220" y="82" text-anchor="middle" dominant-baseline="central">菜单定义</text>
+    <rect x="360" y="44" width="200" height="52" rx="10" class="b8"/>
+    <text class="th" x="460" y="64" text-anchor="middle" dominant-baseline="central">PanelRegistry</text>
+    <text class="ts" x="460" y="82" text-anchor="middle" dominant-baseline="central">OCP 分派 key→方法</text>
+  </g>
+
+  <!-- Tier B: UI coordinator + shared helper -->
+  <g>
+    <rect x="220" y="140" width="220" height="52" rx="10" class="b8"/>
+    <text class="th" x="330" y="160" text-anchor="middle" dominant-baseline="central">UIManager 协调器</text>
+    <text class="ts" x="330" y="178" text-anchor="middle" dominant-baseline="central">Shadow宿主 + clearPanel</text>
+    <rect x="470" y="140" width="160" height="52" rx="10" class="bT"/>
+    <text class="tT" x="550" y="160" text-anchor="middle" dominant-baseline="central">PanelHelper</text>
+    <text class="tsT" x="550" y="178" text-anchor="middle" dominant-baseline="central">共享预览/Toast/拖拽</text>
+  </g>
+
+  <!-- Tier C: panel modules -->
+  <g>
+    <rect x="180" y="236" width="360" height="52" rx="10" class="b8"/>
+    <text class="th" x="360" y="256" text-anchor="middle" dominant-baseline="central">9 面板模块（独立）</text>
+    <text class="ts" x="360" y="274" text-anchor="middle" dominant-baseline="central">.call(UIManager) · 互不直接依赖</text>
+  </g>
+
+  <!-- Tier D: service ports (DIP seam) -->
+  <g>
+    <rect x="30" y="332" width="150" height="52" rx="10" class="bT"/>
+    <text class="tT" x="105" y="352" text-anchor="middle" dominant-baseline="central">OverlayService</text>
+    <text class="tsT" x="105" y="370" text-anchor="middle" dominant-baseline="central">覆盖层端口</text>
+    <rect x="195" y="332" width="150" height="52" rx="10" class="bT"/>
+    <text class="tT" x="270" y="352" text-anchor="middle" dominant-baseline="central">StorageService</text>
+    <text class="tsT" x="270" y="370" text-anchor="middle" dominant-baseline="central">唯一写端口</text>
+    <rect x="360" y="332" width="150" height="52" rx="10" class="bT"/>
+    <text class="tT" x="435" y="352" text-anchor="middle" dominant-baseline="central">RuleDomain</text>
+    <text class="tsT" x="435" y="370" text-anchor="middle" dominant-baseline="central">影响度/导出</text>
+    <rect x="525" y="332" width="115" height="52" rx="10" class="bT"/>
+    <text class="tT" x="582" y="352" text-anchor="middle" dominant-baseline="central">EventBus</text>
+    <text class="tsT" x="582" y="370" text-anchor="middle" dominant-baseline="central">iframe 解耦</text>
+  </g>
+
+  <!-- Tier E: engines -->
+  <g>
+    <rect x="30" y="428" width="150" height="52" rx="10" class="b8"/>
+    <text class="th" x="105" y="448" text-anchor="middle" dominant-baseline="central">BlockEngine</text>
+    <text class="ts" x="105" y="466" text-anchor="middle" dominant-baseline="central">隐藏/选择器</text>
+    <rect x="195" y="428" width="150" height="52" rx="10" class="b8"/>
+    <text class="th" x="270" y="448" text-anchor="middle" dominant-baseline="central">OverlayDetector</text>
+    <text class="ts" x="270" y="466" text-anchor="middle" dominant-baseline="central">不可见扫描</text>
+    <rect x="360" y="428" width="150" height="52" rx="10" class="b8"/>
+    <text class="th" x="435" y="448" text-anchor="middle" dominant-baseline="central">IframeGuard</text>
+    <text class="ts" x="435" y="466" text-anchor="middle" dominant-baseline="central">帧防线 + Frame*</text>
+    <rect x="525" y="428" width="115" height="52" rx="10" class="b8"/>
+    <text class="th" x="582" y="448" text-anchor="middle" dominant-baseline="central">DomainBlock</text>
+    <text class="ts" x="582" y="466" text-anchor="middle" dominant-baseline="central">域名封杀</text>
+  </g>
+
+  <!-- Tier F: storage -->
+  <g>
+    <rect x="240" y="524" width="200" height="52" rx="10" class="b8"/>
+    <text class="th" x="340" y="544" text-anchor="middle" dominant-baseline="central">StorageManager</text>
+    <text class="ts" x="340" y="562" text-anchor="middle" dominant-baseline="central">GM 持久化</text>
+  </g>
+
+  <!-- Arrows: dispatch -->
+  <path class="arr" marker-end="url(#arrow)" d="M220 96 L320 140"/>
+  <path class="arr" marker-end="url(#arrow)" d="M460 96 L350 140"/>
+  <!-- coordinator to panels -->
+  <path class="arr" marker-end="url(#arrow)" d="M330 192 L355 236"/>
+  <path class="ld" marker-end="url(#arrow)" d="M550 192 L505 236"/>
+  <!-- panels to ports -->
+  <path class="arr" marker-end="url(#arrow)" d="M300 288 L120 332"/>
+  <path class="arr" marker-end="url(#arrow)" d="M330 288 L270 332"/>
+  <path class="arr" marker-end="url(#arrow)" d="M390 288 L435 332"/>
+  <path class="arr" marker-end="url(#arrow)" d="M420 288 L582 332"/>
+  <!-- ports to engines -->
+  <path class="arr" marker-end="url(#arrow)" d="M105 384 L105 428"/>
+  <path class="arr" marker-end="url(#arrow)" d="M270 384 L270 428"/>
+  <path class="arr" marker-end="url(#arrow)" d="M435 384 L435 428"/>
+  <!-- EventBus -> IframeGuard decoupling (teal) -->
+  <path class="arrT" marker-end="url(#arrow)" d="M582 384 L470 428"/>
+  <!-- engines to storage -->
+  <path class="arr" marker-end="url(#arrow)" d="M105 480 L300 524"/>
+  <path class="arr" marker-end="url(#arrow)" d="M270 480 L325 524"/>
+  <path class="arr" marker-end="url(#arrow)" d="M435 480 L355 524"/>
+  <path class="arr" marker-end="url(#arrow)" d="M582 480 L380 524"/>
+
+  <!-- C4: StorageManager/StorageService 经 EventBus 通知 IframeGuard 缓存失效（已落地） -->
+  <path class="arrT" marker-end="url(#arrow)" d="M420 524 L576 390"/>
+  <text class="tsT" x="512" y="452" text-anchor="middle" dominant-baseline="central" transform="rotate(-31 512 452)">C4 emit</text>
+
+  <!-- Legend: optimization moves -->
+  <g>
+    <rect x="40" y="596" width="600" height="108" rx="12" fill="#0C1722" stroke="#85B7EB" stroke-width="0.5"/>
+    <text class="lg" x="58" y="616" dominant-baseline="central">优化点（相对现状）：</text>
+    <text class="lg" x="58" y="636" dominant-baseline="central">① PanelHelper 抽离共享预览/横幅/Toast，消除 5 面板重复实现</text>
+    <text class="lg" x="58" y="656" dominant-baseline="central">② StorageService 收口全部写路径，iframeConfig 读写经 setIframeConfig 端口（C2 已落地）</text>
+    <text class="lg" x="58" y="676" dominant-baseline="central">③ UIManager 退化为协调器，9 面板为独立模块，依赖单向向下、无环</text>
+    <text class="lg" x="58" y="696" dominant-baseline="central">④ C4 已落地：StorageManager/StorageService 经 EventBus 通知 IframeGuard 缓存失效，不再直连引擎</text>
+  </g>
+</svg>

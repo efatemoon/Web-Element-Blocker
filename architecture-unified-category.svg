@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 560" width="100%" role="img">
+  <title>统一元素分类体系架构</title>
+  <desc>检测引擎层产出 canonical category 键，全部经顶部 ELEMENT_CATEGORY/CATEGORY_LABELS/categoryLabelOf 单一事实来源，再由三个面板统一渲染</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#6b7280" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <text x="340" y="30" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="500" fill="#1a1a1a">统一元素分类体系架构</text>
+  <text x="340" y="48" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#5a6072">单一事实来源 ELEMENT_CATEGORY / CATEGORY_LABELS / categoryLabelOf</text>
+
+  <text x="44" y="80" font-family="sans-serif" font-size="13" font-weight="500" fill="#1a1a1a">检测引擎层 · 产出 canonical category 键</text>
+
+  <rect x="40" y="90" width="185" height="64" rx="10" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
+  <text x="132" y="114" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#26215C">OverlayScanEngine</text>
+  <text x="132" y="134" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#333">4 分析器 → 覆盖层/不可见/追踪/博彩</text>
+  <text x="132" y="150" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">_analyzeElement 等</text>
+
+  <rect x="247" y="90" width="196" height="64" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="1"/>
+  <text x="345" y="114" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#04342C">IframeDeepScanner</text>
+  <text x="345" y="134" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#333">domain-ad / path-ad + 帧内 overlay</text>
+  <text x="345" y="150" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">_classifyElement + 帧内 overlay</text>
+
+  <rect x="465" y="90" width="175" height="64" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="1"/>
+  <text x="552" y="114" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#042C53">GlobalDomainScanner</text>
+  <text x="552" y="134" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#333">TYPE_MAP → 资源类型键</text>
+  <text x="552" y="150" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">script/css/image/xhr…</text>
+
+  <line x1="132" y1="154" x2="132" y2="180" stroke="#6b7280" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="345" y1="154" x2="345" y2="180" stroke="#6b7280" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="552" y1="154" x2="552" y2="180" stroke="#6b7280" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+  <rect x="44" y="180" width="592" height="216" rx="14" fill="#f6f7fb" stroke="#534AB7" stroke-width="1.5"/>
+  <text x="340" y="200" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="500" fill="#26215C">ELEMENT_CATEGORY · CATEGORY_LABELS · categoryLabelOf（单一事实来源）</text>
+  <text x="340" y="218" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5a6072">消除 3 套散落映射：categoryLabel / elementReasonLabel / 网络层标签</text>
+
+  <text x="80" y="242" font-family="sans-serif" font-size="12" font-weight="500" fill="#993C1D">广告形态维度（7 键）</text>
+  <text x="80" y="262" font-family="sans-serif" font-size="11" fill="#A32D2D">overlay 覆盖层</text>
+  <text x="80" y="278" font-family="sans-serif" font-size="11" fill="#5F5E5A">invisible 不可见</text>
+  <text x="80" y="294" font-family="sans-serif" font-size="11" fill="#BA7517">tracking 追踪像素</text>
+  <text x="80" y="310" font-family="sans-serif" font-size="11" fill="#993556">vice-image 博彩色情图</text>
+  <text x="80" y="326" font-family="sans-serif" font-size="11" fill="#185FA5">domain-ad 域名封杀</text>
+  <text x="80" y="342" font-family="sans-serif" font-size="11" fill="#0F6E56">path-ad 路径匹配</text>
+  <text x="80" y="358" font-family="sans-serif" font-size="11" fill="#5F5E5A">unknown 其他可疑</text>
+
+  <text x="360" y="242" font-family="sans-serif" font-size="12" font-weight="500" fill="#0C447C">资源类型维度（10 键）</text>
+  <text x="360" y="262" font-family="sans-serif" font-size="11" fill="#0C447C">script 脚本</text>
+  <text x="360" y="276" font-family="sans-serif" font-size="11" fill="#0C447C">css 样式表</text>
+  <text x="360" y="290" font-family="sans-serif" font-size="11" fill="#0C447C">image 图片</text>
+  <text x="360" y="304" font-family="sans-serif" font-size="11" fill="#0C447C">xhr 网络请求</text>
+  <text x="360" y="318" font-family="sans-serif" font-size="11" fill="#0C447C">beacon 网络请求</text>
+  <text x="360" y="332" font-family="sans-serif" font-size="11" fill="#0C447C">iframe iframe</text>
+  <text x="360" y="346" font-family="sans-serif" font-size="11" fill="#0C447C">media 媒体</text>
+  <text x="360" y="360" font-family="sans-serif" font-size="11" fill="#0C447C">ws WebSocket</text>
+  <text x="360" y="374" font-family="sans-serif" font-size="11" fill="#0C447C">plugin 插件</text>
+  <text x="360" y="388" font-family="sans-serif" font-size="11" fill="#0C447C">other 其他</text>
+
+  <line x1="132" y1="396" x2="132" y2="428" stroke="#6b7280" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="345" y1="396" x2="345" y2="428" stroke="#6b7280" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="552" y1="396" x2="552" y2="428" stroke="#6b7280" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+  <text x="44" y="418" font-family="sans-serif" font-size="13" font-weight="500" fill="#1a1a1a">面板渲染层 · 统一 categoryLabelOf(cat)</text>
+
+  <rect x="40" y="428" width="185" height="54" rx="10" fill="#ffffff" stroke="#534AB7" stroke-width="1"/>
+  <text x="132" y="450" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#26215C">覆盖层面板</text>
+  <text x="132" y="468" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">categoryLabelOf(cat)</text>
+
+  <rect x="247" y="428" width="196" height="54" rx="10" fill="#ffffff" stroke="#0F6E56" stroke-width="1"/>
+  <text x="345" y="450" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#04342C">iframe 面板</text>
+  <text x="345" y="468" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">categoryLabelOf(cat)</text>
+
+  <rect x="465" y="428" width="175" height="54" rx="10" fill="#ffffff" stroke="#185FA5" stroke-width="1"/>
+  <text x="552" y="450" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#042C53">域名检索面板</text>
+  <text x="552" y="468" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#666">categoryLabelOf(cat)</text>
+
+  <text x="44" y="506" font-family="sans-serif" font-size="10" fill="#444">深度扫描 = 重新扫描 + 临时嵌套深度 3→5（runScan 前已生效）</text>
+  <text x="44" y="522" font-family="sans-serif" font-size="10" fill="#444">显式扫描均清 _scanCache 强制重算 → 快速准确</text>
+
+  <rect x="468" y="498" width="172" height="46" rx="8" fill="#FBEAF0" stroke="#993556" stroke-width="1"/>
+  <text x="554" y="514" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="500" fill="#4B1528">修复 A1 / A2</text>
+  <text x="554" y="530" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#4B1528">可点击图默认 overlay；内联事件广告赌博TLD 保持 overlay</text>
+</svg>

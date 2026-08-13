@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页元素屏蔽器
 // @namespace    http://tampermonkey.net/
-// @version      3.4.9
+// @version      3.4.10
 // @description  三层架构 v2.1：FrameDetector 独立模块（帧发现与同域判定）。
 //               Engine Layer 包含：NetworkEngine（网络请求拦截）、DOMScanner（动态节点扫描）、
 //               CSSEngine（CSS 规则注入）、FrameDetector（iframe 帧发现）、
@@ -23,6 +23,62 @@
 
 (function () {
     'use strict';
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  统一元素分类体系（单一事实来源）
+    //  维度一「广告形态」(overlay / iframe 系)：按广告呈现形态命名
+    //  维度二「资源类型」(网络层 / 域名检索)：按被加载资源类型命名
+    //  两维度命名不同属合理双层视角，但所有中文标签集中于此，消除散落三处映射。
+    //  OverlayScanEngine / IframeDeepScanner 产出 category 键；
+    //  GlobalDomainScanner.TYPE_MAP 也已映射到此处的资源类型键，标签统一取 CATEGORY_LABELS。
+    // ═══════════════════════════════════════════════════════════════════
+    const ELEMENT_CATEGORY = {
+        // 广告形态维度（overlay / iframe 系）
+        OVERLAY: 'overlay',        // 覆盖层：透明/定位遮挡/点击跳转广告
+        INVISIBLE: 'invisible',    // 不可见：opacity:0 / visibility:hidden / 屏外 / 1x1 像素占位
+        TRACKING: 'tracking',      // 追踪像素：1x1 / 信标
+        VICE_IMAGE: 'vice-image',  // 博彩/色情图片（仅真实 img）
+        DOMAIN_AD: 'domain-ad',    // 域名封杀：命中广告域名集
+        PATH_AD: 'path-ad',        // 路径匹配：命中路径规则
+        UNKNOWN: 'unknown',        // 其他可疑
+        // 资源类型维度（网络层 / 域名检索）
+        SCRIPT: 'script',          // 脚本
+        CSS: 'css',                // 样式表
+        IMAGE: 'image',            // 图片
+        XHR: 'xhr',                // 网络请求（XMLHttpRequest / fetch）
+        BEACON: 'beacon',          // 网络请求（navigator.sendBeacon）
+        IFRAME: 'iframe',          // iframe / 子文档
+        MEDIA: 'media',            // 媒体（video / audio）
+        WS: 'ws',                  // WebSocket
+        PLUGIN: 'plugin',          // 插件（embed / object）
+        OTHER: 'other'             // 其他
+    };
+
+    // 分类键 → 中文标签（统一映射，覆盖全部 19 个键）
+    const CATEGORY_LABELS = {
+        'overlay': '覆盖层',
+        'invisible': '不可见',
+        'tracking': '追踪像素',
+        'vice-image': '🚫博彩色情图',
+        'domain-ad': '域名封杀',
+        'path-ad': '路径匹配',
+        'unknown': '其他可疑',
+        'script': '脚本',
+        'css': '样式表',
+        'image': '图片',
+        'xhr': '网络请求',
+        'beacon': '网络请求',
+        'iframe': 'iframe',
+        'media': '媒体',
+        'ws': 'WebSocket',
+        'plugin': '插件',
+        'other': '其他'
+    };
+
+    // 统一标签获取：所有面板共用，替代 overlay/iframe/网络层三套散落映射
+    function categoryLabelOf(cat) {
+        return CATEGORY_LABELS[cat] || '未知';
+    }
 
     function debounce(func, wait, maxWait) {
         let timeout, lastExec = null;
@@ -88,15 +144,6 @@
         }
     };
 
-    // safeExecute: 统一错误处理包装器，替代重复的 catch (e) { Log.warn(...) } 模式
-    function safeExecute(fn, name = 'operation') {
-        try {
-            return fn();
-        } catch (e) {
-            Log.warn(name + ' 异常:', e.message || e);
-        }
-    }
-
     // 安全获取计算样式：跨帧调用时若失败则返回 null
     function safeGetComputedStyle(el, view) {
         try { return view.getComputedStyle(el); } catch (e) { return null; }
@@ -133,6 +180,16 @@
         // 深度限制
         MAX_SCAN_DEPTH: 3,
         MAX_NESTING_DEPTH: 10
+    };
+
+    // UI 层常量：集中 z-index / 搜索深度 / 配置 key，消除散落魔法数字（冗余清理）
+    const UI_CONST = {
+        UI_TOP_Z_INDEX: 2147483647,        // Shadow DOM 宿主顶层 z-index
+        UI_OVERLAY_Z_INDEX: 2147483646,    // Toast / 确认弹窗 / 横幅 浮层 z-index
+        HIDE_Z_INDEX: -2147483648,         // 隐藏规则 CSS 中把元素压到最底层
+        WRAPPER_SEARCH_DEPTH: 4,           // findSingleChildWrapper 单子链容器搜索深度
+        HIGHLIGHT_COLOR_KEY: 'config_highlight_color',
+        DEFAULT_HIGHLIGHT_COLOR: '#FF3B30'
     };
 
     // 资源选择器构建器：统一域名/路径资源属性选择器构建，消除 8+ 处手动拼接(4.4 节)
@@ -176,7 +233,7 @@
                         BlockEngine.hideElement(el);
                         if (el.parentElement) BlockEngine.hideElement(el.parentElement);
                     }
-                    BlockEngine.hideElement(BlockEngine.findSingleChildWrapper(el, 4));
+                    BlockEngine.hideElement(BlockEngine.findSingleChildWrapper(el, UI_CONST.WRAPPER_SEARCH_DEPTH));
                 });
             });
         }
@@ -292,20 +349,6 @@
     };
 
     // ═══════════════════════════════════════════════════════════
-    // RuleStore：规则存储接口（从 StorageManager 拆分）
-    // 职责：规则 CRUD + 导入导出 + 缓存管理
-    // 依赖：GM_setValue/GM_getValue
-    // ═══════════════════════════════════════════════════════════
-    const RuleStore = {};
-
-    // ═══════════════════════════════════════════════════════════
-    // ConfigStore：配置存储接口（从 StorageManager 拆分）
-    // 职责：运行时配置 + 闪现标记 + iframe 配置
-    // 依赖：GM_setValue/GM_getValue
-    // ═══════════════════════════════════════════════════════════
-    const ConfigStore = {};
-
-    // ═══════════════════════════════════════════════════════════
     // StorageManager：存储层核心模块
     // 职责：规则 CRUD + 持久化（GM_setValue/GM_getValue）+ 防抖落盘
     // 规则类型：static/dynamic/regex/attribute/structural/complex/pathPattern/domainBlock/iframeBlock
@@ -332,7 +375,7 @@
         _markDirty(key, value) {
             this._pendingWrites[key] = value;
             if (this._saveTimer) clearTimeout(this._saveTimer);
-            this._saveTimer = setTimeout(() => this._flush(), TIMING.TOAST_DISMISS_MS);
+            this._saveTimer = setTimeout(() => this._flush(), TIMING.STORAGE_FLUSH_DEBOUNCE_MS);
         }
 
         // 立即落盘所有待写数据
@@ -737,6 +780,14 @@
                 }
             }
 
+            // 各规则桶主键：导入时校验，缺失主键的非法规则对象直接丢弃，
+            // 避免坏规则写入存储后刷新 applyCSSRules/applyRegexRules 抛错或静默漏应用(BUG-IMPORT-BADRULE)
+            const REQUIRED_KEY = {
+                blocks: 'selector', dynamicBlocks: 'className', regexBlocks: 'regex',
+                attrBlocks: 'attrSelector', structBlocks: 'structSelector',
+                pathPatternBlocks: 'pattern'
+                // complexBlocks 结构多样(selector/conditions/rules)，仅要求为对象，不强制单键
+            };
             const dictKeys = ['blocks', 'dynamicBlocks', 'regexBlocks', 'attrBlocks', 'structBlocks', 'complexBlocks', 'pathPatternBlocks', 'config', 'pro_blocker_flash_domains'];
             dictKeys.forEach(key => {
                 const incoming = importData[key];
@@ -758,6 +809,9 @@
                             const existingSet = new Set(existing[d].map(fingerprint));
                             incoming[d].forEach(item => {
                                 if (item && typeof item === 'object') {
+                                    // 跳过缺失主键的非法规则，保持存储健康(BUG-IMPORT-BADRULE)
+                                    const _req = REQUIRED_KEY[key];
+                                    if (_req && !Object.prototype.hasOwnProperty.call(item, _req)) return;
                                     const fp = fingerprint(item);
                                     if (!existingSet.has(fp)) {
                                         existingSet.add(fp);
@@ -811,7 +865,7 @@
                 } else {
                     this._markDirty('iframeBlocks', incoming.map(r => ({ ...r, _ts: Date.now() })));
                 }
-                if (typeof IframeGuard !== 'undefined') IframeGuard.invalidateBlockRules();
+                EventBus.emit('iframe:rules-changed'); // 清 iframe 规则缓存（解耦 IframeGuard，经 EventBus）
             } else if (!merge) {
                 this._markDirty('iframeBlocks', []);
             }
@@ -850,7 +904,7 @@
             list.push({ matchType: rule.matchType, value: rule.value, _ts: Date.now() });
             this._markDirty('iframeBlocks', list);
             if (!skipApply) {
-                IframeGuard.invalidateBlockRules(); // 清缓存
+                EventBus.emit('iframe:rules-changed'); // 清缓存（解耦 IframeGuard）
                 EventBus.emit('rule:changed', { type: 'iframeBlock' });
             }
             return true;
@@ -860,7 +914,7 @@
             if (index < 0 || index >= list.length) return false;
             list.splice(index, 1);
             this._markDirty('iframeBlocks', list);
-            IframeGuard.invalidateBlockRules();
+            EventBus.emit('iframe:rules-changed'); // 解耦 IframeGuard
             EventBus.emit('rule:changed', { type: 'iframeBlock' });
             return true;
         }
@@ -869,12 +923,18 @@
             if (index < 0 || index >= list.length) return false;
             list[index]._disabled = !list[index]._disabled;
             this._markDirty('iframeBlocks', list);
-            IframeGuard.invalidateBlockRules();
+            EventBus.emit('iframe:rules-changed'); // 解耦 IframeGuard
             EventBus.emit('rule:changed', { type: 'iframeBlock' });
             return list[index]._disabled;
         }
         getIframeConfig() {
             return this._readKey('iframeConfig', { maxDepth: 3 });
+        }
+        // C2 端口：iframeConfig 写入统一经 StorageManager（_markDirty + EventBus 失效），
+        // 消除 IframeGuard 裸写 GM_setValue 绕过缓存一致性的缺陷
+        setIframeConfig(obj) {
+            this._markDirty('iframeConfig', obj || {});
+            EventBus.emit('iframe:rules-changed');
         }
 
         markAsFlashing() {
@@ -945,25 +1005,6 @@
     // 真实浏览器才实例化 StorageManager（其构造器依赖 window/document）；node/jest 下置 null，
     // 使产物可被 require 做 UI 契约测试（Feathers《Working Effectively with Legacy Code》§3 接缝）
     const storage = (typeof document !== 'undefined' && typeof window !== 'undefined' && typeof window.HTMLElement !== 'undefined') ? new StorageManager() : null;
-
-    // 门面模式：RuleStore 和 ConfigStore 委托到 storage 实例
-    // node/jest 下 storage 为 null，跳过门面装配（产物仍可 require 做 UI 契约测试）
-    if (storage) {
-        ['getDomainBlocks', 'addRule', 'removeRule', 'toggleDisabled', 'getData',
-            'getIframeBlocks', 'addIframeRule', 'removeIframeRule', 'toggleIframeRuleDisabled',
-            'exportAll', 'importAll', 'invalidateDataCache', 'getDomainSet',
-            'getStatic', 'getDynamic', 'getRegex', 'getAttribute', 'getStructural',
-            'getComplex', 'getPathPattern', 'domain'
-        ].forEach(m => {
-            if (typeof storage[m] === 'function') RuleStore[m] = (...args) => storage[m](...args);
-            else RuleStore[m] = storage[m];
-        });
-        ['getConfig', 'setConfig', 'getIframeConfig', 'markAsFlashing', 'resetFlash', 'flashList'
-        ].forEach(m => {
-            if (typeof storage[m] === 'function') ConfigStore[m] = (...args) => storage[m](...args);
-            else ConfigStore[m] = storage[m];
-        });
-    }
 
     /**
      * 路径规则倒排索引：提取每条 pattern 最长 ≥4 字符 token 建 Map<token, Set<pattern>>，
@@ -1067,7 +1108,7 @@
         applyCSSRules() {
             const data = storage.getData();
             const selectors = [];
-            const hideCSS = '{ display: none !important; opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; z-index: -2147483648 !important; height: 0 !important; width: 0 !important; position: absolute !important; }';
+            const hideCSS = `{ display: none !important; opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; z-index: ${UI_CONST.HIDE_Z_INDEX} !important; height: 0 !important; width: 0 !important; position: absolute !important; }`;
 
             // 跳过 _disabled=true 的规则（用户临时禁用，不参与拦截）
             data.static.forEach(r => !r._disabled && r.selector && selectors.push(r.selector));
@@ -1718,10 +1759,12 @@
             const results = conditions.map(c => {
                 if (c.type === 'text') {
                     const val = (el.textContent || '') + '';
-                    if (c.operator === 'contains') return val.includes(c.value);
+                    // 积木"包含"改为大小写不敏感，与正则面板"包含"(lower.includes)口径一致(BUG-Y5)，
+                    // 避免同一词在两种入口行为相反、误判规则失效
+                    if (c.operator === 'contains') return (val.toLowerCase()).includes((c.value || '').toLowerCase());
                     // FIX-A：not_contains 对空文本应返回 true（"不含 X"对空值恒真），
                     // 原 `val !== '' && !val.includes(...)` 在空文本时误返回 false，导致 AND 规则漏匹配
-                    if (c.operator === 'not_contains') return !val.includes(c.value);
+                    if (c.operator === 'not_contains') return !(val.toLowerCase()).includes((c.value || '').toLowerCase());
                     if (c.operator === 'equals') return val.trim() === (c.value || '').trim();
                     return false;
                 }
@@ -1900,7 +1943,7 @@
                 }
 
                 if (blocked) {
-                    const target = BlockEngine.findSingleChildWrapper(el, 4);
+                    const target = BlockEngine.findSingleChildWrapper(el, UI_CONST.WRAPPER_SEARCH_DEPTH);
                     // 闪现检测必须在隐藏之前：display:none 会使 getBoundingClientRect 返回 0×0
                     // 元素已渲染出非零尺寸才说明它"闪现"过 → 标记域名，下次进入自动启用 preemptive
                     BlockEngine.detectFlashAndMark(el, matchedDomain ? `https://${matchedDomain}/` : '');
@@ -3195,7 +3238,9 @@
         // ─── 博彩/色情/恶意跳转词元库（使用顶层统一集合）───
         const VICE_TOKENS = VICE_TOKENS_UNIFIED;
 
-        // ─── 资源类型映射 ───
+        // ─── 资源类型映射（维度二：资源类型）───
+        // 输出键与文件顶部 CATEGORY_LABELS 的资源类型键一致（script/css/image/xhr/beacon/iframe/media/ws/plugin/other），
+        // 面板展示时统一调用 categoryLabelOf() 取中文标签，勿在此处另建标签映射。
         const TYPE_MAP = {
             'script': 'script', 'link': 'css', 'css': 'css',
             'img': 'image', 'image': 'image', 'picture': 'image',
@@ -3748,6 +3793,7 @@
         RELOAD_DELAY_MS: 1500,      // 规则变更/导入后页面重载延迟
         REPORT_DELAY_MS: 100,       // 子帧分类上报延迟
         TOAST_DISMISS_MS: 300,      // Toast 自动消失延迟
+        STORAGE_FLUSH_DEBOUNCE_MS: 300, // 存储落盘防抖（与 Toast 时长语义解耦，避免误改名牵动刷新节奏）
         OBSERVER_TIMEOUT_MS: 30000, // 帧观察器自动断开超时（防 GC 泄漏）
         DEEP_SCAN_DELAY_MS: 50,     // 深扫防抖
         MICRO_DELAY_MS: 10          // 微任务延迟
@@ -3929,6 +3975,7 @@
                 if (onclickVal.includes('window.open') || onclickVal.includes('location.href') || onclickVal.includes('location=')) {
                     f.suspicion += 20; f.reasons.push('onclick跳转');
                     f.features.clickable = true;
+                    f.category = 'overlay'; // 明确可点击跳转广告，归入覆盖层而非 unknown(分类准确)
                     // 提取跳转目标域名
                     const urlMatch = onclickVal.match(/https?:\/\/[^\s"'<>(){}']+/i);
                     if (urlMatch) {
@@ -3947,6 +3994,7 @@
             if (dataTrigger && /^https?:\/\//.test(dataTrigger)) {
                 f.suspicion += 15; f.reasons.push('data-*跳转');
                 f.features.clickable = true;
+                f.category = 'overlay'; // 明确可点击跳转广告，归入覆盖层而非 unknown(分类准确)
                 try {
                     const targetHost = new URL(dataTrigger).hostname;
                     if (targetHost !== location.hostname) {
@@ -4000,8 +4048,8 @@
         }
 
         function _analyzeClickableImage(img) {
-            if (ProtectedCheck.isProtected(img)) return { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
-            const f = { el: img, suspicion: 0, reasons: [], features: {}, category: 'vice-image' };
+            if (ProtectedCheck.isProtected(img)) return { el: img, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
+            const f = { el: img, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
             const rect = _rect(img);
             const parent = img.closest('a, [onclick]');
             const container = img.parentElement;
@@ -4043,7 +4091,7 @@
             const cls = ((img.className || '') + ' ' + (container ? (container.className || '') : '')).toLowerCase();
             const id = (img.id || '').toLowerCase();
             if (VICE_IMG_RE.test(cls) || VICE_IMG_RE.test(id)) {
-                f.suspicion += 15; f.reasons.push('图片命名可疑');
+                f.suspicion += 15; f.reasons.push('图片命名可疑'); f.category = 'vice-image';
             }
             const cs = _cs(img) || _cs(container);
             if (cs && (cs.position === 'fixed' || cs.position === 'absolute')) {
@@ -4063,8 +4111,8 @@
         // 分析带内联事件的广告元素（移动端劫持核心）
         // 针对 [onclick] / [ontouchstart] / [onmousedown] / [data-href] 等元素
         function _analyzeInlineEventAd(el) {
-            if (ProtectedCheck.isProtected(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
-            const f = { el, suspicion: 0, reasons: [], features: {}, category: 'invisible' };
+            if (ProtectedCheck.isProtected(el)) return { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
+            const f = { el, suspicion: 0, reasons: [], features: {}, category: 'overlay' };
             const tag = el.tagName.toLowerCase();
             const rect = _rect(el);
             const cls = (el.className || '').toLowerCase();
@@ -4083,7 +4131,6 @@
                             if (labels.length >= 2 && GAMBLING_TLDS.has(labels[labels.length - 1])) {
                                 f.suspicion += 25; f.reasons.push('赌博TLD');
                                 f.features.viceTarget = targetHost;
-                                f.category = 'vice-image';
                             }
                         } catch (e) { Log.warn(e.message || e); }
                     }
@@ -4119,7 +4166,6 @@
                     if (labels.length >= 2 && GAMBLING_TLDS.has(labels[labels.length - 1])) {
                         f.suspicion += 25; f.reasons.push('赌博TLD');
                         f.features.viceTarget = targetHost;
-                        f.category = 'vice-image';
                     }
                 } catch (e) { Log.warn(e.message || e); }
             }
@@ -4630,11 +4676,8 @@
     const StorageService = new Proxy({}, {
         get(_t, prop) {
             if (prop === 'invalidateIframeRules') {
-                return () => {
-                    if (typeof IframeGuard !== 'undefined' && typeof IframeGuard.invalidateBlockRules === 'function') {
-                        IframeGuard.invalidateBlockRules();
-                    }
-                };
+                // C4 解耦：StorageService 不再直连 IframeGuard，改经 EventBus 通知缓存失效
+                return () => EventBus.emit('iframe:rules-changed');
             }
             const target = storage || {};
             const v = target[prop];
@@ -4662,7 +4705,11 @@
     // ── Phase B 面板模块（物理抽离自 UIManager · 独立可测） ──
     // 每个面板为独立函数模块，经 XPanel.call(this) 注入 UIManager 协调器为 this；行为等价（SRP/OCP）。
     function SelectionPanel() {
-        this.stopSelection();
+        // BUG-FIX(架构优化#1·Critical): 进入选择模式必须走 clearPanel() 而非 stopSelection()。
+        // clearPanel 会还原上一个面板可能处于激活态的预览(_globalPreview/_overlayPreview/_iframePreview/_actionPreview)
+        // 与选择高亮，并清理孤儿面板 DOM / 拖拽监听 / 预览横幅；否则从"带预览的面板"经菜单切到选择模式后，
+        // 被预览隐藏的元素在本会话内不恢复、上一个面板 DOM 与横幅叠加残留 → 元素被永久隐藏(BUG-X-PERMAHIDE)。
+        this.clearPanel();
         this.injectHighlightStyle();
         this._showSelectionBanner();
         // 选择模式下完全冻结页面导航：广告常通过 window.open / location.href / form.submit
@@ -4751,6 +4798,9 @@
         let selectedHosts = new Set(allDomains.filter(d => d.score >= 35 || d.viceToken).map(d => d.host));
         let filterText = '';
         let onlyAds = true;
+        // 用户手动取消勾选的域名：深度扫描的"自动补勾高分域"不得覆盖用户显式意图(BUG-G4)
+        // 否则用户取消勾选某个高分域后点深度扫描，该域会被静默重新勾选，预览与最终封杀名单不符
+        const manuallyDeselected = new Set();
 
         const isAdLike = (d) => isAdKeywordHost(d.host) || d.score >= 40 || !!d.viceToken || !!d.adToken || d.level === 'ad' || d.level === 'suspect';
 
@@ -4761,10 +4811,16 @@
             const box = panel.querySelector('#global-domains');
             const stats = panel.querySelector('#gd-stats');
             if (!box) return;
+            // 列表整体重写 innerHTML 会把 scrollTop 复位为 0，长列表下勾选一项就跳回顶部，
+            // 用户无法连续勾选。渲染前后保存并回填滚动位置(BUG-G1)
+            const prevScroll = box.scrollTop;
 
             const filtered = allDomains.filter(d => {
                 if (filterText && !d.host.includes(filterText)) return false;
-                if (onlyAds && !isAdLike(d)) return false;
+                // BUG-FIX(架构优化#7·Important): "只看广告相关"过滤下仍需保留已被勾选的域名，
+                // 否则 35–39 分(默认勾选阈值)却 <40 分(过滤阈值)的域名会被默认勾选却从列表消失，
+                // 导致"已选 N"虚高、用户看不到也无法取消这些项(BUG-SEL-INVISIBLE)
+                if (onlyAds && !isAdLike(d) && !selectedHosts.has(d.host)) return false;
                 return true;
             });
 
@@ -4795,13 +4851,14 @@
                                 <div class="gd-check">${checked ? '✓' : ''}</div>
                                 <div>
                                     <div class="gd-host">${escapeHTML(d.host)} ${viceBadge}${adBadge}${levelBadge}</div>
-                                    <div class="gd-meta">来源：${sources}${reasons ? ' · ' + escapeHTML(reasons) : ''}</div>
+                                    <div class="gd-meta">来源：${escapeHTML(sources)}${reasons ? ' · ' + escapeHTML(reasons) : ''}</div>
                                 </div>
                             </div>
                             <div class="gd-score ${getScoreClass(d.score)}">${d.score}</div>
                         </div>`;
                 }).join('');
             }
+            box.scrollTop = prevScroll; // 回填滚动位置(BUG-G1)
 
             const btnBlock = panel.querySelector('#btn-block-global');
             if (btnBlock) {
@@ -4846,8 +4903,9 @@
             const row = e.target.closest('.gd-domain-row');
             if (!row) return;
             const host = row.dataset.host.toLowerCase();
-            if (selectedHosts.has(host)) selectedHosts.delete(host);
-            else selectedHosts.add(host);
+            // 记录用户显式意图：取消勾选后深度扫描不得自动补勾回来(BUG-G4)
+            if (selectedHosts.has(host)) { selectedHosts.delete(host); manuallyDeselected.add(host); }
+            else { selectedHosts.add(host); manuallyDeselected.delete(host); }
             updateGlobalPreview();
             renderDomains();
         });
@@ -4862,11 +4920,13 @@
                 if (onlyAds && !isAdLike(d)) return false;
                 return true;
             });
-            visible.forEach(d => selectedHosts.add(d.host));
+            visible.forEach(d => { selectedHosts.add(d.host); manuallyDeselected.delete(d.host); });
             updateGlobalPreview();
             renderDomains();
         });
         panel.querySelector('#gd-select-none').addEventListener('click', () => {
+            // "清空"是显式意图，深度扫描不得把高分域重新补勾回来(BUG-G4)
+            selectedHosts.forEach(h => manuallyDeselected.add(h));
             selectedHosts.clear();
             updateGlobalPreview();
             renderDomains();
@@ -4892,6 +4952,7 @@
                 allDomains.push({ host, score: 99, sources: ['manual'], reasons: ['用户手动添加'], count: 1, viceToken: null, adToken: null, level: null, gdsReasons: [], signals: 0 });
             }
             selectedHosts.add(host);
+            manuallyDeselected.delete(host);
             input.value = '';
             updateGlobalPreview();
             renderDomains();
@@ -4908,6 +4969,9 @@
             btn.textContent = '⏳ 深度挖掘中...';
             // 高开销探测包裹 requestIdleCallback，避免主线程卡死（方案六.2 性能保护）
             const runDeep = () => {
+                // requestIdleCallback/setTimeout 期间用户可能已关闭或切换面板，
+                // 此时继续渲染与弹 Toast 属于对已销毁面板的写入，且会让预览态在面板外复活(BUG-G2)
+                if (!panel.isConnected) return;
                 try {
                     const currentBlocked = new Set(this.storage.getDomainBlocks().map(r => (r.domain || '').toLowerCase()));
                     allDomains = allDomains.filter(d => !currentBlocked.has(d.host));
@@ -4953,12 +5017,16 @@
                     Array.from(selectedHosts).forEach(h => { if (!hostSet.has(h)) selectedHosts.delete(h); });
                     // ⑩ 深度扫描后自动勾选新出现的高分域名，与初始加载逻辑一致
                     // 初始加载 selectedHosts 纳入 score>=35 || viceToken，深度扫描同口径补齐新增域名
+                    // 但跳过用户手动取消过的域名，避免自动补勾覆盖显式意图(BUG-G4)
                     allDomains.forEach(d => {
-                        if ((d.score >= 35 || d.viceToken) && !selectedHosts.has(d.host)) {
+                        if ((d.score >= 35 || d.viceToken) && !selectedHosts.has(d.host) && !manuallyDeselected.has(d.host)) {
                             selectedHosts.add(d.host);
                         }
                     });
                     renderDomains();
+                    // 预览激活时同步：深度扫描新自动勾选的域名须立即反映到实时预览，
+                    // 否则预览隐藏的元素少于真实封杀项，与刷新后效果不一致(BUG-Y3)
+                    updateGlobalPreview();
                     btn.disabled = false;
                     btn.textContent = origText;
                     const deepNote = deepResult.deepExtras ? `（深度新增：SW ${deepResult.deepExtras.swHosts.length} · WS ${deepResult.deepExtras.wsHosts.length} · 伪元素 ${deepResult.deepExtras.pseudoUrls.length} · SVG ${deepResult.deepExtras.svgUrls.length}）` : '';
@@ -5165,6 +5233,21 @@
             }
         };
 
+        // 统一入口：只有真正命中元素才进入预览态(BUG-R1)
+        // 此前 attribute / builder / contains / regex 四个分支缺少命中校验，0 命中也会
+        // 置 isPreviewing=true、弹预览横幅、按钮改成"👁 恢复显示"，用户以为规则生效实则空转，
+        // 与 path 分支的 hit===0 拦截口径不一致
+        const enterPreview = (btn) => {
+            if (this._previewAffectedElements.length === 0) {
+                this.showToast('当前页面未匹配到任何元素，预览为空。', 'info');
+                return false;
+            }
+            isPreviewing = true;
+            this._showPreviewBanner(() => resetPreview());
+            btn.textContent = '👁 恢复显示';
+            return true;
+        };
+
         panel.addEventListener('input', resetPreview);
         panel.addEventListener('change', resetPreview);
 
@@ -5198,14 +5281,12 @@
                     let counted = false;
                     if (hideNode(el)) counted = true;
                     if (el.parentElement && hideNode(el.parentElement)) counted = true;
-                    const wrapper = BlockEngine.findSingleChildWrapper(el, 4);
+                    const wrapper = BlockEngine.findSingleChildWrapper(el, UI_CONST.WRAPPER_SEARCH_DEPTH);
                     if (hideNode(wrapper)) counted = true;
                     if (counted) hit++;
                 });
                 if (hit === 0) { this.showToast('当前页面未匹配到含该路径片段的资源，预览为空。', 'info'); return; }
-                isPreviewing = true;
-                this._showPreviewBanner(() => resetPreview());
-                btn.textContent = '👁 恢复显示';
+                enterPreview(btn);
                 return;
             }
 
@@ -5226,9 +5307,7 @@
                     this.showToast('校验失败：属性选择器语法错误。', 'error');
                     return;
                 }
-                isPreviewing = true;
-                this._showPreviewBanner(() => resetPreview());
-                btn.textContent = '👁 恢复显示';
+                enterPreview(btn);
                 return;
             }
 
@@ -5318,9 +5397,7 @@
                 }
             }
 
-            isPreviewing = true;
-            this._showPreviewBanner(() => resetPreview());
-            btn.textContent = '👁 恢复显示';
+            enterPreview(btn);
         });
 
         panel.querySelector('#btn-save-regex').addEventListener('click', () => {
@@ -5405,7 +5482,7 @@
                         this.showToast('校验失败：正则含嵌套量词（ReDoS 风险），已拒绝保存。', 'error');
                         return;
                     }
-                    this.storage.addRule('regex', { regex: text, level: level, type: 'regex' });
+                    this.storage.addRule('regex', { regex: text, level: level, mode: 'regex', type: 'regex' });
                 }
                 BlockEngine.applyRegexRules();
             }
@@ -5478,17 +5555,15 @@
         let _scanCacheTime = 0;
         const SCAN_CACHE_TTL = 5000;
 
-        // 已拦截指纹：跨扫描保留 blocked 状态
-        const blockedFingerprints = new WeakSet();
-        IframeGuard._liveFrames().forEach((iframe) => {
-            const rec = IframeGuard._frameRecords.get(iframe);
-            if (rec && (rec.blocked || rec.manual)) blockedFingerprints.add(iframe);
-        });
+        // 跨扫描的 blocked 粘性由 IframeGuard._frameRecords 唯一承担（collectAll 读 rec.blocked || rec.manual），
+        // 此处原有的 blockedFingerprints WeakSet 只写不读，且元素分支的 el.closest('iframe')
+        // 在帧内文档中恒为 null，属死代码，已移除(BUG-I2)
 
         // ─── 标签与颜色 ───
         const verdictLabel = (v) => ({ 'ad': '广告帧', 'content': '内容帧', 'whitelist': '白名单', 'unknown': '未知' }[v] || '未知');
         const verdictColor = (v) => ({ 'ad': 'rgba(255,59,48,0.7)', 'content': 'rgba(52,199,89,0.6)', 'whitelist': 'rgba(0,122,255,0.6)', 'unknown': 'rgba(120,144,156,0.5)' }[v] || 'rgba(120,144,156,0.5)');
-        const elementReasonLabel = { 'domain-ad': '域名封杀', 'path-ad': '路径匹配', 'overlay': '透明覆盖', 'vice': '赌博域名', 'skin': '肤色特征' };
+        // 元素分类标签统一走 categoryLabelOf（见文件顶部 ELEMENT_CATEGORY / CATEGORY_LABELS）。
+        // 原 elementReasonLabel 散落映射已删除：死键 'vice'/'skin' 从未被产出，'overlay' 统一为「覆盖层」。
         const getScoreClass = (s) => s >= 50 ? 'high' : s >= 25 ? 'mid' : 'low';
 
         // 帧级风险分：广告帧最高，未知次之
@@ -5576,6 +5651,9 @@
             const box = panel.querySelector('#iframe-list');
             const stats = panel.querySelector('#iframe-stats');
             if (!box) return;
+            // 与域名面板同因：innerHTML 整体替换会把 scrollTop 归零，
+            // 列表 max-height:320px 必然出现滚动，勾选一项就跳回顶部(BUG-I3)
+            const prevScroll = box.scrollTop;
 
             if (scanning) {
                 box.innerHTML = '<li class="empty-tip">⏳ 正在扫描 iframe...</li>';
@@ -5628,7 +5706,7 @@
                     const elRec = r.elRec;
                     const cat = r.category;
                     const color = cat.endsWith('-ad') ? 'rgba(255,59,48,0.7)' : 'rgba(255,159,10,0.6)';
-                    const label = elementReasonLabel[cat] || cat;
+                    const label = categoryLabelOf(cat);
                     badgeHtml = `<span class="tag" style="background:${color};">⚠${label}</span>`;
                     if (r.blocked) badgeHtml += '<span class="tag" style="background:rgba(52,199,89,0.6);">已拦截</span>';
 
@@ -5652,6 +5730,7 @@
                         <div class="gd-score ${scoreClass}">${r.suspicion}</div>
                     </div>`;
             }).join('');
+            box.scrollTop = prevScroll; // 回填滚动位置(BUG-I3)
 
             const btn = panel.querySelector('#btn-block-iframe');
             if (btn) {
@@ -5679,7 +5758,9 @@
                 if (!r || r.blocked) return;
                 if (r.type === 'frame') {
                     const iframe = r.iframe;
-                    if (document.contains(iframe) && iframe.style.display !== 'none') {
+                    // 统一用 isConnected（与 element 分支一致）：嵌套(孙级)iframe 在另一 iframe 文档内时
+                    // document.contains 返回 false 但 isConnected 为 true，否则嵌套 iframe 预览不生效却仍被计入(BUG-I3)
+                    if (iframe && iframe.isConnected && iframe.style.display !== 'none') {
                         BlockEngine.hideElement(iframe);
                         this._iframePreview.elements.push(iframe);
                     }
@@ -5692,6 +5773,23 @@
                     }
                 }
             });
+        };
+        // 进入预览态：预览按钮与"扫描后恢复预览"共用同一执行器，
+        // 避免两处各写一份导致口径漂移(BUG-I1)
+        const enterPreview = () => {
+            if (selectedSet.size === 0) return false;
+            this._iframePreview = { active: true, elements: [] };
+            try {
+                updatePreview();
+            } catch (err) {
+                Log.error('iframe 预览失败:', err);
+                this._iframePreview = { active: false, elements: [] };
+                this.showToast('预览失败：' + err.message, 'error');
+                return false;
+            }
+            this._showPreviewBanner(() => resetPreview());
+            previewBtn.textContent = '👁 恢复显示';
+            return true;
         };
 
         // ─── 事件绑定 ───
@@ -5747,7 +5845,6 @@
                     }
                     BlockEngine.hideElement(iframe);
                     r.rec.blocked = true; r.rec.verdict = 'ad';
-                    blockedFingerprints.add(iframe);
                     IframeGuard._incStat('blocked');
                     EventBus.emit('iframe:blocked', { iframe, reason: 'panel-click' });
                     if (blockDomainToo && iframe.src) {
@@ -5761,8 +5858,6 @@
                     const elRec = r.elRec;
                     if (!elRec || elRec.blocked) return;
                     IframeGuard.blockInFrameNode(elRec);
-                    const targetIframe = elRec.el?.closest('iframe');
-                    if (targetIframe) blockedFingerprints.add(targetIframe);
                     if (blockDomainToo && elRec.frameHost) {
                         try {
                             const u = new URL('//' + elRec.frameHost, location.href);
@@ -5796,17 +5891,7 @@
                 this.showToast('请先选择需要预览的 iframe/元素。', 'warning');
                 return;
             }
-            this._iframePreview = { active: true, elements: [] };
-            try {
-                updatePreview();
-            } catch (err) {
-                Log.error('iframe 预览失败:', err);
-                this._iframePreview.active = false;
-                this.showToast('预览失败：' + err.message, 'error');
-                return;
-            }
-            this._showPreviewBanner(() => resetPreview());
-            previewBtn.textContent = '👁 恢复显示';
+            enterPreview();
         });
 
         panel.querySelector('#if-block-domain').addEventListener('change', () => updatePreview());
@@ -5816,6 +5901,11 @@
             const old = btn.textContent;
             btn.textContent = '⏳ 扫描中...';
             btn.disabled = true;
+            // 预览态必须先还原：① records 会被重建、selectedSet 被重置，旧预览隐藏的元素
+            // 不再对应任何选中项，横幅与按钮却仍显示"预览中"；② 被 display:none 的 iframe
+            // 会污染 IframeGuard 的冻结几何测量，导致重新分类结果失真(BUG-I1)
+            const wasPreview = this._iframePreview.active;
+            resetPreview();
             _scanCache = null;
             selectedSet.clear();
             // 深度：临时拉满嵌套深度，强制重跑帧内元素级深扫（递归嵌套帧、识别透明覆盖/赌博域名等元素）
@@ -5826,14 +5916,18 @@
             IframeDeepScanner.maxDepth = prevDepth;
             btn.textContent = old;
             btn.disabled = false;
+            if (wasPreview) enterPreview(); // 按新的自动勾选结果重建预览
             if (ok) this.showToast('深度扫描完成（已递归嵌套帧、重跑元素级深扫）', 'success');
         });
 
         panel.querySelector('#btn-rescan-iframe').addEventListener('click', async () => {
+            const wasPreview = this._iframePreview.active;
+            resetPreview(); // 同 BUG-I1：重扫前还原预览，避免隐藏态污染重新分类与状态脱节
             _scanCache = null;
             selectedSet.clear();
             try { IframeGuard.forceRescan(); } catch (e) { this.showToast('重扫失败: ' + e.message, 'error'); return; }
             await runScan(false);
+            if (wasPreview) enterPreview();
             this.showToast('已重新扫描全部 iframe（帧级重新分类）', 'success');
         });
 
@@ -5887,7 +5981,7 @@
         const flashStatus = isFlashMarked
             ? `<span style="color:red; font-weight:bold;">已记录闪现特征</span>（本次加载如无闪现，将计入自愈 ${cleanCount}/3）`
             : '<span style="color:#34c759; font-weight:bold;">运行良好</span>';
-        const highlightColor = GM_getValue('config_highlight_color', '#FF3B30');
+        const highlightColor = GM_getValue(UI_CONST.HIGHLIGHT_COLOR_KEY, UI_CONST.DEFAULT_HIGHLIGHT_COLOR);
 
         panel.innerHTML = `
                 <h3 title="按住可拖动窗口">规则与防御管理 (${this.storage.domain})</h3>
@@ -5976,7 +6070,9 @@
                 case 'structural': return escapeHTML(r.structSelector || '');
                 case 'pathPattern': return `模式: ${escapeHTML(r.pattern || '')}`;
                 case 'iframeBlock': {
-                    const mt = r.matchType === 'srcDomain' ? 'src域名' : (r.matchType === 'srcdocKeyword' ? 'srcdoc关键词' : (r.matchType === 'geometry' ? '几何条件' : r.matchType));
+                    // 白名单映射未知 matchType 为 '未知'；回退值必须经 escapeHTML，否则导入的恶意
+                    // matchType（如 <img src=x onerror=...>）会作为未转义 HTML 注入管理面板，造成存储型 XSS(BUG-XSS)
+                    const mt = r.matchType === 'srcDomain' ? 'src域名' : (r.matchType === 'srcdocKeyword' ? 'srcdoc关键词' : (r.matchType === 'geometry' ? '几何条件' : (r.matchType ? escapeHTML(r.matchType) : '未知')));
                     return `iframe[${mt}]: ${escapeHTML(r.value || '')}`;
                 }
                 case 'complex': {
@@ -6070,6 +6166,11 @@
             // 仅统计域名黑名单(domainBlock)，排除 iframeBlock 规则，否则"全局域名黑名单"计数被虚高(BUG-COUNT)
             if (countEl) countEl.textContent = records.filter(r => r.scope === 'global' && r.type === 'domainBlock').length;
             if (!list) return;
+            // 与域名/iframe 面板同因：innerHTML 赋值会先清空子节点，滚动容器高度瞬时塌陷，
+            // scrollTop 被钳制为 0，删除一条规则后视口跳回顶部(BUG-M2)。
+            // 注意滚动容器是 ul 的父级 .selection-info（max-height:320px;overflow-y:auto），ul 自身无 overflow
+            const scroller = list.parentElement;
+            const prevScroll = scroller ? scroller.scrollTop : 0;
             // 影响度模式下按 impactScore 降序，让高风险（疑似误杀）规则置顶
             const displayRecords = impactMode
                 ? records.slice().sort((a, b) => (b.impactScore || 0) - (a.impactScore || 0))
@@ -6125,6 +6226,7 @@
                         <button class="btn-danger btn-delete" style="flex:none; width:60px; padding: 6px;" data-scope="${rec.scope}" data-domain="${escapeHTML(rec.domain)}" data-type="${rec.type}" data-index="${rec.index}" data-value="${escapeHTML(rec.value || '')}">删除</button>
                     </li>`;
             }).join('');
+            if (scroller) scroller.scrollTop = prevScroll; // 回填滚动位置(BUG-M2)
         };
         renderList();
 
@@ -6357,7 +6459,7 @@
                     colorInput.style.borderColor = '';
                     document.documentElement.style.setProperty('--pro-blocker-highlight-color', val);
                     if (colorPreview) colorPreview.style.background = val;
-                    GM_setValue('config_highlight_color', val);
+                    GM_setValue(UI_CONST.HIGHLIGHT_COLOR_KEY, val);
                 } else {
                     colorInput.style.borderColor = '#FF3B30';
                 }
@@ -6438,7 +6540,9 @@
             a.href = url;
             a.download = `pro-blocker-rules-${new Date().toISOString().slice(0, 10)}.json`;
             a.click();
-            URL.revokeObjectURL(url);
+            // 延迟回收 Blob URL：部分浏览器（Firefox/旧版 Chrome）在 a.click() 后异步启动下载，
+            // 若立即 revoke 会在下载开始前沿途销毁 URL，导致文件静默下载失败(RV1)
+            setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) { /* noop */ } }, 1000);
         });
 
         panel.querySelector('#btn-back').addEventListener('click', () => this.showManager());
@@ -6486,7 +6590,8 @@
             a.href = url;
             a.download = `adguard-rules-${new Date().toISOString().slice(0, 10)}.txt`;
             a.click();
-            URL.revokeObjectURL(url);
+            // 延迟回收 Blob URL：与导出面板同因(RV1)，避免下载沿途被销毁导致静默失败
+            setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) { /* noop */ } }, 1000);
         });
 
         panel.querySelector('#btn-ag-back').addEventListener('click', () => this.showManager());
@@ -6638,12 +6743,8 @@
         // 扫描进行中标志：render() 据此显示加载占位，避免空 records 误导用户以为扫描无结果(BUG-S2)
         let scanning = true;
 
-        const categoryLabel = (cat) => ({
-            'invisible': '不可见',
-            'overlay': '覆盖层',
-            'tracking': '追踪像素',
-            'vice-image': '🚫博彩色情图'
-        }[cat] || '可疑');
+        // 分类标签统一取自文件顶部 CATEGORY_LABELS（单一事实来源），不再散落映射
+        const categoryLabel = categoryLabelOf;
         const categoryColor = (cat) => ({
             'invisible': 'rgba(120,144,156,0.65)',
             'overlay': 'rgba(255,59,48,0.65)',
@@ -6656,6 +6757,9 @@
             const box = panel.querySelector('#overlay-list');
             const stats = panel.querySelector('#overlay-stats');
             if (!box) return;
+            // 与域名/iframe/管理面板同因：innerHTML 赋值先清空子节点，scrollTop 被钳制为 0，
+            // 长列表下勾选一项就跳回顶部(BUG-O1)
+            const prevScroll = box.scrollTop;
 
             // 扫描进行中：显示加载占位，不展示"未发现"误导用户(BUG-S2)
             if (scanning) {
@@ -6716,6 +6820,7 @@
                         <div class="gd-score ${getScoreClass(suspicion)}">${suspicion}</div>
                     </div>`;
             }).join('');
+            box.scrollTop = prevScroll; // 回填滚动位置(BUG-O1)
 
             const btnBlock = panel.querySelector('#btn-block-overlay');
             if (btnBlock) {
@@ -6812,6 +6917,16 @@
             this._hidePreviewBanner();
             previewBtn.textContent = '🔍 预览效果';
         };
+        // 重新激活预览（供重新扫描/深度扫描后按最新 records 复原预览态）。
+        // 旧版误调用 updateOverlayPreview（从未定义）→ ReferenceError，导致预览永久丢失。
+        // 此处用已存在的 updatePreview 口径重建：先置 active，再 _showPreviewBanner + 隐藏当前选中。
+        const restoreOverlayPreview = () => {
+            if (this._overlayPreview.active) return;
+            this._overlayPreview = { active: true, elements: [], hiddenDomains: new Set() };
+            this._showPreviewBanner(() => resetOverlayPreview());
+            if (previewBtn) previewBtn.textContent = '👁 恢复显示';
+            updatePreview();
+        };
 
         // 实时更新预览：根据当前 selectedSet 和域名勾选状态，增量隐藏/还原元素
         const updatePreview = () => {
@@ -6902,6 +7017,7 @@
             // 正式拦截前先还原预览，避免预览态与正式拦截叠加造成状态混乱
             resetOverlayPreview();
             let ruleCount = 0;
+            let unpersistedCount = 0;
             let skippedSelfUI = 0;
             // 收集选中记录的去重跨域域名，循环结束后批量封杀（避免重复添加规则）
             const domainsToBlock = new Set();
@@ -6914,40 +7030,46 @@
                     skippedSelfUI++;
                     return;
                 }
-                // 统一隐藏口径：补齐 opacity:0，与 applyCSSRules/scanAndBlockDynamic 一致(BUG-D4)
-                BlockEngine.hideElement(r.el);
-                r.blocked = true;
-                // 记录指纹：重新扫描后据此回填 blocked 状态(BUG-D8)
-                blockedFingerprints.add(fingerprintOf(r));
                 // 自动生成持久化规则：基于元素特征生成属性选择器，确保刷新后仍能拦截
                 // 无 id/class 时回退到物理结构选择器(BUG-D5)，避免刷新后拦截失效
-                try {
-                    const el = r.el;
-                    const tag = el.tagName.toLowerCase();
-                    let attrSelector = null;
-                    // 优先用 id 生成属性规则（唯一性最强）
-                    if (el.id) {
-                        attrSelector = `${tag}[id="${CSS.escape(el.id)}"]`;
-                    } else if (typeof el.className === 'string' && el.className.trim()) {
-                        // 用第一个有辨识度的 class 生成属性规则
-                        const classes = el.className.trim().split(/\s+/).filter(c => c.length >= 3);
-                        if (classes.length > 0) {
-                            attrSelector = `${tag}[class*="${CSS.escape(classes[0])}"]`;
-                        }
+                const el = r.el;
+                const tag = el.tagName.toLowerCase();
+                let attrSelector = null;
+                // 优先用 id 生成属性规则（唯一性最强）
+                if (el.id) {
+                    attrSelector = `${tag}[id="${CSS.escape(el.id)}"]`;
+                } else if (typeof el.className === 'string' && el.className.trim()) {
+                    // 用第一个有辨识度的 class 生成属性规则
+                    const classes = el.className.trim().split(/\s+/).filter(c => c.length >= 3);
+                    if (classes.length > 0) {
+                        attrSelector = `${tag}[class*="${CSS.escape(classes[0])}"]`;
                     }
+                }
+                let ruleGenerated = false;
+                try {
                     // skipApply=true：跳过 addRule 内部 applyCSSRules，循环结束后统一调用一次(冗余-2)
                     if (attrSelector) {
                         this.storage.addRule('attribute', { attrSelector, type: 'attribute' }, true);
-                        ruleCount++;
+                        ruleCount++; ruleGenerated = true;
                     } else {
                         // 兜底：无 id/class 时用物理结构选择器(nth-of-type 路径)，刷新后仍可定位(BUG-D5)
                         const structSelector = BlockEngine.generateStructuralSelector(el);
                         if (structSelector) {
                             this.storage.addRule('structural', { structSelector, type: 'structural' }, true);
-                            ruleCount++;
+                            ruleCount++; ruleGenerated = true;
                         }
                     }
                 } catch (e) { Log.warn(e.message || e); }
+                // BUG-FIX(架构优化#8·Important): 仅当成功生成持久规则时才写入指纹；
+                // 否则仅即时隐藏给用户即时反馈并计入"无持久规则"计数，明确提示刷新可能复原，
+                // 杜绝"已生成持久化规则"误导向与刷新复活假象(BUG-NO-PERSIST)
+                BlockEngine.hideElement(el);
+                r.blocked = true;
+                if (ruleGenerated) {
+                    blockedFingerprints.add(fingerprintOf(r));
+                } else {
+                    unpersistedCount++;
+                }
                 // 仅在勾选「封杀域名」时收集跨域跳转域名（去重）
                 if (blockDomainToo && r.triggerUrl) {
                     try {
@@ -6969,8 +7091,9 @@
             render();
             const domainNote = blockDomainToo ? `，${domainCount} 个跨域跳转域名已加入全局黑名单` : '（未封杀域名）';
             const ruleNote = ruleCount > 0 ? `，已生成 ${ruleCount} 条持久化规则` : '';
+            const unpersistNote = unpersistedCount > 0 ? `，${unpersistedCount} 个元素无持久规则（刷新可能复原）` : '';
             const skipNote = skippedSelfUI > 0 ? `（跳过 ${skippedSelfUI} 个脚本自身元素）` : '';
-            this.showToast(`已拦截选中的覆盖层${domainNote}${ruleNote}${skipNote}`, 'success');
+            this.showToast(`已拦截选中的覆盖层${domainNote}${ruleNote}${unpersistNote}${skipNote}`, unpersistedCount > 0 ? 'warning' : 'success');
         });
 
         // 深度扫描：真·深度覆盖层挖掘（v0.7.0 重构）
@@ -6980,6 +7103,8 @@
             const btn = e.currentTarget; // BUG-3：用 currentTarget 取按钮本身
             btn.disabled = true;
             btn.textContent = '⏳ 深度挖掘中...';
+            // 记录预览态：异步扫描期间 records 被替换，扫描完成后按最新结果复原预览(BUG-Y6)
+            const wasPreview = this._overlayPreview.active;
             resetOverlayPreview();
             // runScan 返回成功/失败标志(BUG-9)：失败时 catch 已显示"扫描失败"Toast，
             // 此处仅成功时显示"深度扫描完成"，避免两个矛盾 Toast 同时出现
@@ -6993,13 +7118,20 @@
                     const note = ex ? `（深度新增：🎨肤色图 ${(ex.viceImages || []).length} · 🔐混淆跳转 ${(ex.obfuscatedUrls || []).length} · ::伪元素 ${(ex.pseudoInjects || []).length} · 🔤自定义字体 ${(ex.customFontEls || []).length}）` : '';
                     this.showToast(`深度扫描完成，发现 ${records.length} 个可疑覆盖层。${note}`, 'success', 6000);
                 }
+                // 扫描完成后复原预览（与重新扫描口径一致），否则深度扫描会静默丢弃预览态
+                if (wasPreview) restoreOverlayPreview();
             });
         });
 
         // 重新扫描：快速基线扫描（耗时 < 50ms），仅双引擎基线，不开启高开销探测(不一致-3)
         panel.querySelector('#btn-rescan').addEventListener('click', () => {
+            // 记录预览状态：异步扫描期间若用户已开启预览，旧 records 会被新结果替换，
+            // 扫描完成后再重新应用预览，避免基于过期集合的瞬时错误隐藏(BUG-Y6)
+            const wasPreview = this._overlayPreview.active;
             resetOverlayPreview();
-            runScan(false, { deep: false });
+            runScan(false, { deep: false }).then(() => {
+                if (wasPreview) restoreOverlayPreview();
+            });
         });
 
         panel.querySelector('#btn-close-overlay').addEventListener('click', () => this.clearPanel());
@@ -7146,8 +7278,21 @@
                 impacts.push({ type: 'pathPattern', index: i, count, score: calcImpactScore(count) });
             });
 
-            // structural / complex 规则不评估：structural 选择器含 :nth-of-type 路径，
-            // complex 无单一选择器，评估成本高且命中数参考价值低
+            // structural 规则：structSelector 是合法 CSS 选择器，可直接 querySelectorAll 计数，
+            // 纳入影响度评估，避免高命中 structural 规则在误杀排查中"隐形"(BUG-IMPACT-BLIND)
+            (data.structural || []).forEach((r, i) => {
+                if (r._disabled || !r.structSelector) return;
+                const count = countMatches(r.structSelector);
+                impacts.push({ type: 'structural', index: i, count, score: calcImpactScore(count) });
+            });
+
+            // complex 规则：无单一选择器；尽力用 r.selector（若存在）计数，否则评估成本过高跳过
+            (data.complex || []).forEach((r, i) => {
+                if (r._disabled || !r.selector) return;
+                const count = countMatches(r.selector);
+                impacts.push({ type: 'complex', index: i, count, score: calcImpactScore(count) });
+            });
+
             impacts.sort((a, b) => b.score - a.score);
             return impacts;
         }
@@ -7393,7 +7538,7 @@
 
             this.shadowHost = document.createElement('div');
             this.shadowHost.id = 'pro-blocker-ui-host';
-            this.shadowHost.style.cssText = 'position: fixed; z-index: 2147483647; top: 0; left: 0; width: 0; height: 0; overflow: visible;';
+            this.shadowHost.style.cssText = `position: fixed; z-index: ${UI_CONST.UI_TOP_Z_INDEX}; top: 0; left: 0; width: 0; height: 0; overflow: visible;`;
             this.shadowRoot = this.shadowHost.attachShadow({ mode: 'closed' });
             this.injectStyles();
             document.documentElement.appendChild(this.shadowHost);
@@ -7509,6 +7654,9 @@
                     border-color: #4aa3ff; box-shadow: 0 0 0 3px rgba(74,163,255,0.18);
                 }
                 textarea { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; resize: vertical; min-height: 140px; }
+                /* 导出/AdGuard 文本框：规则量很大时若不限制高度，复制/下载按钮会被顶出可视区，
+                   用户需滚动整个面板才能点到（展示问题）。限高让按钮常驻可见，文本框自身内部滚动 */
+                textarea.export-box, textarea#export-text { max-height: 50vh; }
 
                 .rule-list { list-style: none; padding: 0; margin: 0; }
                 .rule-item {
@@ -7605,7 +7753,7 @@
 
                 /* Toast 通知：非阻塞，右上角自动消失，替代 alert() */
                 .pro-toast-container {
-                    position: fixed; top: 20px; right: 20px; z-index: 2147483646;
+                    position: fixed; top: 56px; right: 20px; z-index: ${UI_CONST.UI_OVERLAY_Z_INDEX};
                     display: flex; flex-direction: column; gap: 8px; pointer-events: none;
                 }
                 .pro-toast {
@@ -7633,7 +7781,7 @@
 
                 /* 内嵌确认弹窗：替代 confirm()，面板内弹出 */
                 .pro-confirm-overlay {
-                    position: fixed; inset: 0; z-index: 2147483646;
+                    position: fixed; inset: 0; z-index: ${UI_CONST.UI_OVERLAY_Z_INDEX};
                     background: rgba(0,0,0,0.5); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
                     display: flex; align-items: center; justify-content: center;
                 }
@@ -7652,7 +7800,7 @@
 
                 /* 选择模式状态横幅 */
                 .pro-selection-banner {
-                    position: fixed; top: 0; left: 0; right: 0; z-index: 2147483646;
+                    position: fixed; top: 0; left: 0; right: 0; z-index: ${UI_CONST.UI_OVERLAY_Z_INDEX};
                     background: rgba(255,149,0,0.9); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
                     color: #fff; text-align: center; padding: 8px 16px;
                     font-size: 13px; font-weight: 500; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -7661,7 +7809,7 @@
 
                 /* 预览模式全局横幅 */
                 .pro-preview-banner {
-                    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 2147483646;
+                    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: ${UI_CONST.UI_OVERLAY_Z_INDEX};
                     background: rgba(74,163,255,0.92); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
                     color: #fff; padding: 8px 20px; border-radius: 20px;
                     font-size: 12px; font-weight: 500; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -7694,6 +7842,11 @@
                 this.shadowRoot.appendChild(container);
             }
             container.appendChild(toast);
+            // 限制可见 Toast 数量，避免连续触发时堆叠溢出视口底部被裁切(BUG-TOAST-OVERFLOW)
+            while (container.children.length > 5) {
+                const oldest = container.firstElementChild;
+                if (oldest) oldest.remove(); else break;
+            }
             requestAnimationFrame(() => toast.classList.add('pro-toast-show'));
             let undone = false;
             if (onUndo) {
@@ -7721,7 +7874,7 @@
             overlay.innerHTML = `
                 <div class="pro-confirm-box">
                     <div class="pro-confirm-title">${escapeHTML(title)}</div>
-                    <div class="pro-confirm-body">${escapeHTML(message)}</div>
+                    <div class="pro-confirm-body" style="white-space:pre-wrap;">${escapeHTML(message)}</div>
                     <div class="pro-confirm-actions">
                         <button class="btn-danger" id="cf-yes">确认</button>
                         <button class="btn-outline" id="cf-no">取消</button>
@@ -7813,7 +7966,7 @@
             if (!target) return;
             this._previewHideNode(target, store);
             if (target.parentElement) this._previewHideNode(target.parentElement, store);
-            this._previewHideNode(BlockEngine.findSingleChildWrapper(target, 4), store);
+            this._previewHideNode(BlockEngine.findSingleChildWrapper(target, UI_CONST.WRAPPER_SEARCH_DEPTH), store);
         }
 
         // 预览按域名隐藏全页资源：6 通道属性选择器（src/href/data-src/data-original/srcset/poster）
@@ -7865,7 +8018,11 @@
                         // iframeBlock 规则走独立 API（须在 scope==='global' 分支前判断，因 iframeBlock 也标记为 global）
                         this.storage.addIframeRule(it.rule, true);
                     } else if (it.scope === 'global' || it.type === 'domainBlock') {
-                        this.storage.addRule('domainBlock', { domain: it.rule.domain, type: 'domainBlock' });
+                        // 撤销时保留原 _ts(排序) 与 _disabled(禁用状态) 元数据，否则恢复成"启用且置底"(BUG-Y4)
+                        this.storage.addRule('domainBlock', {
+                            domain: it.rule.domain, type: 'domainBlock',
+                            _ts: it.rule._ts, _disabled: it.rule._disabled
+                        });
                     } else if (it.scope === 'other') {
                         this.storage.addRuleForDomain(it.domain, it.type, it.rule);
                     } else {
@@ -7897,6 +8054,10 @@
             if (_curPanel && typeof _curPanel._cleanupDrag === 'function') {
                 try { _curPanel._cleanupDrag(); } catch (e) { Log.warn(e.message || e); }
             }
+            // G2 防御：错误边界必须退出选择模式，确保面板渲染异常（尤其 SelectionPanel 在
+            // _freezeNavigation 之后抛错）时导航冻结与 document 级拦截监听被解除，否则页面将
+            // 永久无法跳转 / 主文档点击被静默拦截（隐藏逻辑 bug：错误边界未配对清理选择态）
+            this.stopSelection();
             this.shadowRoot.innerHTML = '';
             this.injectStyles();
             const panel = document.createElement('div');
@@ -7933,7 +8094,7 @@
 
         injectHighlightStyle() {
             // 从存储加载用户自定义高亮颜色，默认 #FF3B30
-            const savedColor = GM_getValue('config_highlight_color', '#FF3B30');
+            const savedColor = GM_getValue(UI_CONST.HIGHLIGHT_COLOR_KEY, UI_CONST.DEFAULT_HIGHLIGHT_COLOR);
             document.documentElement.style.setProperty('--pro-blocker-highlight-color', savedColor);
 
             let style = document.getElementById('pro-blocker-highlight-style');
@@ -8024,6 +8185,8 @@
             this._unfreezeNavigation();
             // 清除 iframe 上下文
             this._selectionIframeContext = null;
+            // 动作面板上下文随选择模式结束一并清空，避免下次进入动作面板时残留旧 iframe 上下文(BUG-S1)
+            this._actionIframeContext = null;
         }
 
         // ── 集中式文档监听器追踪（TD-GM-08）──
@@ -8153,20 +8316,47 @@
         _handleTouchEnd(e) {
             if (!e.changedTouches || e.changedTouches.length === 0) return;
             const touch = e.changedTouches[0];
-            const target = document.elementFromPoint(touch.clientX, touch.clientY);
+            // 优先用真实事件目标（含同源 iframe 内元素；elementFromPoint 在主文档坐标下取不到 iframe 内部元素）；
+            // 仅当真实目标缺失或为 body/html 时用 elementFromPoint 兜底(BUG-TOUCH-IFRAME)
+            let target = (e.target && e.target.closest) ? e.target : null;
+            if (!target || target === document.body || target === document.documentElement) {
+                target = document.elementFromPoint(touch.clientX, touch.clientY);
+            }
             if (!target || !target.closest || ProtectedCheck.isProtected(target)) return;
             if (target === document.body || target === document.documentElement) return;
+            // 触屏进入同源 iframe 上下文（对齐 _handleClick 的 iframe 重入逻辑，修复移动端无法选中 iframe 内元素）
+            if (target.closest) {
+                const ti = target.closest('iframe');
+                if (ti && ti.contentDocument) {
+                    const src = ti.src || '';
+                    const host = src ? safeURLHostname(src) : window.location.hostname;
+                    const sameOrigin = !src || host === window.location.hostname || host.endsWith('.' + window.location.hostname) || window.location.hostname.endsWith('.' + host);
+                    // 已在当前 iframe 上下文：避免重复注册帧内监听(BUG-Y2-重注册)
+                    if (this._selectionIframeContext && this._selectionIframeContext.iframe === ti) return;
+                    if (sameOrigin) {
+                        this._selectionIframeContext = { iframe: ti, doc: ti.contentDocument, win: ti.contentWindow, host };
+                        this.showToast(`已进入 iframe: ${host}`, 'info');
+                        this._trackDocOn(ti.contentDocument, 'touchstart', this._handleTouchStart, { capture: true, passive: false });
+                        this._trackDocOn(ti.contentDocument, 'touchend', this._handleTouchEnd, { capture: true, passive: false });
+                        this._trackDocOn(ti.contentDocument, 'click', this._handleClick, { capture: true, passive: false });
+                        return;
+                    }
+                }
+            }
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
+            // BUG-Y2 修复：必须在 stopSelection 之前捕获 iframe 上下文（与 _handleClick 口径一致）
+            const iframeCtx = this._selectionIframeContext || null;
             this.stopSelection();
-            // 元素有效性校验(BUG-2)：stopSelection 触发导航解冻瞬间，广告脚本可能移除目标元素，
-            // 此时 showActionPanel 会绑定失效引用导致后续操作报错，与 _handleClick 校验口径保持一致
-            if (!this._isElementInDOM(target)) {
+            // 元素有效性校验(BUG-2)：与 _handleClick 校验口径保持一致，使用捕获的 iframeCtx 兼容 iframe 内元素
+            const _inCtxT = (iframeCtx && iframeCtx.doc && iframeCtx.doc.contains(target));
+            const effectiveCtxT = _inCtxT ? iframeCtx : null;
+            if (!this._isElementInDOM(target, effectiveCtxT)) {
                 this.showToast('目标元素已失效，请重新选择。', 'warning');
                 return;
             }
-            this.showActionPanel(target);
+            this.showActionPanel(target, effectiveCtxT);
         }
 
         // 阻止 touchstart 默认行为，防止广告通过 touch 事件直接触发跳转（移动端）
@@ -8215,25 +8405,36 @@
             e.preventDefault();
             e.stopPropagation();
             e.stopImmediatePropagation && e.stopImmediatePropagation();
-            this.stopSelection();
+            // BUG-Y2 修复：stopSelection() 会清空 _selectionIframeContext。必须在它之前捕获同源
+            // iframe 上下文，否则：(a) showActionPanel 读取的 ctxHost 恒为 null，规则落到外层 host，
+            // 刷新后 iframe 内广告"复活"；(b) 下方 _isElementInDOM 因 context 已清空而误判 iframe 内
+            // 元素"已失效"，动作面板永远打不开。上下文随 _selectionIframeContext 一并携带已解析的 host。
+            const iframeCtx = this._selectionIframeContext || null;
 
-            // 优化方案 §6.1 面板1：检测选中元素是否在 iframe 内，若是同域 iframe 则进入选择模式
+            // 优化方案 §6.1 面板1：检测选中元素是否在 iframe 内（仅当 e.target 本身是 iframe 元素成立，
+            // 帧内点击由 iframe 文档的监听捕获，不会冒泡到主文档）
             const targetIframe = e.target.closest('iframe');
             if (targetIframe) {
                 try {
                     const iframeDoc = targetIframe.contentDocument;
-                    const iframeSrc = targetIframe.src || '';
-                    // 同源检查：iframe 可访问且域名相同
-                    if (iframeDoc && iframeSrc) {
-                        const iframeHost = new URL(iframeSrc).hostname;
-                        if (iframeHost === window.location.hostname ||
+                    if (iframeDoc) {
+                        const iframeSrc = targetIframe.src || '';
+                        // 同源判定：有 src 时比较 host；无 src（srcdoc）与父页同域，
+                        // contentDocument 可被访问即表示同源，应允许精准封杀帧内元素(BUG-Y2-5)
+                        const iframeHost = iframeSrc ? safeURLHostname(iframeSrc) : window.location.hostname;
+                        const sameOrigin = !iframeSrc ||
+                            iframeHost === window.location.hostname ||
                             iframeHost.endsWith('.' + window.location.hostname) ||
-                            window.location.hostname.endsWith('.' + iframeHost)) {
+                            window.location.hostname.endsWith('.' + iframeHost);
+                        if (sameOrigin) {
+                            // 去重：已处于该 iframe 上下文时直接返回，避免重复注册帧内监听(BUG-Y2-重注册)
+                            if (iframeCtx && iframeCtx.iframe === targetIframe) return;
                             // 进入 iframe 上下文
                             this._selectionIframeContext = {
                                 iframe: targetIframe,
                                 doc: iframeDoc,
-                                win: targetIframe.contentWindow
+                                win: targetIframe.contentWindow,
+                                host: iframeHost
                             };
                             this.showToast(`已进入 iframe: ${iframeHost}`, 'info');
                             // 重新绑定事件到 iframe 文档（同源）。统一走 _trackDocOn 注册，
@@ -8256,13 +8457,20 @@
                 } catch (ex) { Log.warn(ex.message || ex); }
             }
 
-            // 元素有效性校验：广告脚本可能在 stopSelection 触发的导航解冻瞬间移除目标元素
-            // 此时再 showActionPanel 会绑定失效引用，导致后续操作报错
-            if (!this._isElementInDOM(e.target)) {
+            // 非 iframe 进入路径：退出选择模式后再校验 + 展示动作面板
+            this.stopSelection();
+            // 元素有效性校验（用捕获的 iframeCtx 判定，兼容 iframe 内元素）：广告脚本可能在
+            // stopSelection 触发的导航解冻瞬间移除目标元素，此时 showActionPanel 会绑定失效引用
+            // G1 上下文降级：若记录的 iframe 上下文并不包含点击目标（用户已点回主文档/其它帧），
+            // 降级为顶层文档上下文；否则 _isElementInDOM 会拿 iframeCtx.doc.contains 误判"已失效"，
+            // 导致进入 iframe 上下文后点击主文档元素时动作面板永远打不开（隐藏交互 bug）
+            const _inCtx = (iframeCtx && iframeCtx.doc && iframeCtx.doc.contains(e.target));
+            const effectiveCtx = _inCtx ? iframeCtx : null;
+            if (!this._isElementInDOM(e.target, effectiveCtx)) {
                 this.showToast('目标元素已失效，请重新选择。', 'warning');
                 return;
             }
-            this.showActionPanel(e.target);
+            this.showActionPanel(e.target, effectiveCtx);
         }
 
         _clearSelectionHighlight() {
@@ -8271,10 +8479,13 @@
             }
         }
 
-        _isElementInDOM(el) {
-            // 如果在 iframe 上下文中，检查元素是否在该 iframe 的 document 中
-            if (this._selectionIframeContext) {
-                return el && this._selectionIframeContext.doc.contains(el);
+        _isElementInDOM(el, ctx) {
+            // 若在 iframe 上下文中（显式 ctx > 动作面板上下文 > 选择模式上下文），检查元素是否在该 iframe 的 document 中
+            // BUG-S1：新增 this._actionIframeContext 回退（stopSelection 已清空 _selectionIframeContext，
+            // 但动作面板子方法仍需判定 iframe 内元素是否存活）
+            const c = ctx || this._actionIframeContext || this._selectionIframeContext;
+            if (c) {
+                return el && c.doc.contains(el);
             }
             return el && document.contains(el);
         }
@@ -8328,7 +8539,7 @@
                 } catch (e) { Log.warn(e.message || e); }
             });
             // 3) 当前框选的广告容器（正式封杀也会手动隐藏容器）
-            this._previewHideNode(BlockEngine.findSingleChildWrapper(el, 4), store);
+            this._previewHideNode(BlockEngine.findSingleChildWrapper(el, UI_CONST.WRAPPER_SEARCH_DEPTH), store);
         }
 
         // 实时更新预览：域名选择变化时，先还原已隐藏元素，再基于当前选择重新应用（Bug2）
@@ -8414,7 +8625,7 @@
             }
         }
 
-        showActionPanel(element) {
+        showActionPanel(element, iframeCtx) {
             this.clearPanel();
             this.injectHighlightStyle();
             this.originalSelectedEl = element;
@@ -8426,8 +8637,15 @@
             this._actionHostsEl = null;
             // BUG-Y2 修复：若当前选中元素位于同源 iframe 内，规则必须写在该 iframe 的 host 下，
             // 否则 addRule 会落到外层页面 host，刷新后 iframe 内容（不同 host）不再命中该规则，导致"拦截无效/复活"。
-            // ctxHost 非空时，静态/动态/结构规则改走 addRuleForDomain(ctxHost, ...) 并即时隐藏 live 元素。
-            const ctxHost = this._selectionIframeContext ? safeURLHostname(this._selectionIframeContext.iframe.src) : null;
+            // ctxHost 由 _handleClick/_handleTouchEnd 在进入选择模式前捕获并透传，避免被 stopSelection 清空。
+            // iframeCtx.host 在入口处已解析（srcdoc 时回退为父页 host），不再依赖 iframe.src 二次解析。
+            const ctxHost = iframeCtx ? iframeCtx.host : null;
+            // BUG-S1 修复：stopSelection() 会清空 this._selectionIframeContext，但动作面板的子方法
+            // （_resetActionPreview / _applyActionPreviewHiding / btn-zoom-in）依赖实例上的 iframe 上下文
+            // 判定元素是否存活。若仅用已被清空的 _selectionIframeContext，同源 iframe 内元素会被误判为
+            // "已从页面移除"，导致彻底封杀域名/预览/放大层级全部失效。此处把上下文持久化到独立字段，
+            // 不被 stopSelection 清除，动作面板生命周期内始终可用，clearPanel→stopSelection 时统一置空。
+            this._actionIframeContext = iframeCtx || null;
 
             const panel = document.createElement('div');
             panel.className = 'panel';
@@ -8524,6 +8742,13 @@
 
             // 静态路径拦截
             panel.querySelector('#btn-static').addEventListener('click', () => {
+                // 存活校验：SPA/动态广告可能在面板打开期间移除或重渲染选中节点，
+                // 此时生成的选择器在活动 DOM 中匹配不到任何元素，规则"保存成功但永不生效"
+                if (!this._isElementInDOM(this.currentSelectedEl, iframeCtx)) {
+                    this.showToast('目标元素已从页面移除，请重新选择。', 'warning');
+                    this.clearPanel();
+                    return;
+                }
                 const sel = BlockEngine.generateOptimalSelector(this.currentSelectedEl);
                 if (ctxHost) {
                     this.storage.addRuleForDomain(ctxHost, 'static', { selector: sel, type: 'static' });
@@ -8536,6 +8761,11 @@
 
             // 动态类名拦截
             panel.querySelector('#btn-dynamic').addEventListener('click', () => {
+                if (!this._isElementInDOM(this.currentSelectedEl, iframeCtx)) {
+                    this.showToast('目标元素已从页面移除，请重新选择。', 'warning');
+                    this.clearPanel();
+                    return;
+                }
                 const el = this.currentSelectedEl;
                 const primaryClass = (el.className || '').split(/\s+/)[0];
                 if (!primaryClass) { this.showToast('当前元素无有效类名，请选择其他拦截方式。', 'warning'); return; }
@@ -8550,6 +8780,11 @@
 
             // 物理结构拦截：基于元素位置路径生成选择器，作为 Selector 失效时的兜底定位
             panel.querySelector('#btn-struct').addEventListener('click', () => {
+                if (!this._isElementInDOM(this.currentSelectedEl, iframeCtx)) {
+                    this.showToast('目标元素已从页面移除，请重新选择。', 'warning');
+                    this.clearPanel();
+                    return;
+                }
                 const el = this.currentSelectedEl;
                 const sel = BlockEngine.generateStructuralSelector(el);
                 if (ctxHost) {
@@ -8576,7 +8811,7 @@
 
             // 彻底封杀域名（核心：解决刷新复活）— 仅封杀用户选中的域名，与预览保持一致（解决问题2）
             panel.querySelector('#btn-domain').addEventListener('click', () => {
-                if (!this._isElementInDOM(this.currentSelectedEl)) {
+                if (!this._isElementInDOM(this.currentSelectedEl, iframeCtx)) {
                     this.showToast('目标元素已从页面移除，请重新选择。', 'warning');
                     this.clearPanel();
                     return;
@@ -8609,7 +8844,7 @@
                     });
 
                     // 立即隐藏当前框选的整个广告容器（向上找单子链容器）
-                    const container = BlockEngine.findSingleChildWrapper(this.currentSelectedEl, 4);
+                    const container = BlockEngine.findSingleChildWrapper(this.currentSelectedEl, UI_CONST.WRAPPER_SEARCH_DEPTH);
                     BlockEngine.hideElement(container);
 
                     // 封杀选中域名：添加 domainBlock 规则 + 即时隐藏匹配资源（full 口径）
@@ -8636,7 +8871,7 @@
                     return;
                 }
                 const el = this.currentSelectedEl;
-                if (!this._isElementInDOM(el)) {
+                if (!this._isElementInDOM(el, iframeCtx)) {
                     this.showToast('目标元素已从页面移除，请重新选择。', 'warning');
                     this.clearPanel();
                     return;
@@ -9537,8 +9772,25 @@
             EventBus.emit('iframe:stats', { ...this._stats });
         },
 
+        // C2 解耦：iframeConfig 读写统一经 StorageService 端口（this.storage），
+        // 不再裸调 GM_setValue/GM_getValue，消除"绕写即失效"一致性缺陷。
+        // 端口方法缺失时回退 GM（兼容注入未就绪环境，如 node 测试）
+        _cfgGet() {
+            if (this.storage && typeof this.storage.getIframeConfig === 'function') {
+                return this.storage.getIframeConfig() || {};
+            }
+            return GM_getValue('iframeConfig', {});
+        },
+        _cfgSet(obj) {
+            if (this.storage && typeof this.storage.setIframeConfig === 'function') {
+                this.storage.setIframeConfig(obj);
+                return;
+            }
+            GM_setValue('iframeConfig', obj);
+        },
+
         _loadConfig() {
-            const config = GM_getValue('iframeConfig', {});
+            const config = this._cfgGet();
             const depth = parseInt(config.maxDepth, 10);
             this._maxDepth = (depth >= this.MIN_DEPTH && depth <= this.MAX_DEPTH) ? depth : 3;
         },
@@ -9547,9 +9799,9 @@
             const d = parseInt(depth, 10);
             if (d >= this.MIN_DEPTH && d <= this.MAX_DEPTH) {
                 this._maxDepth = d;
-                const config = GM_getValue('iframeConfig', {});
+                const config = this._cfgGet();
                 config.maxDepth = d;
-                GM_setValue('iframeConfig', config);
+                this._cfgSet(config);
             }
         },
 
@@ -9792,7 +10044,7 @@
         _handleAdNode(node, doc) {
             if (!node || ProtectedCheck.isProtected(node)) return;
             // 找最近的包裹容器
-            const container = BlockEngine.findSingleChildWrapper(node, 4);
+            const container = BlockEngine.findSingleChildWrapper(node, UI_CONST.WRAPPER_SEARCH_DEPTH);
             let containerText = '';
             let hasSemantic = false;
             try {
@@ -9970,6 +10222,11 @@
     };
     // 注入存储服务：_getIframeBlockRules / blockInFrameNode / reapplyInFrames 均依赖 this.storage
     IframeGuard.storage = StorageService;
+    // C4 解耦：StorageManager/StorageService 经 EventBus 通知 iframe 规则缓存失效，
+    // 此处统一订阅，消除存储层对 IframeGuard 的直连依赖（仅依赖 EventBus 横切缝）
+    EventBus.on('iframe:rules-changed', () => {
+        try { IframeGuard.invalidateBlockRules(); } catch (e) { Log.warn('iframe:rules-changed', e.message || e); }
+    });
 
     // ── GM 菜单注册表（抽离为纯函数，可被 jest 直接单测，关闭 TD-08 / T5 的 0% 覆盖缺口）──
     const MENU_ITEMS = [

@@ -1,0 +1,75 @@
+<svg viewBox="0 0 680 470" width="100%" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>选择模式生命周期与 clearPanel 预览清理中枢</title>
+<desc>startSelection 到 stopSelection 的生命周期，以及异常路径的修复点 G1/G2 与 clearPanel 预览状态清理</desc>
+<defs>
+<marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<text x="50" y="34" fill="#F1EFE8" font-size="14" font-weight="500">选择模式生命周期（隐藏 bug G1/G2 所在链路）</text>
+
+<g class="c-blue">
+<rect x="50" y="56" width="360" height="40" rx="8" fill="#042C53" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="230" y="76" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="12">_buildMenu → startSelection() 进入选择模式</text>
+</g>
+<g class="c-blue">
+<rect x="50" y="104" width="360" height="40" rx="8" fill="#042C53" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="230" y="124" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="12">_trackDoc 注册监听 + _freezeNavigation 劫持导航</text>
+</g>
+<g class="c-blue">
+<rect x="50" y="152" width="360" height="40" rx="8" fill="#042C53" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="230" y="172" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="12">用户点击/触摸 → _handleClick / _handleTouchEnd</text>
+</g>
+<g>
+<rect x="50" y="200" width="360" height="40" rx="8" fill="#3C3489" stroke="#F0997B" stroke-width="1.5"/>
+<text x="230" y="220" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="12" font-weight="500">解析 ctx：iframeCtx.doc.contains(target) ? → effectiveCtx</text>
+</g>
+<g class="c-purple">
+<rect x="50" y="248" width="360" height="40" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="230" y="268" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="12">_isElementInDOM(target, effectiveCtx) 校验存活</text>
+</g>
+<g class="c-green">
+<rect x="50" y="296" width="360" height="40" rx="8" fill="#27500A" stroke="#97C459" stroke-width="0.5"/>
+<text x="230" y="316" text-anchor="middle" dominant-baseline="central" fill="#EAF3DE" font-size="12">showActionPanel(target, effectiveCtx) 打开动作面板</text>
+</g>
+<g class="c-green">
+<rect x="50" y="344" width="360" height="40" rx="8" fill="#27500A" stroke="#97C459" stroke-width="0.5"/>
+<text x="230" y="364" text-anchor="middle" dominant-baseline="central" fill="#EAF3DE" font-size="12">stopSelection → _untrackDocAll + _unfreezeNavigation + 清 ctx</text>
+</g>
+<g>
+<rect x="50" y="392" width="360" height="40" rx="8" fill="#042C53" stroke="#F0997B" stroke-width="1.5"/>
+<text x="230" y="412" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="12">异常路径 → _safeCall → _showErrorPanel → stopSelection</text>
+</g>
+
+<polyline points="230,96 230,104" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+<polyline points="230,144 230,152" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+<polyline points="230,192 230,200" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+<polyline points="230,240 230,248" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+<polyline points="230,288 230,296" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+<polyline points="230,336 230,344" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+<polyline points="230,384 230,392" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#arrow2)"/>
+
+<rect x="448" y="120" width="200" height="300" rx="16" fill="none" stroke="#F0997B" stroke-width="0.5"/>
+<text x="548" y="142" text-anchor="middle" dominant-baseline="central" fill="#F5C4B3" font-size="13" font-weight="500">clearPanel() 预览中枢</text>
+<text x="548" y="166" text-anchor="middle" dominant-baseline="central" fill="#F0997B" font-size="11">关闭任意面板时清零 5 个预览态</text>
+<line x1="468" y1="180" x2="628" y2="180" stroke="#F0997B" stroke-width="0.5"/>
+<text x="548" y="206" text-anchor="middle" dominant-baseline="central" fill="#FBEAF0" font-size="12">_actionPreview</text>
+<text x="548" y="234" text-anchor="middle" dominant-baseline="central" fill="#FBEAF0" font-size="12">_previewAffectedElements</text>
+<text x="548" y="262" text-anchor="middle" dominant-baseline="central" fill="#FBEAF0" font-size="12">_globalPreview</text>
+<text x="548" y="290" text-anchor="middle" dominant-baseline="central" fill="#FBEAF0" font-size="12">_overlayPreview</text>
+<text x="548" y="318" text-anchor="middle" dominant-baseline="central" fill="#FBEAF0" font-size="12">_iframePreview</text>
+<text x="548" y="350" text-anchor="middle" dominant-baseline="central" fill="#F0997B" font-size="11">5 态全部 safe 清零</text>
+<text x="548" y="372" text-anchor="middle" dominant-baseline="central" fill="#F0997B" font-size="11">避免预览残留/幽灵高亮</text>
+
+<polyline points="410,316 448,200" fill="none" stroke="#F0997B" stroke-width="1" stroke-dasharray="4 3"/>
+
+<g class="c-green">
+<rect x="58" y="205" width="86" height="22" rx="6" fill="#3B6D11" stroke="#97C459" stroke-width="0.5"/>
+<text x="101" y="216" text-anchor="middle" dominant-baseline="central" fill="#EAF3DE" font-size="11" font-weight="500">G1 已修复</text>
+</g>
+<g class="c-green">
+<rect x="58" y="397" width="86" height="22" rx="6" fill="#3B6D11" stroke="#97C459" stroke-width="0.5"/>
+<text x="101" y="408" text-anchor="middle" dominant-baseline="central" fill="#EAF3DE" font-size="11" font-weight="500">G2 已修复</text>
+</g>
+</svg>

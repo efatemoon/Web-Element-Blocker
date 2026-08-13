@@ -1,0 +1,70 @@
+<svg viewBox="0 0 680 590" width="100%" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>iframe 扫描：深度 vs 重扫 + 嵌套提取 + 分类体系</title>
+<desc>两种扫描按钮殊途同归，差异仅在 maxDepth；scanFrame 递归同源嵌套帧提取元素级 record；三套分类词汇统一映射</desc>
+<defs>
+<marker id="ar3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<text x="40" y="28" fill="#F1EFE8" font-size="14" font-weight="500">iframe 扫描链路：深度扫描 ≠ 重新扫描（差异仅在嵌套深度）</text>
+
+<g class="c-gray">
+<rect x="60" y="44" width="190" height="46" rx="8" fill="#2C2C2A" stroke="#888780" stroke-width="0.5"/>
+<text x="155" y="62" text-anchor="middle" dominant-baseline="central" fill="#F1EFE8" font-size="13" font-weight="500">🔄 重新扫描</text>
+<text x="155" y="80" text-anchor="middle" dominant-baseline="central" fill="#B4B2A9" font-size="11">maxDepth = 配置值(默认3)</text>
+</g>
+<g class="c-blue">
+<rect x="430" y="44" width="190" height="46" rx="8" fill="#042C53" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="525" y="62" text-anchor="middle" dominant-baseline="central" fill="#E6F1FB" font-size="13" font-weight="500">🤖 深度扫描</text>
+<text x="525" y="80" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4" font-size="11">临时 maxDepth=5 后恢复</text>
+</g>
+<polyline points="250,67 300,90" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#ar3)"/>
+<polyline points="430,67 380,90" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#ar3)"/>
+
+<g class="c-purple">
+<rect x="240" y="92" width="200" height="40" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="340" y="112" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="12" font-weight="500">forceRescan + scanAll</text>
+</g>
+<polyline points="340,132 340,160" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#ar3)"/>
+
+<g class="c-purple">
+<rect x="170" y="160" width="340" height="56" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="340" y="180" text-anchor="middle" dominant-baseline="central" fill="#EDEAF8" font-size="12" font-weight="500">scanFrame(iframe, depth)</text>
+<text x="340" y="198" text-anchor="middle" dominant-baseline="central" fill="#CECBF6" font-size="11">depth&gt;maxDepth 返回 · 扫描域名/路径/overlay · 递归 doc.querySelectorAll('iframe')</text>
+</g>
+<polyline points="340,216 340,248" fill="none" stroke="#C9C6BD" stroke-width="1.5" marker-end="url(#ar3)"/>
+
+<g class="c-amber">
+<rect x="170" y="248" width="340" height="40" rx="8" fill="#633806" stroke="#EF9F27" stroke-width="0.5"/>
+<text x="340" y="268" text-anchor="middle" dominant-baseline="central" fill="#FAEEDA" font-size="12" font-weight="500">iframe.contentDocument 可读？(同源判定)</text>
+</g>
+
+<g class="c-teal">
+<rect x="40" y="306" width="250" height="64" rx="8" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="165" y="324" text-anchor="middle" dominant-baseline="central" fill="#E1F5EE" font-size="12" font-weight="500">同源 → 提取元素级 record</text>
+<text x="165" y="342" text-anchor="middle" dominant-baseline="central" fill="#9FE1CB" font-size="11">category: domain-ad / path-ad /</text>
+<text x="165" y="358" text-anchor="middle" dominant-baseline="central" fill="#9FE1CB" font-size="11">overlay / invisible / tracking / vice-image</text>
+</g>
+<g class="c-coral">
+<rect x="390" y="306" width="250" height="64" rx="8" fill="#4A1B0C" stroke="#F0997B" stroke-width="0.5"/>
+<text x="515" y="324" text-anchor="middle" dominant-baseline="central" fill="#F5C4B3" font-size="12" font-weight="500">跨域 → 仅帧级处理</text>
+<text x="515" y="342" text-anchor="middle" dominant-baseline="central" fill="#F5C4B3" font-size="11">无法读 contentDocument(安全限制)</text>
+<text x="515" y="358" text-anchor="middle" dominant-baseline="central" fill="#F5C4B3" font-size="11">整帧拦截 / 按外链域名封杀</text>
+</g>
+<polyline points="200,286 90,306" fill="none" stroke="#5DCAA5" stroke-width="1.5" marker-end="url(#ar3)"/>
+<polyline points="480,286 590,306" fill="none" stroke="#F0997B" stroke-width="1.5" marker-end="url(#ar3)"/>
+
+<g class="c-gray">
+<rect x="170" y="392" width="340" height="40" rx="8" fill="#2C2C2A" stroke="#888780" stroke-width="0.5"/>
+<text x="340" y="412" text-anchor="middle" dominant-baseline="central" fill="#F1EFE8" font-size="12">递归嵌套 iframe：depth+1，直至 maxDepth(3/5)</text>
+</g>
+<polyline points="340,348 340,392" fill="none" stroke="#C9C6BD" stroke-width="1.2" stroke-dasharray="4 3"/>
+
+<rect x="40" y="448" width="600" height="120" rx="16" fill="none" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="60" y="468" fill="#EDEAF8" font-size="13" font-weight="500">分类体系（三套词汇 → 统一规范中文标签）</text>
+<text x="60" y="490" fill="#CECBF6" font-size="11">覆盖层扫描：invisible 不可见 · overlay 覆盖层 · tracking 追踪像素 · vice-image 博彩色情图 · unknown 其他可疑</text>
+<text x="60" y="510" fill="#CECBF6" font-size="11">iframe 面板：domain-ad 域名封杀 · path-ad 路径匹配 · (复用 overlay 系)</text>
+<text x="60" y="530" fill="#CECBF6" font-size="11">域名检索(网络层)：image 图片 · script 脚本 · iframe · css · media 媒体 · xhr/beacon 请求 · ws · plugin · other</text>
+<text x="60" y="552" fill="#F0997B" font-size="11">跨域嵌套帧内元素无法提取/过滤（浏览器安全限制，非 bug）；同源嵌套可提取并持久化过滤</text>
+</svg>

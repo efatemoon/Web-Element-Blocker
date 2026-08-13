@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         视频快速检测与稳定播放 (v19 架构)
 // @namespace    http://tampermonkey.net/
-// @version      3.2.0
+// @version      3.2.1
 // @description  v19：感知-裁决-会话-自愈-观测架构。CandidateArbiter 候选评分、GlobalScheduler 统一调度、用户意图保护、恢复预算与冷却、FAB 状态环、配置迁移、iframe FrameMesh。
 // @author       EFate (Refactored by AI)
 // @match        http://*/*
@@ -369,7 +369,7 @@
 
         const boolKeys = [
             'autoPlay', 'bigBuffer', 'seekGuard', 'watchdog', 'autoDowngrade',
-            'showToast', 'showDetect', 'fastDetect', 'fetchPriority', 'visibleOnly',
+            'showToast', 'showDetect', 'showFab', 'fastDetect', 'fetchPriority', 'visibleOnly',
             'protoHook', 'earlyPointer', 'preconnect', 'rvfcMonitor', 'instantPlay',
             'qualityManage', 'userIntentFirst', 'standbyMode', 'adGuard', 'frameMesh'
         ];
@@ -393,6 +393,7 @@
 
                 showToast: true,
                 showDetect: true,
+                showFab: true,
                 logLevel: 'info',
 
                 minPreBuffer: 2,
@@ -582,6 +583,7 @@
             { id: 'va-budget', key: 'recoveryBudget', type: 'num', def: 8 },
             { id: 'va-toast', key: 'showToast', type: 'chk' },
             { id: 'va-detect', key: 'showDetect', type: 'chk' },
+            { id: 'va-fab', key: 'showFab', type: 'chk' },
             { id: 'va-loglevel', key: 'logLevel', type: 'str' },
         ];
 
@@ -3645,6 +3647,7 @@
                         <div class="sec-title">UI 与日志</div>
                         <label class="opt"><input type="checkbox" id="va-toast"> 显示操作提示</label>
                         <label class="opt"><input type="checkbox" id="va-detect"> 显示接管通知</label>
+                        <label class="opt"><input type="checkbox" id="va-fab"> 显示 FAB 按钮</label>
                         <label class="opt">日志级别
                             <select id="va-loglevel">
                                 <option value="debug">Debug</option>
@@ -3927,7 +3930,10 @@
             this._panel.style.display = 'none';
             this._visible = false;
 
-            if (this._fab) this._fab.style.display = 'flex';
+            // 尊重 showFab 配置：若用户隐藏了 FAB，则保持隐藏状态
+            if (this._fab && ConfigManager.get('showFab') !== false) {
+                this._fab.style.display = 'flex';
+            }
         }
 
         toast(msg, kind) {
@@ -4094,6 +4100,12 @@
 
         _updateFab(state) {
             if (!this._fab) return;
+
+            // 尊重 showFab 配置：若用户隐藏了 FAB，保持 display:none
+            if (ConfigManager.get('showFab') === false) {
+                this._fab.style.display = 'none';
+                return;
+            }
 
             let st = 'idle';
 

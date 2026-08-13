@@ -43,7 +43,9 @@ describe('v9.0 GlobalDomainPanel 渲染与选择守卫', () => {
         // onlyAds/关键字过滤隐藏的项，导致选中数虚高、用户却看不到被选中项。
         expect(panel).toContain("const visible = allDomains.filter(d => {");
         expect(panel).toContain('onlyAds && !isAdLike(d)');
-        expect(panel).toContain('visible.forEach(d => selectedHosts.add(d.host));');
+        // 断言遍历的是 visible 而非 allDomains（BUG-G4 后 forEach 体内多了
+        // manuallyDeselected.delete，故不再锁死整行字面量，只锁遍历源与写入动作）
+        expect(panel).toMatch(/visible\.forEach\(d =>[\s\S]{0,120}?selectedHosts\.add\(d\.host\)/);
         // 旧的危险全量写法不应再出现
         expect(panel).not.toContain('allDomains.forEach(d => selectedHosts.add(d.host));');
     });

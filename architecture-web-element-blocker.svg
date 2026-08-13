@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 540" width="100%" role="img">
+  <title>web-element-blocker 分层架构</title>
+  <desc>9 菜单项驱动的 Shadow-DOM 拦截器：交互层 / 服务端口层 / 引擎层 / 存储层 / 目标层，红色虚线为 BUG-Y2 修复后的 iframe 选择上下文透传路径。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#6e7b8a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrowR" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="#ff6b5e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <text x="340" y="26" text-anchor="middle" fill="#e6edf3" font-size="15" font-weight="500" font-family="sans-serif">web-element-blocker 分层架构</text>
+  <text x="340" y="46" text-anchor="middle" fill="#9aa7b4" font-size="12" font-family="sans-serif">9 菜单项驱动的 Shadow-DOM 拦截器 · 端口化 / 单一数据源</text>
+
+  <!-- Tier 1: Interaction -->
+  <g>
+    <rect x="60" y="64" width="200" height="54" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="160" y="86" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">UIManager</text>
+    <text x="160" y="104" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">Shadow-DOM 协调器</text>
+    <rect x="420" y="64" width="200" height="54" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="520" y="86" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">MENU_ITEMS + PanelRegistry</text>
+    <text x="520" y="104" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">OCP 分派接缝</text>
+  </g>
+
+  <!-- 9 menu chips -->
+  <g font-family="sans-serif" font-size="11" fill="#c9d1d9" text-anchor="middle">
+    <rect x="44" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="73" y="143">选择</text>
+    <rect x="108" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="137" y="143">规则</text>
+    <rect x="172" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="201" y="143">域名</text>
+    <rect x="236" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="265" y="143">覆盖</text>
+    <rect x="300" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="329" y="143">管理</text>
+    <rect x="364" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="393" y="143">iframe</text>
+    <rect x="428" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="457" y="143">导出</text>
+    <rect x="492" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="521" y="143">AG</text>
+    <rect x="556" y="130" width="58" height="20" rx="5" fill="#161b22" stroke="#30363d" stroke-width="0.5"/><text x="585" y="143">导入</text>
+  </g>
+
+  <!-- Tier 2: Service ports -->
+  <g>
+    <rect x="60" y="170" width="175" height="50" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="147.5" y="190" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">OverlayService</text>
+    <text x="147.5" y="207" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">覆盖层端口 (DIP)</text>
+    <rect x="255" y="170" width="170" height="50" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="340" y="190" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">StorageService</text>
+    <text x="340" y="207" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">持久化唯一写入端口</text>
+    <rect x="450" y="170" width="170" height="50" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="535" y="190" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">RuleDomain</text>
+    <text x="535" y="207" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">影响度/AdGuard 导出</text>
+  </g>
+
+  <!-- Tier 3: Engines -->
+  <g>
+    <rect x="60" y="270" width="180" height="56" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="150" y="292" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">BlockEngine</text>
+    <text x="150" y="310" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">核心：hide/选择器/路径</text>
+    <rect x="255" y="270" width="170" height="56" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="340" y="292" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">OverlayScan + GlobalDomain</text>
+    <text x="340" y="310" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">覆盖层 + 12维域名采集</text>
+    <rect x="440" y="270" width="180" height="56" rx="10" fill="#2a1f22" stroke="#ff6b5e" stroke-width="1"/>
+    <text x="530" y="292" text-anchor="middle" fill="#ffd9d2" font-size="14" font-weight="500" font-family="sans-serif">IframeGuard + Frame*</text>
+    <text x="530" y="310" text-anchor="middle" fill="#ffb3a8" font-size="11" font-family="sans-serif">iframe 防线 · 评分 · 网络层</text>
+  </g>
+
+  <!-- Tier 4: Storage -->
+  <g>
+    <rect x="60" y="372" width="360" height="44" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="240" y="392" text-anchor="middle" fill="#e6edf3" font-size="14" font-weight="500" font-family="sans-serif">StorageManager</text>
+    <text x="240" y="408" text-anchor="middle" fill="#9aa7b4" font-size="11" font-family="sans-serif">GM 存储：规则 / 域名 / iframeBlock</text>
+  </g>
+
+  <!-- Tier 5: Target -->
+  <g>
+    <rect x="60" y="442" width="360" height="40" rx="10" fill="#1f2630" stroke="#3b4754" stroke-width="0.5"/>
+    <text x="240" y="466" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="500" font-family="sans-serif">目标页面 DOM / 同源 iframe</text>
+  </g>
+
+  <!-- edges -->
+  <path d="M160,118 L147.5,170" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M205,118 L340,170" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M250,118 L535,170" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M147.5,220 L340,270" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M340,220 L240,372" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M535,220 L150,270" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M150,326 L240,372" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M200,326 L240,442" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M530,326 L300,442" fill="none" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- accent: iframe selection context fix -->
+  <path d="M260,118 L440,270" fill="none" stroke="#ff6b5e" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#arrowR)"/>
+
+  <!-- legend -->
+  <g font-family="sans-serif" font-size="11">
+    <line x1="60" y1="506" x2="92" y2="506" stroke="#6e7b8a" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <text x="100" y="510" fill="#9aa7b4">数据流</text>
+    <line x1="170" y1="506" x2="202" y2="506" stroke="#ff6b5e" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#arrowR)"/>
+    <text x="210" y="510" fill="#ffb3a8">BUG-Y2 修复：iframe 选择上下文透传</text>
+  </g>
+</svg>

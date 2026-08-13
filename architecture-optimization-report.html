@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>架构分析与优化报告 · web-element-blocker</title>
+<style>
+  :root{ --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --bd:#2a2f3a; --txt:#e8eaf0; --mut:#9aa3b2; --acc:#4aa3ff; --ok:#34c759; --warn:#ff9f0a; --bad:#ff453a; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:960px;margin:0 auto;padding:32px 24px 64px}
+  h1{font-size:24px;margin:0 0 6px}
+  h2{font-size:18px;margin:36px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--bd)}
+  h3{font-size:15px;margin:22px 0 8px;color:#cdd3df}
+  .sub{color:var(--mut);font-size:13px}
+  .card{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .kv{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
+  .pill{background:var(--panel2);border:1px solid var(--bd);border-radius:999px;padding:4px 12px;font-size:12px;color:#cdd3df}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--bd);vertical-align:top}
+  th{color:#cdd3df;font-weight:600;background:var(--panel2)}
+  code{background:#0c0e12;border:1px solid var(--bd);border-radius:5px;padding:1px 6px;font-size:12px;color:#9fe7c4}
+  .sev-c{color:var(--bad);font-weight:700}
+  .sev-i{color:var(--warn);font-weight:700}
+  .sev-m{color:var(--acc);font-weight:700}
+  .ok{color:var(--ok);font-weight:700}
+  ul{margin:8px 0;padding-left:20px}
+  li{margin:5px 0}
+  .archrow{display:flex;gap:16px;flex-wrap:wrap}
+  .archrow a{flex:1;min-width:280px;text-decoration:none;color:inherit;background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:16px;transition:.15s}
+  .archrow a:hover{border-color:var(--acc)}
+  .archrow b{display:block;margin-bottom:4px;color:#fff}
+  .tag{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#9fe7c4}
+  .note{background:rgba(74,163,255,.08);border:1px solid rgba(74,163,255,.3);border-radius:10px;padding:12px 14px;font-size:13px;color:#cfe3ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>架构分析与优化报告</h1>
+  <div class="sub">目标文件：<code>web-element-blocker.user.js</code>（10,268 行）· 时间：2026-08-13 · 技能：架构图绘制 · JS 测试 · brooks 审查 · 重构</div>
+  <div class="kv">
+    <span class="pill">9 菜单项 → PanelRegistry → UIManager → 9 面板函数</span>
+    <span class="pill">Shadow DOM 隔离</span>
+    <span class="pill">EventBus 横切解耦</span>
+    <span class="pill ok">jest 181/181 通过</span>
+    <span class="pill ok">node --check 通过</span>
+  </div>
+
+  <h2>1. 当前架构分析</h2>
+  <div class="card">
+    <h3>分层结构</h3>
+    <ul>
+      <li><b>① 菜单调度层</b>：<code>MENU_ITEMS</code>（9 项 <code>[label,title,key]</code>）→ <code>_buildMenu</code> 纯函数 → <code>PanelRegistry</code>（key→UIManager 方法）→ <code>GM_registerMenuCommand</code>。新增面板 = 注册一行 + <code>MENU_ITEMS</code> 加一项，分派逻辑零改动（OCP 接缝良好）。</li>
+      <li><b>② 协调器 UIManager</b>：持有 Shadow DOM 宿主 <code>#pro-blocker-ui-host</code> 与全部共享状态（<code>_actionPreview / _globalPreview / _overlayPreview / _iframePreview / _selectionBanner / _previewBanner / _undoStack</code>）；提供 <code>clearPanel()</code>（单一切口清理）、<code>showToast()</code>、<code>_safeCall()</code>、<code>stopSelection()</code>、<code>_freezeNavigation()</code>、<code>_handleClick/_handleTouchEnd</code>、<code>showActionPanel()</code>。</li>
+      <li><b>③ 9 个面板函数</b>：<code>SelectionPanel / RegexPanel / GlobalDomainPanel / OverlayScanPanel / ManagerPanel / IframePanel / ExportPanel / AdGuardExportPanel / ImportPanel</code>，均经 <code>XxxPanel.call(this)</code> 注入 UIManager 为 <code>this</code>，行为等价且可独立单测。</li>
+      <li><b>④ 服务层</b>：<code>BlockEngine</code>（CSS/正则/结构隐藏）、<code>StorageService</code>（GM 持久化）、<code>EventBus</code>（横切缝）、<code>OverlayService</code>、<code>IframeGuard/Frame*</code>、<code>ContentClassifier</code>、<code>ProtectedCheck</code>、<code>RuleDomain</code>、<code>MessageGuard</code>。</li>
+    </ul>
+    <div class="note">架构本身健康：OCP 接缝、Shadow DOM 隔离、EventBus 解耦均已就位。问题集中在<strong>跨面板状态清理的不一致</strong>与若干<strong>交互/健壮性盲区</strong>，而非结构性缺陷。</div>
+  </div>
+
+  <h2>2. 交互 / 展示 / 逻辑问题归纳</h2>
+  <div class="card">
+    <ul>
+      <li><b>跨面板状态清理不对称（最危险）</b>：<code>clearPanel()</code> 是统一清理入口，但 <code>SelectionPanel</code> 入口只调 <code>stopSelection()</code>，绕过 <code>clearPanel()</code> → 上一个面板的预览隐藏元素在本会话内不恢复、孤儿面板 DOM / 拖拽监听 / 预览横幅残留。</li>
+      <li><b>触屏无法进入 iframe 上下文</b>：<code>_handleClick</code> 有"点 iframe 边框进入同源上下文"逻辑，<code>_handleTouchEnd</code> 完全没有 → 移动端无法选中 iframe 内元素。</li>
+      <li><b>“选中但不可见”</b>：全局域名面板默认勾选 35–39 分域，但"只看广告相关"按 40 分过滤，导致这些域被选却从列表消失。</li>
+      <li><b>覆盖层"刷新复活"假象</b>：无 id/class 且无结构选择器时仍即时隐藏元素，但不写持久规则，UI 误导。</li>
+      <li><b>误杀排查盲区</b>：影响度评估跳过 structural/complex 规则，最易误杀的高命中规则永远 score=0、不报警。</li>
+      <li><b>健壮性</b>：导入不校验规则主键；regex 模式规则缺 <code>mode</code> 字段（依赖隐含约定）；iframe 预览用 <code>document.contains</code> 与 <code>isConnected</code> 口径不一；Toast 容器无上限且被选择横幅遮挡。</li>
+    </ul>
+  </div>
+
+  <h2>3. 优化后架构与前后对比</h2>
+  <div class="archrow">
+    <a href="architecture-current.svg"><b>当前架构（优化前）</b>含 SelectionPanel 绕过 clearPanel 的红色缺陷链路</a>
+    <a href="architecture-optimized.svg"><b>优化后架构</b>全 9 面板统一经 clearPanel 清理 + 已修复清单</a>
+  </div>
+  <div class="card">
+    <h3>关键架构性改动</h3>
+    <ul>
+      <li><b>单一切口</b>：<code>SelectionPanel</code> 入口由 <code>stopSelection()</code> 改为 <code>clearPanel()</code>，使 9 个面板全部经唯一入口重置共享状态——从"8 面板统一 + 1 面板分叉"收敛为"全统一"。</li>
+      <li><b>预览状态机统一</b>：所有 preview（action/global/overlay/iframe）与选择/冻结/横幅，只在 <code>clearPanel()</code> 内还原，消除残留类 bug 的滋生土壤。</li>
+      <li><b>触屏 iframe 闭环</b>：<code>_handleTouchEnd</code> 解析真实事件目标（含 iframe 内元素）并在触屏下进入同源 iframe 上下文，对齐鼠标路径。</li>
+      <li><b>进口校验</b>：<code>StorageService.importAll</code> 增加各桶主键校验，坏规则不入存储。</li>
+    </ul>
+  </div>
+
+  <h2>4. 逐项修复清单（10 项）</h2>
+  <table>
+    <thead><tr><th>#</th><th>严重度</th><th>模块</th><th>问题</th><th>修复</th><th>代码标记</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="sev-c">Critical</td><td>SelectionPanel</td><td>入口 <code>stopSelection()</code> 绕过 <code>clearPanel()</code> → 预览元素永久隐藏 + 孤儿面板/监听/横幅残留</td><td>入口改为 <code>this.clearPanel()</code></td><td><code>BUG-X-PERMAHIDE</code></td></tr>
+      <tr><td>5</td><td class="sev-i">Important</td><td>_handleTouchEnd</td><td>触屏无 iframe 上下文入口，移动端无法选中 iframe 内元素</td><td>解析真实事件目标 + 触屏进入同源 iframe 上下文（含重注册守卫）</td><td><code>BUG-TOUCH-IFRAME</code></td></tr>
+      <tr><td>7</td><td class="sev-i">Important</td><td>GlobalDomainPanel</td><td>默认勾选 35–39 分域但"只看广告相关"按 40 分过滤 → 选中却不可见</td><td>过滤条件追加 <code>!selectedHosts.has(d.host)</code>，已选域始终可见</td><td><code>BUG-SEL-INVISIBLE</code></td></tr>
+      <tr><td>8</td><td class="sev-i">Important</td><td>OverlayScanPanel</td><td>无持久规则时仍即时隐藏，UI 暗示"已持久"→ 刷新复活假象</td><td>仅成功生成规则才写指纹；否则即时隐藏 + 计入 <code>unpersistedCount</code> 并在 Toast 明确提示</td><td><code>BUG-NO-PERSIST</code></td></tr>
+      <tr><td>9</td><td class="sev-i">Important</td><td>RuleDomain.evaluateRuleImpact</td><td>跳过 structural/complex 规则 → 高命中误杀规则在影响度视图永远隐形</td><td>纳入 <code>structural</code>（structSelector 计数）与 <code>complex</code>（selector 计数）</td><td><code>BUG-IMPACT-BLIND</code></td></tr>
+      <tr><td>10</td><td class="sev-m">Minor</td><td>IframePanel 预览</td><td><code>frame</code> 分支用 <code>document.contains</code>、<code>element</code> 分支用 <code>isConnected</code> 口径不一 → 嵌套 iframe 预览失效却仍计数</td><td>统一改用 <code>iframe.isConnected</code></td><td><code>BUG-I3</code></td></tr>
+      <tr><td>16</td><td class="sev-m">Minor</td><td>RegexPanel 保存</td><td>regex 模式规则缺 <code>mode</code> 字段，依赖"缺省即正则"隐含约定</td><td>显式补 <code>mode:'regex'</code></td><td>—</td></tr>
+      <tr><td>18</td><td class="sev-i">Important</td><td>StorageService.importAll</td><td>导入不校验规则主键，坏规则入存储后刷新可能令 applyRules 抛错</td><td>各桶主键 <code>REQUIRED_KEY</code> 校验，缺键对象直接丢弃</td><td><code>BUG-IMPORT-BADRULE</code></td></tr>
+      <tr><td>23</td><td class="sev-m">Minor</td><td>showToast 样式</td><td>选择横幅（top:0）遮挡右上角 Toast</td><td>Toast 容器 <code>top: 20px → 56px</code> 避让横幅</td><td>—</td></tr>
+      <tr><td>24</td><td class="sev-m">Minor</td><td>showToast</td><td>连续多条 Toast 堆叠溢出视口底部被裁切</td><td>可见 Toast 数量上限 5，超出移除最旧</td><td><code>BUG-TOAST-OVERFLOW</code></td></tr>
+    </tbody>
+  </table>
+  <div class="note">未采纳项（已核实为假阳性 / 低风险，避免引入回归）：① 同源 iframe 内点击的"主文档双重处理"——跨文档事件不冒泡到父文档，主文档 <code>_handleClick</code> 不会触发，故不存在误导性 Toast；② ManagerPanel 批量删除用 <code>|</code> 分隔——合法 hostname 不含 <code>|</code>（RFC 1035），实际安全，标注为已知低风险。</div>
+
+  <h2>5. 验证结果</h2>
+  <div class="card">
+    <ul>
+      <li><span class="ok">✓</span> <code>node --check web-element-blocker.user.js</code> → 语法通过</li>
+      <li><span class="ok">✓</span> <code>npx jest</code> → <b>27 套件 / 181 用例全部通过</b>（含 panel-registry、menu-wiring、protected-check、storage-manager 等）</li>
+      <li><span class="ok">✓</span> 新增代码均带可追溯标记（<code>BUG-X-PERMAHIDE</code> 等），便于后续审查与回归定位</li>
+    </ul>
+  </div>
+
+  <h2>6. 后续建议（非本次改动）</h2>
+  <div class="card">
+    <ul>
+      <li>为关键交互路径补充端到端 UI 契约测试（尤其 SelectionPanel↔iframe 上下文、覆盖层即时/持久一致性），将 10 项修复固化为回归用例。</li>
+      <li>导入校验可进一步做"单规则 schema 校验 + 失败汇总提示"，而非静默丢弃。</li>
+      <li>影响度评估对复杂规则（无单一选择器）可引入采样式 DOM 命中估算，缩小误杀盲区。</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>
